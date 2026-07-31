@@ -289,26 +289,47 @@ function layoutContainerPackStep8(items, spec, rotMap, opts) {
   function tryPlaceUnit(u, placeOpts) {
     const canWeight = containers.some(c => c.weightUsed + u.weight <= maxKg + 1e-6)
       || containers.length < maxContainers;
-    if (!canWeight) return false;
+    const trialLog = [];
+    const mark = u.mark || (u.marks && u.marks[0]) || '?';
+    placementSteps.push({
+      type: 'unit_start',
+      mark,
+      marks: u.marks ? [...u.marks] : [mark],
+      weight: cs8UnitWeightKg(u),
+      tier: cs8AnchorTier(u, Lmax),
+      isAssembly: cs8IsAssemblyUnit(u),
+      floorAnchor: !!(placeOpts && placeOpts.floorAnchor),
+      pass: (placeOpts && placeOpts.pass) || 1,
+      l: u.l, w: u.w, h: u.h,
+    });
+    if (!canWeight) {
+      placementSteps.push({ type: 'reject', mark, reason: 'weight_limit' });
+      return false;
+    }
 
+    const optsWithLog = Object.assign({}, placeOpts || {}, { trialLog: trialLog });
     let placed = false;
     for (const c of containers) {
       if (c.weightUsed + u.weight > maxKg + 1e-6) continue;
       const pose = cs8FindPlacement(
-        c, u, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm, placeOpts);
+        c, u, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm, optsWithLog);
       if (!pose) continue;
       cs8Commit(c, u, pose, Lmax, Wmax);
       const last = c.items[c.items.length - 1];
       last.baseLayerLock = cs8IsFloorAnchorCargo(u);
       last.floorAnchor = !!(placeOpts && placeOpts.floorAnchor);
       last.anchorTier = cs8AnchorTier(u);
+      for (let ti = 0; ti < trialLog.length; ti++) placementSteps.push(trialLog[ti]);
       placementSteps.push({
+        type: 'commit',
         mark: last.mark,
         marks: last.marks ? [...last.marks] : [last.mark],
         isAssembly: !!last.baseLayerLock,
         floorAnchor: !!last.floorAnchor,
         pass: placeOpts?.pass || 1,
         containerNumber: containers.indexOf(c) + 1,
+        tag: last.packOrientTag || (pose.o && pose.o.tag),
+        x: last.x, y: last.y, z: last.z,
       });
       placed = true;
       break;
@@ -319,25 +340,34 @@ function layoutContainerPackStep8(items, spec, rotMap, opts) {
       containers.push(c);
       if (c.weightUsed + u.weight <= maxKg + 1e-6) {
         const pose = cs8FindPlacement(
-          c, u, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm, placeOpts);
+          c, u, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm, optsWithLog);
         if (pose) {
           cs8Commit(c, u, pose, Lmax, Wmax);
           const last = c.items[c.items.length - 1];
           last.baseLayerLock = cs8IsFloorAnchorCargo(u);
           last.floorAnchor = !!(placeOpts && placeOpts.floorAnchor);
           last.anchorTier = cs8AnchorTier(u);
+          for (let ti = 0; ti < trialLog.length; ti++) placementSteps.push(trialLog[ti]);
           placementSteps.push({
+            type: 'commit',
             mark: last.mark,
             marks: last.marks ? [...last.marks] : [last.mark],
             isAssembly: !!last.baseLayerLock,
             floorAnchor: !!last.floorAnchor,
             pass: placeOpts?.pass || 1,
             containerNumber: containers.indexOf(c) + 1,
+            tag: last.packOrientTag || (pose.o && pose.o.tag),
+            x: last.x, y: last.y, z: last.z,
           });
           placed = true;
         }
       }
       if (!placed) containers.pop();
+    }
+    if (!placed) {
+      for (let ti = 0; ti < trialLog.length; ti++) placementSteps.push(trialLog[ti]);
+      if (!trialLog.some(t => t.type === 'reject'))
+        placementSteps.push({ type: 'reject', mark, reason: 'unplaced' });
     }
     return placed;
   }
@@ -631,32 +661,22 @@ function cs8DiagnoseUnfit(u, Lmax, Wmax, Hmax, containers, maxKg) {
       msg: `Remaining capacity < ${Math.round(wt)} kg`,
     };
   }
-  // Longitudinal only (0°/180°) — hard envelope
-  if (L > Lmax + CS8_EPS) {
+  // Absolute: no axis of the AABB may exceed the longest container edge
+  const maxEdge = Math.max(Lmax, Wmax, Hmax);
+  if (Math.max(L, W, H) > maxEdge + CS8_EPS) {
     return {
       code: 'LENGTH_EXCEEDS_CONTAINER',
-      msg: `Length ${Math.round(L)} mm > container ${Lmax} mm`,
+      msg: `Largest dim ${Math.round(Math.max(L, W, H))} mm > box max ${Math.round(maxEdge)} mm`,
     };
   }
-  if (W > Wmax + CS8_EPS) {
-    return {
-      code: 'WIDTH_EXCEEDS_ENVELOPE',
-      msg: `Width ${Math.round(W)} mm > container ${Wmax} mm`
-        + ` (yaw 0°/180° only — cannot turn 90°)`,
-    };
-  }
-  if (H > Hmax + CS8_EPS) {
-    return {
-      code: 'HEIGHT_EXCEEDS_ENVELOPE',
-      msg: `Height ${Math.round(H)} mm > pack height ${Math.round(Hmax)} mm`,
-    };
-  }
-  const orients = cs8YawOrientsFloorAnchor(u, Lmax, Wmax, Hmax);
+  const orients = typeof cs8StableBaseOrients === 'function'
+    ? cs8StableBaseOrients(u, Lmax, Wmax, Hmax)
+    : cs8YawOrientsFloorAnchor(u, Lmax, Wmax, Hmax);
   if (!orients.length) {
     return {
-      code: 'ORIENT_INCOMPATIBLE',
-      msg: `No yaw 0°/180° fit for ${Math.round(L)}×${Math.round(W)}×${Math.round(H)} mm`
-        + ` in ${Lmax}×${Wmax}×${Math.round(Hmax)}`,
+      code: 'WIDTH_EXCEEDS_ENVELOPE',
+      msg: `No face/yaw fit for ${Math.round(L)}×${Math.round(W)}×${Math.round(H)} mm`
+        + ` in ${Lmax}×${Wmax}×${Math.round(Hmax)} (tried all stable-base directions)`,
     };
   }
   // Fits only if end clearance shrinks below preferred 100 mm
@@ -696,9 +716,7 @@ function cs8ToOversized(u, reason, detail) {
 // ── Y-only orientations ─────────────────────────────────────────────────────
 
 /**
- * Rule #1 Orientation Lock — longitudinal only (0° and 180°).
- * Length parallel to container; never 90° cross-load on the floor layer.
- * 180° = same footprint, opposite door/back facing (taper / flange anti-align).
+ * Legacy longitudinal-only (0°/180°) — kept for tests / Pass2 prefer list.
  */
 function cs8YawOrientsFloorAnchor(u, Lmax, Wmax, Hmax) {
   const L = u.l, W = u.w, H = u.h;
@@ -710,6 +728,10 @@ function cs8YawOrientsFloorAnchor(u, Lmax, Wmax, Hmax) {
       tag: 'yaw0',
       shipPreferred: true,
       floorAnchor: true,
+      packYawOnly: true,
+      packComposeRot: false,
+      baseArea: L * W,
+      stabilityScore: L * W,
     });
     list.push({
       l: L, w: W, h: H,
@@ -717,13 +739,70 @@ function cs8YawOrientsFloorAnchor(u, Lmax, Wmax, Hmax) {
       tag: 'yaw180',
       shipPreferred: true,
       floorAnchor: true,
+      packYawOnly: true,
+      packComposeRot: false,
+      baseArea: L * W,
+      stabilityScore: L * W - 1,
     });
   }
   return list;
 }
 
 /**
- * Pass2 / non-anchor fill: prefer longitudinal; 90° only for short loose pieces.
+ * Yard-style ALL-DIRECTION trials for Floor Anchor:
+ * yaw 0/90/180/270 + Rx/Rz face rolls. Sorted most-stable base first
+ * (largest footprint, lowest tip ratio). Only orients that FIT the box.
+ */
+function cs8StableBaseOrients(u, Lmax, Wmax, Hmax) {
+  const A = Math.max(+u.l || 1, 1);
+  const B = Math.max(+u.w || 1, 1);
+  const C = Math.max(+u.h || 1, 1);
+  const faces = [
+    { l: A, w: B, h: C, rot: { x: 0, y: 0, z: 0 }, tag: 'yaw0', yawOnly: true },
+    { l: A, w: B, h: C, rot: { x: 0, y: Math.PI, z: 0 }, tag: 'yaw180', yawOnly: true },
+    { l: B, w: A, h: C, rot: { x: 0, y: Math.PI / 2, z: 0 }, tag: 'yaw90', yawOnly: true },
+    { l: B, w: A, h: C, rot: { x: 0, y: -Math.PI / 2, z: 0 }, tag: 'yaw270', yawOnly: true },
+    { l: A, w: C, h: B, rot: { x: Math.PI / 2, y: 0, z: 0 }, tag: 'Rx90', yawOnly: false },
+    { l: A, w: C, h: B, rot: { x: Math.PI / 2, y: Math.PI, z: 0 }, tag: 'Rx90_Ry180', yawOnly: false },
+    { l: C, w: A, h: B, rot: { x: Math.PI / 2, y: Math.PI / 2, z: 0 }, tag: 'Rx90_yaw90', yawOnly: false },
+    { l: A, w: C, h: B, rot: { x: -Math.PI / 2, y: 0, z: 0 }, tag: 'Rx270', yawOnly: false },
+    { l: C, w: A, h: B, rot: { x: -Math.PI / 2, y: Math.PI / 2, z: 0 }, tag: 'Rx270_yaw90', yawOnly: false },
+    { l: B, w: C, h: A, rot: { x: 0, y: 0, z: Math.PI / 2 }, tag: 'Rz90', yawOnly: false },
+    { l: C, w: B, h: A, rot: { x: 0, y: Math.PI / 2, z: Math.PI / 2 }, tag: 'Rz90_yaw90', yawOnly: false },
+    { l: B, w: C, h: A, rot: { x: 0, y: 0, z: -Math.PI / 2 }, tag: 'Rz270', yawOnly: false },
+  ];
+  const list = [];
+  const seen = new Set();
+  faces.forEach(f => {
+    if (f.l > Lmax + CS8_EPS || f.w > Wmax + CS8_EPS || f.h > Hmax + CS8_EPS) return;
+    const key = `${Math.round(f.l)}|${Math.round(f.w)}|${Math.round(f.h)}|${f.tag}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    const baseArea = f.l * f.w;
+    const tipRatio = f.h / Math.max(Math.min(f.l, f.w), 1);
+    const tipPen = tipRatio > 2.0 ? 1e9 * (tipRatio - 2) : tipRatio * 1e4;
+    list.push({
+      l: f.l, w: f.w, h: f.h,
+      rot: { x: f.rot.x || 0, y: f.rot.y || 0, z: f.rot.z || 0 },
+      tag: f.tag,
+      shipPreferred: f.yawOnly && (f.tag === 'yaw0' || f.tag === 'yaw180'),
+      floorAnchor: true,
+      packYawOnly: !!f.yawOnly,
+      packComposeRot: !f.yawOnly,
+      baseArea,
+      tipRatio,
+      stabilityScore: baseArea - f.h * 40 - tipPen,
+    });
+  });
+  list.sort((a, b) => (b.stabilityScore - a.stabilityScore)
+    || (b.baseArea - a.baseArea)
+    || ((a.tipRatio || 0) - (b.tipRatio || 0)));
+  return list;
+}
+
+/**
+ * Pass2 / non-anchor fill: prefer longitudinal; 90° for short loose pieces.
+ * Floor-anchor callers use cs8StableBaseOrients instead.
  */
 function cs8YawOrients(u, Lmax, Wmax, Hmax) {
   const L = u.l, W = u.w, H = u.h;
@@ -731,7 +810,6 @@ function cs8YawOrients(u, Lmax, Wmax, Hmax) {
   const isAsm = cs8IsAssemblyUnit(u);
   const longMember = L >= Math.min(Lmax, Wmax) * 0.55;
   const fit90 = W <= Lmax + CS8_EPS && L <= Wmax + CS8_EPS && H <= Hmax + CS8_EPS;
-  // Floor-anchor cargo: NEVER add 90°
   if (fit90 && !isAsm && !longMember && !cs8IsFloorAnchorCargo(u)) {
     list.push({
       l: W, w: L, h: H,
@@ -739,6 +817,10 @@ function cs8YawOrients(u, Lmax, Wmax, Hmax) {
       tag: 'yaw90',
       shipPreferred: false,
       floorAnchor: false,
+      packYawOnly: true,
+      packComposeRot: false,
+      baseArea: W * L,
+      stabilityScore: W * L,
     });
   }
   return list;
@@ -990,13 +1072,17 @@ function cs8YawTagFromRad(y) {
 function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm, placeOpts) {
   const po = placeOpts || {};
   const floorAnchor = !!po.floorAnchor;
-  // Rule #1: Floor Anchor uses longitudinal yaw only (0°/180°)
+  const log = Array.isArray(po.trialLog) ? po.trialLog : null;
+  const mark = u.mark || (u.marks && u.marks[0]) || '?';
+  // Floor Anchor: try ALL stable-base directions (yaw + face rolls), best base first
   let tryOrients = floorAnchor
-    ? cs8YawOrientsFloorAnchor(u, Lmax, Wmax, Hmax)
+    ? cs8StableBaseOrients(u, Lmax, Wmax, Hmax)
     : cs8YawOrients(u, Lmax, Wmax, Hmax);
 
-  // Pass2 / base lock: keep Pass1 yaw + already-oriented footprint (no double-swap)
-  if (po.lockedYaw != null && isFinite(po.lockedYaw)) {
+  // Pass2 / base lock: keep Pass1 footprint + rotation (no re-roll)
+  if (po.lockedOrient && po.lockedOrient.l > 0) {
+    tryOrients = [po.lockedOrient];
+  } else if (po.lockedYaw != null && isFinite(po.lockedYaw)) {
     const fl = Math.max(u.packFootprintL || 0, 0);
     const fw = Math.max(u.packFootprintW || 0, 0);
     const fh = Math.max(u.packFootprintH || u.h || 0, 0);
@@ -1004,10 +1090,18 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
       const tag = cs8YawTagFromRad(po.lockedYaw);
       tryOrients = [{
         l: fl, w: fw, h: fh,
-        rot: { x: 0, y: po.lockedYaw, z: 0 },
+        rot: {
+          x: (u.userRot && u.userRot.x) || 0,
+          y: po.lockedYaw,
+          z: (u.userRot && u.userRot.z) || 0,
+        },
         tag,
         shipPreferred: tag === 'yaw0' || tag === 'yaw180',
-        floorAnchor: tag !== 'yaw90',
+        floorAnchor: true,
+        packYawOnly: !!(u.packYawOnly !== false && !(u.packComposeRot)),
+        packComposeRot: !!u.packComposeRot,
+        baseArea: fl * fw,
+        stabilityScore: fl * fw,
       }];
     } else {
       const locked = tryOrients.filter(o =>
@@ -1015,7 +1109,10 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
       if (locked.length) tryOrients = locked;
     }
   }
-  if (!tryOrients.length) return null;
+  if (!tryOrients.length) {
+    if (log) log.push({ type: 'orient_fail', mark, tag: '-', reason: 'no_orient_fits' });
+    return null;
+  }
 
   const supportMin = floorAnchor
     ? cs8FloorAnchorSupportMin()
@@ -1025,37 +1122,77 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
 
   for (const o of tryOrients) {
     const fl = o.l, fw = o.w, fh = o.h;
-    // Rule 14: prefer configured wall gap; shrink if piece is near full-size
+    if (log) {
+      log.push({
+        type: 'orient',
+        mark,
+        tag: o.tag,
+        l: fl, w: fw, h: fh,
+        rot: { x: o.rot.x || 0, y: o.rot.y || 0, z: o.rot.z || 0 },
+        baseArea: o.baseArea || (fl * fw),
+        packYawOnly: !!o.packYawOnly,
+        packComposeRot: !!o.packComposeRot,
+      });
+    }
     const gaps = cs8EffectiveWallGaps(fl, fw, Lmax, Wmax);
     const gL = gaps.gL;
     const gW = gaps.gW;
-    // Step in mm from effective wall inset — NOT from cell 0 (cell 0 fails when
-    // gW is 20–99mm: z=0 < gW rejects every candidate for near-full-width yaw90).
     const stepXm = Math.max(CS8_CELL_MM, Math.min(fl, CS8_CELL_MM * 2));
     const stepZm = Math.max(CS8_CELL_MM, Math.min(fw, CS8_CELL_MM * 2));
     const xMax0 = Lmax - gL - fl;
     const zMax0 = Wmax - gW - fw;
-    if (xMax0 < gL - CS8_EPS || zMax0 < gW - CS8_EPS) continue;
+    if (xMax0 < gL - CS8_EPS || zMax0 < gW - CS8_EPS) {
+      if (log) log.push({ type: 'orient_fail', mark, tag: o.tag, reason: 'envelope' });
+      continue;
+    }
 
-    // Build slot lists including exact end-aligned position (tiny slack / near-full width)
     const xs = [], zs = [];
     for (let x = gL; x <= xMax0 + CS8_EPS; x += stepXm) xs.push(x);
     for (let z = gW; z <= zMax0 + CS8_EPS; z += stepZm) zs.push(z);
     if (!xs.length || Math.abs(xs[xs.length - 1] - xMax0) > CS8_EPS) xs.push(xMax0);
     if (!zs.length || Math.abs(zs[zs.length - 1] - zMax0) > CS8_EPS) zs.push(zMax0);
 
+    // Sample corners + mid for live anim (full search still runs)
+    const sampleXs = [xs[0], xs[Math.floor(xs.length / 2)], xs[xs.length - 1]]
+      .filter((v, i, a) => v != null && a.indexOf(v) === i);
+    const sampleZs = [zs[0], zs[Math.floor(zs.length / 2)], zs[zs.length - 1]]
+      .filter((v, i, a) => v != null && a.indexOf(v) === i);
+    let slotsLogged = 0;
+    let orientHits = 0;
+
     for (let zi = 0; zi < zs.length; zi++) {
       for (let xi = 0; xi < xs.length; xi++) {
         const x = xs[xi];
         const z = zs[zi];
+        const isSample = sampleXs.includes(x) && sampleZs.includes(z);
 
         const ev = cs8EvalFootprint(c, x, z, fl, fw, u, o);
-        if (!ev) continue;
-        // Rule #1: ≥80% bearing on floor layer; else Pass2 40%
-        if (ev.supportFrac + 1e-9 < supportMin) continue;
+        if (!ev) {
+          if (log && isSample && slotsLogged < 5) {
+            log.push({
+              type: 'slot', mark, tag: o.tag, x, z, ok: false,
+              reason: 'support_map', rot: o.rot, l: fl, w: fw, h: fh,
+              packYawOnly: !!o.packYawOnly, packComposeRot: !!o.packComposeRot,
+            });
+            slotsLogged++;
+          }
+          continue;
+        }
+        if (ev.supportFrac + 1e-9 < supportMin) {
+          if (log && isSample && slotsLogged < 5) {
+            log.push({
+              type: 'slot', mark, tag: o.tag, x, z, ok: false,
+              reason: `bearing ${Math.round(ev.supportFrac * 100)}%`,
+              supportFrac: ev.supportFrac,
+              rot: o.rot, l: fl, w: fw, h: fh,
+              packYawOnly: !!o.packYawOnly, packComposeRot: !!o.packComposeRot,
+            });
+            slotsLogged++;
+          }
+          continue;
+        }
         if (ev.overhangFrac - 1e-9 > cs8OverhangMax()) continue;
 
-        // Rule 15: dunnage between different family layers
         let y0 = ev.supportY;
         if (y0 > CS8_EPS) {
           const belowFam = cs8FamilyUnder(c, x, z, fl, fw, y0);
@@ -1064,8 +1201,17 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
             y0 += (dunnageMm != null ? dunnageMm : cs8Dunnage());
         }
 
-        // Rule #1 Floor Lock: anchors MUST sit on floor or skid (MinY)
-        if (floorAnchor && !cs8IsFloorOrSkidY(y0)) continue;
+        if (floorAnchor && !cs8IsFloorOrSkidY(y0)) {
+          if (log && isSample && slotsLogged < 5) {
+            log.push({
+              type: 'slot', mark, tag: o.tag, x, z, y0, ok: false,
+              reason: 'not_floor', rot: o.rot, l: fl, w: fw, h: fh,
+              packYawOnly: !!o.packYawOnly, packComposeRot: !!o.packComposeRot,
+            });
+            slotsLogged++;
+          }
+          continue;
+        }
 
         if (y0 + fh > Hmax + CS8_EPS) continue;
 
@@ -1075,7 +1221,6 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
           minZ: z, maxZ: z + fw,
           family: u.groupKind || u.category || null,
         };
-        // Rule 13+14: AABB collision with bundle-to-bundle gap inflate
         const gap = bundleGap != null ? bundleGap : cs8BundleGap();
         const boxInfl = {
           minX: box.minX - gap * 0.5, maxX: box.maxX + gap * 0.5,
@@ -1089,11 +1234,31 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
             minZ: b.minZ - gap * 0.5, maxZ: b.maxZ + gap * 0.5,
           };
           return cs8AabbCollide(boxInfl, bi);
-        })) continue;
+        })) {
+          if (log && isSample && slotsLogged < 5) {
+            log.push({
+              type: 'slot', mark, tag: o.tag, x, z, y0, ok: false,
+              reason: 'collision', rot: o.rot, l: fl, w: fw, h: fh,
+              packYawOnly: !!o.packYawOnly, packComposeRot: !!o.packComposeRot,
+            });
+            slotsLogged++;
+          }
+          continue;
+        }
 
         const cx = x + fl / 2;
         const zFromLeft = z + fw / 2;
         const cog = cs8PredictCog(c, u.weight, cx, zFromLeft, Lmax, Wmax);
+        orientHits++;
+        if (log && slotsLogged < 8) {
+          log.push({
+            type: 'slot', mark, tag: o.tag, x, z, y0, ok: true,
+            supportFrac: ev.supportFrac,
+            rot: o.rot, l: fl, w: fw, h: fh,
+            packYawOnly: !!o.packYawOnly, packComposeRot: !!o.packComposeRot,
+          });
+          slotsLogged++;
+        }
         candidates.push({
           x, z, y0, o, box, cog, fl, fw,
           supportFrac: ev.supportFrac,
@@ -1101,12 +1266,16 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
         });
       }
     }
+    if (log && !orientHits) {
+      log.push({ type: 'orient_fail', mark, tag: o.tag, reason: 'no_slot' });
+    }
   }
 
-  if (!candidates.length) return null;
+  if (!candidates.length) {
+    if (log) log.push({ type: 'orient_fail', mark, tag: '*', reason: 'no_candidate' });
+    return null;
+  }
 
-  // CoG hard filter: NEVER block Floor Anchor seats (empty lane > perfect CoG).
-  // Soft score still prefers balanced poses among valid floor slots.
   let pool = candidates;
   if (!floorAnchor) {
     const minY = Math.min(...candidates.map(p => p.y0));
@@ -1121,14 +1290,32 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
     }
   }
 
-  // Select: lowest Y → yaw0 before yaw180 → best CoG → leftmost X → front Z
+  // Select: lowest Y → most stable base → ship-preferred → CoG → X/Z
   let best = null;
   for (const p of pool) {
-    const yawCost = (p.o && p.o.shipPreferred === false) ? 1e10 : 0;
-    const yaw180Cost = (p.o && p.o.tag === 'yaw180') ? 1e6 : 0;
-    const score = p.y0 * 1e12 + yawCost + yaw180Cost
+    const stabCost = -((p.o && p.o.stabilityScore) || (p.fl * p.fw) || 0);
+    const yawCost = (p.o && p.o.shipPreferred === false) ? 1e8 : 0;
+    const yaw180Cost = (p.o && p.o.tag === 'yaw180') ? 1e5 : 0;
+    const score = p.y0 * 1e12 + stabCost * 1e0 + yawCost + yaw180Cost
       + p.cog.penalty * 1e9 + p.x * 1e3 + p.z;
     if (!best || score < best.score) best = { score, ...p };
+  }
+  if (log && best) {
+    log.push({
+      type: 'accept',
+      mark,
+      tag: best.o.tag,
+      x: best.x, z: best.z, y0: best.y0,
+      l: best.fl, w: best.fw, h: best.o.h,
+      rot: {
+        x: best.o.rot.x || 0,
+        y: best.o.rot.y || 0,
+        z: best.o.rot.z || 0,
+      },
+      supportFrac: best.supportFrac,
+      packYawOnly: !!best.o.packYawOnly,
+      packComposeRot: !!best.o.packComposeRot,
+    });
   }
   return best;
 }
@@ -1179,9 +1366,16 @@ function cs8Commit(c, u, pose, Lmax, Wmax) {
     x: cx,
     y: cy,
     z: cz,
-    userRot: { x: 0, y: o.rot.y || 0, z: 0 },
-    packYawOnly: true, // compose Y on top of stable rest-pose — never tilt
+    userRot: {
+      x: o.rot.x || 0,
+      y: o.rot.y || 0,
+      z: o.rot.z || 0,
+    },
+    // yaw-only = spin on rest-pose; compose = face-roll delta on rest-pose
+    packYawOnly: o.packComposeRot ? false : (o.packYawOnly !== false),
+    packComposeRot: !!o.packComposeRot,
     packPoseLock: true, // render must not gravity-rewrite this pose
+    packOrientTag: o.tag || null,
     baseLayerLock: cs8IsFloorAnchorCargo(u),
     floorAnchor: cs8IsFloorOrSkidY(y0),
     anchorTier: cs8AnchorTier(u),
@@ -1322,12 +1516,29 @@ function cs8Pass2CompactAndFill(
 
     movable.forEach(it => {
       const u = cs8UnitFromPackedItem(it);
-      const lockedYaw = (it.userRot && it.userRot.y != null) ? it.userRot.y : 0;
       const isAnchor = !!(it.baseLayerLock || it.floorAnchor || cs8IsFloorAnchorCargo(it));
-      // Shipping: NEVER re-yaw; floor anchors stay on floor (≥80%)
+      const fl = it.packFootprintL || u.l;
+      const fw = it.packFootprintW || u.w;
+      const fh = it.packFootprintH || u.h;
+      const lockedOrient = {
+        l: fl, w: fw, h: fh,
+        rot: {
+          x: (it.userRot && it.userRot.x) || 0,
+          y: (it.userRot && it.userRot.y) || 0,
+          z: (it.userRot && it.userRot.z) || 0,
+        },
+        tag: it.packOrientTag || 'locked',
+        shipPreferred: true,
+        floorAnchor: isAnchor,
+        packYawOnly: !!it.packYawOnly,
+        packComposeRot: !!it.packComposeRot,
+        baseArea: fl * fw,
+        stabilityScore: fl * fw,
+      };
+      // Shipping: keep Pass1 face/yaw; only slide position
       const pose = cs8FindPlacement(
         c, u, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm,
-        { lockedYaw, pass: 2, floorAnchor: isAnchor }
+        { lockedOrient, pass: 2, floorAnchor: isAnchor }
       );
       if (pose) {
         const prevX = it.x;

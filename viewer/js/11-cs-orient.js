@@ -169,9 +169,10 @@ function findBestOrientation(it) {
   if (it.packOrientation) delete it.packOrientation;
   if (it.oriented_transform) delete it.oriented_transform;
 
-  // Z_SHAPE: Nesting Angle from polygon (flange // ground, nest axis tilted)
+  // OPEN+concave: tip+joint nesting angle (geometry gate — not profile name)
   if (typeof attachZNestingAngleToOrientation === 'function'
-      && typeof csNzIsZShape === 'function' && csNzIsZShape(it)) {
+      && typeof requiresLiveRotateSearch === 'function'
+      && requiresLiveRotateSearch(it)) {
     attachZNestingAngleToOrientation(it, orientation_info);
   }
 

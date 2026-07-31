@@ -403,8 +403,8 @@
     const orients = cs8YawOrientsFloorAnchor(
       { l: 10000, w: 400, h: 600 }, 12000, 2350, 2690);
     assert(orients.length === 2, `n=${orients.length}`);
-    assert(orients.every(o => o.tag === 'yaw0' || o.tag === 'yaw180'), 'longitudinal only');
-    assert(!orients.some(o => o.tag === 'yaw90'), 'no 90');
+    assert(orients.every(o => o.tag === 'yaw0' || o.tag === 'yaw180'), 'legacy longitudinal only');
+    assert(!orients.some(o => o.tag === 'yaw90'), 'no 90 in legacy');
     if (typeof cs8FloorAnchorSupportMin === 'function')
       assert(cs8FloorAnchorSupportMin() >= 0.79, '≥80%');
     if (typeof cs8IsFloorOrSkidY === 'function') {
@@ -412,6 +412,96 @@
       assert(cs8IsFloorOrSkidY(100), 'skid');
       assert(!cs8IsFloorOrSkidY(800), 'not stacked');
     }
+  });
+
+  t('W.12m', 'Stable-base orients: all directions, widest base first', () => {
+    if (typeof cs8StableBaseOrients !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const o = cs8StableBaseOrients(
+      { l: 5000, w: 1800, h: 600, weight: 800 },
+      12000, 2350, 2690
+    );
+    assert(o.length >= 2, `orients=${o.length}`);
+    assert(o.some(x => x.tag === 'yaw0' || x.tag === 'yaw180'), 'has longitudinal');
+    assert(o.some(x => /Rx|Rz|yaw90|yaw270/i.test(x.tag)), 'has roll or cross-yaw');
+    assert((o[0].stabilityScore || 0) + 1e-6 >= (o[1].stabilityScore || 0), 'stable first');
+  });
+
+  t('W.13a', 'Rule1 gate: GEOMETRY open+concave — not mark/name', () => {
+    if (typeof requiresLiveRotateSearch !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    // Non-standard mark "P-200" but OPEN + deep concavity → MUST live-rotate
+    const openDeep = {
+      mark: 'P-200',
+      profileDesc: 'CUSTOM',
+      shapeKey: 'unknown',
+      csAnalysis: { open_closed: 'open', profile_type: 'OPEN', concavity_ratio: 0.42 },
+    };
+    assert(requiresLiveRotateSearch(openDeep) === true, 'P-200 open deep');
+    // Z-named but CLOSED / low concavity → must NOT trigger on name alone
+    const fakeZ = {
+      mark: '200Z2',
+      profileDesc: '200Z2',
+      shapeKey: 'z_channel',
+      csAnalysis: { open_closed: 'closed', profile_type: 'CLOSED', concavity_ratio: 0.01 },
+    };
+    assert(requiresLiveRotateSearch(fakeZ) === false, 'name alone not enough');
+    // Solid / shallow open → no
+    assert(requiresLiveRotateSearch({
+      mark: 'PL1',
+      csAnalysis: { open_closed: 'solid', profile_type: 'SOLID', concavity_ratio: 0 },
+    }) === false, 'solid no');
+    assert(requiresLiveRotateSearch({
+      mark: 'C1',
+      csAnalysis: { open_closed: 'open', profile_type: 'OPEN', concavity_ratio: 0.05 },
+    }) === false, 'shallow open no');
+  });
+
+  t('W.13b', 'Direct tip+joint atan2 levels contacts (physics, no deg bias)', () => {
+    if (typeof csNzDirectTipJointAngle !== 'function'
+        || typeof csNzMakeZChannelPolyMm !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const pts = csNzMakeZChannelPolyMm({
+      sectH: 200, sectW: 70, sectT: 2.0, sectD: 18,
+    });
+    const hit = csNzDirectTipJointAngle(pts);
+    assert(!!hit, 'hit');
+    // Direct atan2 levels the tip–joint line; gap should be near 0
+    assert(hit.gap < 2.0, `gap=${hit.gap}`);
+    if (typeof csNzLiveRotateFindGroundAngle === 'function') {
+      const live = csNzLiveRotateFindGroundAngle(pts);
+      assert(!!live && live.gap < 2.0, `live gap=${live && live.gap}`);
+    }
+    // Physics-only score: no +deg cosmetic term
+    if (typeof csNzContactScore === 'function') {
+      assert(csNzContactScore(0, 0) > csNzContactScore(1, 0), 'gap hurts');
+      assert(csNzContactScore(0, 0) > csNzContactScore(0, 1), 'float hurts');
+    }
+  });
+
+  t('W.13c', 'groundOrientItem exists and stamps rule1 result', () => {
+    if (typeof groundOrientItem !== 'function' || typeof THREE === 'undefined') {
+      assert(true, 'skip');
+      return;
+    }
+    const geo = new THREE.BoxGeometry(2, 0.2, 0.4);
+    const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial());
+    mesh.position.set(1, 5, 0);
+    const it = {
+      mark: 'BOX1',
+      csAnalysis: { open_closed: 'solid', profile_type: 'SOLID', concavity_ratio: 0 },
+    };
+    const r = groundOrientItem(it, mesh);
+    assert(!!r && r.ok, 'ok');
+    assert(Math.abs(r.floor_y) < 1e-2, `floor_y=${r.floor_y}`);
+    assert(r.stages && r.stages.length, 'stages');
+    geo.dispose();
   });
 
   t('W.12b', 'cstabIsWeldedAssembly detects multi-part', () => {

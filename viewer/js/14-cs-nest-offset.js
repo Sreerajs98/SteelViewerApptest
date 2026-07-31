@@ -160,8 +160,10 @@ function calculateNestingOffset(it) {
     mutates_geometry: false,
   };
 
-  // Z_SHAPE: offset along tilted nest axis (leveled web), not pure AABB axis
-  if (typeof csNzIsZShape === 'function' && csNzIsZShape(it)
+  // OPEN+concave: offset along tilted nest axis (leveled web), not pure AABB
+  if ((typeof requiresLiveRotateSearch === 'function'
+        ? requiresLiveRotateSearch(it)
+        : (typeof csNzIsZShape === 'function' && csNzIsZShape(it)))
       && (method === 'INTERLOCK_NEST' || method === 'STACK_NEST')) {
     if (typeof attachZNestingAngleToOrientation === 'function')
       attachZNestingAngleToOrientation(it, it.orientation_info);
@@ -587,7 +589,9 @@ function computeInterlockWorldYPlacements(it, count) {
   const s0 = pack.placements[0]?.slide_mm || 0;
   const alongY = dir === 'v'; // else along world Z
   const useTilt = !!(info?.use_tilted_nest_axis
-    && (typeof csNzIsZShape !== 'function' || csNzIsZShape(it)));
+    && (typeof requiresLiveRotateSearch === 'function'
+      ? requiresLiveRotateSearch(it)
+      : (typeof csNzIsZShape !== 'function' || csNzIsZShape(it))));
   const axis = useTilt ? (Number(info.nest_axis_angle_rad) || 0) : 0;
 
   const world = pack.placements.map(p => {

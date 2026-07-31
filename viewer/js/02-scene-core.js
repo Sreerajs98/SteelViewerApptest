@@ -536,10 +536,17 @@ function itemPoseFitsInContainer(it, cont) {
     qty: it.qty || 1,
   }, 0xffffff, 1);
   mesh.position.set((it.x || 0) * SCALE, (it.y || 0) * SCALE, (it.z || 0) * SCALE);
-  // Match render: never wipe rest-pose X/Z with packer yaw-only euler
-  if (it.userRot) {
-    if (it.packYawOnly) mesh.rotation.y += (it.userRot.y || 0);
-    else mesh.rotation.set(it.userRot.x || 0, it.userRot.y || 0, it.userRot.z || 0);
+  if (typeof applyPackItemRotation === 'function')
+    applyPackItemRotation(mesh, it);
+  else if (it.userRot) {
+    if (it.packComposeRot && typeof THREE !== 'undefined') {
+      const e = new THREE.Euler(it.userRot.x || 0, it.userRot.y || 0, it.userRot.z || 0, 'XYZ');
+      mesh.quaternion.premultiply(new THREE.Quaternion().setFromEuler(e));
+      mesh.rotation.setFromQuaternion(mesh.quaternion);
+    } else if (it.packYawOnly !== false)
+      mesh.rotation.y += (it.userRot.y || 0);
+    else
+      mesh.rotation.set(it.userRot.x || 0, it.userRot.y || 0, it.userRot.z || 0);
   } else {
     applyStoredRotation(mesh, it);
   }

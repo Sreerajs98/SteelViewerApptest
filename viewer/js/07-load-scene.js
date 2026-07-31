@@ -20,10 +20,6 @@ function _coreLoadScene(data) {
     if (!(it.sectD > 0) && r.sectD > 0) it.sectD = r.sectD;
   });
 
-  // FIRST PRIORITY — warehouse ground sit preference (applied on makeShape)
-  if (typeof attachWarehouseGroundToItems === 'function') {
-    window._warehouseGroundStats = attachWarehouseGroundToItems(rawScene.items);
-  }
   // STEP 1 — extract 2D cross-section per item (no shape morph; data only)
   if (typeof attachCrossSectionsToItems === 'function') {
     window._crossSectionStats = attachCrossSectionsToItems(rawScene.items);
@@ -31,6 +27,15 @@ function _coreLoadScene(data) {
   // STEP 2 — analyze open/closed/concavity/symmetry/nest direction
   if (typeof attachCsAnalysisToItems === 'function') {
     window._csAnalysisStats = attachCsAnalysisToItems(rawScene.items);
+  }
+  // RULE 1 prep — after Step1+2 so OPEN+concave gate is geometry-correct.
+  // Mesh orient runs once via groundOrientItem inside ensureStableShape/makeShape.
+  if (typeof attachWarehouseGroundToItems === 'function') {
+    window._warehouseGroundStats = attachWarehouseGroundToItems(rawScene.items);
+  }
+  if (typeof groundOrientAll === 'function') {
+    // No scene meshes yet — stamps _rule1Ground; makeShape applies pipeline once
+    window._rule1GroundStats = groundOrientAll(rawScene.items, () => null);
   }
   // STEP 3 — orientation scores only (never mutates mesh / section / display)
   if (typeof attachOrientationsToItems === 'function') {

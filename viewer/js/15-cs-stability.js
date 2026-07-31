@@ -439,83 +439,42 @@ function applyStableRestPose(group, orientationInfo, itemOrOpts) {
     }
   }
 
-  // ── Welded assemblies: try all warehouse faces → best ground base ───────
-  // Assemblies are the container BASE layer — must sit flat, touch Y=0,
-  // never thin-edge / tip. Human yard: widest stable face down, length horiz.
-  if (cstabIsWeldedAssembly(it)) {
-    return refineAssemblyGroundPose(group, it, orientationInfo);
-  }
-
-  // ── Z single: support-flange sit ONLY (skip warehouse AABB tip-sit) ──────
-  // Warehouse widest-face often Rx-lays Z onto a tip — wrong. User wants
-  // flange TIP + flange–WEB JOINT both on ground.
-  if (typeof csNzIsZShape === 'function' && csNzIsZShape(it)
-      && !(qty > 1 && nestKids > 1)
-      && typeof applyZNestingAngleToObject === 'function') {
-    const zInfo = applyZNestingAngleToObject(group, it);
-    // Extra careful ground snap (mesh-only, 2-pass) — pose already set
-    if (typeof csNzSnapObjectToGround === 'function')
-      csNzSnapObjectToGround(group);
+  // ── RULE 1 single pipeline (assembly / live-rotate / warehouse) ─────────
+  // groundOrientItem is the ONLY display-mesh ground path (no parallel systems).
+  if (typeof groundOrientItem === 'function' && !(qty > 1 && nestKids > 1)) {
+    const r1 = groundOrientItem(it, group);
     group.updateMatrixWorld(true);
-    const floorBox = (typeof csNzMeshWorldBox === 'function')
-      ? csNzMeshWorldBox(group)
-      : new THREE.Box3().setFromObject(group);
-    const floorY = floorBox && isFinite(floorBox.min.y) ? floorBox.min.y : 0;
-    const finalZ = (typeof evaluateMeshGroupStability === 'function')
+    const finalEv = (typeof evaluateMeshGroupStability === 'function')
       ? evaluateMeshGroupStability(group)
-      : { stable: true, floor_y: floorY };
-    finalZ.applied_rotation = {
-      x: Number(zInfo?.applied_rad) || 0, y: 0, z: 0,
-    };
-    finalZ.vert_key_hint = orientationInfo?.vert_key || null;
-    finalZ.pose_locked = false;
-    finalZ.z_nesting = zInfo;
-    finalZ.nesting_angle_rad = zInfo?.applied_rad || 0;
-    finalZ.floor_y = floorY;
-    finalZ.ground_stable = Math.abs(floorY) < 1e-4;
-    finalZ.ground_touch = finalZ.ground_stable;
-    finalZ.thin_edge_sit = false;
-    return finalZ;
-  }
-
-  // ── Warehouse ground (IFC load first priority — non-Z) ───────────────────
-  if (typeof orientObjectToWarehouseGround === 'function') {
-    const wh = orientObjectToWarehouseGround(group, it);
-    if (wh && wh.ok) {
-      const finalEv = (typeof evaluateMeshGroupStability === 'function')
-        ? evaluateMeshGroupStability(group)
-        : {
-          stable: !!wh.ground_stable,
-          tip_ratio: wh.tip_ratio,
-          score: wh.face_area || 0,
-          size: wh.extents_after,
-          floor_y: wh.floor_y,
-          standing_on_end: false,
-          thin_edge_sit: !!wh.tips,
-          length_horizontal: (wh.extents_after?.x || 0) >= (wh.extents_after?.y || 0),
-        };
-      finalEv.applied_rotation = wh.rot === 'Rx'
+      : {
+        stable: !!(r1 && r1.ground_stable),
+        floor_y: r1 && r1.floor_y,
+        tip_ratio: 0,
+        score: 0,
+      };
+    const live = r1 && r1.live;
+    const wh = r1 && r1.warehouse;
+    finalEv.applied_rotation = live
+      ? { x: Number(live.applied_rad) || 0, y: 0, z: 0 }
+      : (wh && wh.rot === 'Rx'
         ? { x: Math.PI / 2, y: 0, z: 0 }
-        : (wh.rot === 'Rz'
+        : (wh && wh.rot === 'Rz'
           ? { x: 0, y: 0, z: Math.PI / 2 }
-          : { x: 0, y: 0, z: 0 });
-      finalEv.vert_key_hint = orientationInfo?.vert_key || null;
-      finalEv.chosen_score = wh.face_area || 0;
-      finalEv.pose_locked = false;
-      finalEv.warehouse = wh;
-      finalEv.nesting_angle_rad = it?.orientation_info?.nesting_angle_rad || 0;
-      finalEv.ground_stable = !!wh.ground_stable
-        || (Math.abs(wh.floor_y || 0) < 1e-3 && !wh.tips);
-      group.updateMatrixWorld(true);
-      const boxZ = new THREE.Box3().setFromObject(group);
-      if (isFinite(boxZ.min.y) && Math.abs(boxZ.min.y) > 1e-6) {
-        group.position.y -= boxZ.min.y;
-        group.updateMatrixWorld(true);
-      }
-      finalEv.floor_y = new THREE.Box3().setFromObject(group).min.y;
-      finalEv.ground_stable = Math.abs(finalEv.floor_y || 0) < 1e-3;
-      return finalEv;
-    }
+          : { x: 0, y: 0, z: 0 }));
+    finalEv.vert_key_hint = orientationInfo?.vert_key || null;
+    finalEv.pose_locked = false;
+    finalEv.warehouse = wh || null;
+    finalEv.z_nesting = live || null;
+    finalEv.nesting_angle_rad = live?.applied_rad
+      || it?.orientation_info?.nesting_angle_rad || 0;
+    finalEv.rule1 = r1;
+    finalEv.floor_y = (r1 && r1.floor_y != null) ? r1.floor_y : finalEv.floor_y;
+    finalEv.ground_stable = !!(r1 && r1.ground_stable)
+      || Math.abs(finalEv.floor_y || 0) < 1e-3;
+    finalEv.ground_touch = finalEv.ground_stable;
+    finalEv.thin_edge_sit = false;
+    finalEv.chosen_score = (wh && wh.face_area) || finalEv.score || 0;
+    return finalEv;
   }
 
   // ── Legacy fallback (should rarely run) ─────────────────────────────────

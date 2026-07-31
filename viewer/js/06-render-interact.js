@@ -192,14 +192,8 @@ function renderContainer(idx) {
     const color = COLORS[it.category] ?? COLORS.other;
     const box = makeShape(it, color);
     box.position.set(it.x*SCALE, it.y*SCALE, it.z*SCALE);
-    // Keep the orientation the user set before Optimise & Place.
-    // Step8 packYawOnly: add Y spin on top of stable rest-pose — never tilt X/Z.
-    if (it.userRot) {
-      if (it.packYawOnly) box.rotation.y += (it.userRot.y || 0);
-      else box.rotation.set(it.userRot.x, it.userRot.y, it.userRot.z);
-    } else {
-      applyStoredRotation(box, it);
-    }
+    // Keep packer / user orientation (yaw-only, face-roll compose, or absolute).
+    applyPackItemRotation(box, it);
     scene.add(box);
     const sid = it.stagingGroupId || findStagingIdForUnit(it);
     if (sid && !it.stagingGroupId) it.stagingGroupId = sid;
@@ -274,10 +268,7 @@ function renderContainer(idx) {
           (cont.widthMm/2 + 500 + i*(Math.min(dW, 600) + 200))*SCALE
         );
       }
-      if (it.userRot) {
-        if (it.packYawOnly) mesh.rotation.y += (it.userRot.y || 0);
-        else mesh.rotation.set(it.userRot.x, it.userRot.y, it.userRot.z);
-      } else applyStoredRotation(mesh, it);
+      applyPackItemRotation(mesh, it);
       scene.add(mesh);
       clickable.push({ mesh, item: {
         mark: it.mark, assemblyName: it.assemblyName,
@@ -1881,9 +1872,10 @@ function layoutInspection() {
     const useGap = isAsm ? asmGap : gap;
     // Assemblies / Z: origin after rest-pose is AABB centre OR bottom —
     // place at y=0 so snap-to-ground cannot leave them floating mid-air.
-    const isZ = (typeof csNzIsZShape === 'function')
-      ? csNzIsZShape(u)
-      : /z_channel|z_shape/i.test(String(u.shapeKey || u.profileShape || ''));
+    const isZ = (typeof requiresLiveRotateSearch === 'function')
+      ? requiresLiveRotateSearch(u)
+      : ((typeof csNzIsZShape === 'function' && csNzIsZShape(u))
+        || /z_channel|z_shape/i.test(String(u.shapeKey || u.profileShape || '')));
 
     // Assemblies: length along +X (PCA ship pose), side-by-side in +Z —
     // never leave IFC yaw / pitch in staging (that made the X-cross mess).
@@ -1974,9 +1966,12 @@ function layoutOutside() {
       const stagingId = findStagingIdForUnit(u, it.mark);
       // Z / assemblies: place on ground plane (y=0). Nest/assembly origin
       // ≠ bbox centre — footY/2 would float until snap; start at ground.
-      const isZ = (typeof csNzIsZShape === 'function')
-        ? csNzIsZShape(u) || csNzIsZShape(it)
-        : /z_channel|z_shape/i.test(String(u.shapeKey || u.profileShape || it.shapeKey || it.profileShape || ''));
+      const isZ = (typeof requiresLiveRotateSearch === 'function')
+        ? (requiresLiveRotateSearch(u) || requiresLiveRotateSearch(it))
+        : (((typeof csNzIsZShape === 'function')
+            && (csNzIsZShape(u) || csNzIsZShape(it)))
+          || /z_channel|z_shape/i.test(String(
+            u.shapeKey || u.profileShape || it.shapeKey || it.profileShape || '')));
       const isAsm = !!(u.isAssembly || it.isAssembly
         || (u.parts && u.parts.length >= 2) || (it.parts && it.parts.length >= 2));
       outItems.push({
@@ -2061,34 +2056,57 @@ function csPackSleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/** Apply packer rotation onto a mesh that already has makeShape rest-pose. */
+function applyPackItemRotation(mesh, it) {
+  if (!mesh || !it) return;
+  if (!it.userRot) {
+    if (typeof applyStoredRotation === 'function') applyStoredRotation(mesh, it);
+    return;
+  }
+  const ur = it.userRot;
+  if (it.packComposeRot) {
+    // Face-roll / tip delta composed on top of rest-pose (yard trial)
+    if (typeof THREE !== 'undefined') {
+      const e = new THREE.Euler(ur.x || 0, ur.y || 0, ur.z || 0, 'XYZ');
+      const qAdd = new THREE.Quaternion().setFromEuler(e);
+      mesh.quaternion.premultiply(qAdd);
+      mesh.rotation.setFromQuaternion(mesh.quaternion);
+    } else {
+      mesh.rotation.x += ur.x || 0;
+      mesh.rotation.y += ur.y || 0;
+      mesh.rotation.z += ur.z || 0;
+    }
+  } else if (it.packYawOnly !== false) {
+    mesh.rotation.y += (ur.y || 0);
+  } else {
+    mesh.rotation.set(ur.x || 0, ur.y || 0, ur.z || 0);
+  }
+}
+
 /**
- * Live reveal after Pass1+2 plan is computed — shipping theatre for the user.
- * Does not re-solve; only shows commit order (base/heavy first).
+ * Live Pack theatre: for each heaviest-first unit, show every orient + slot
+ * try (rotate / move ghost), then commit or reject.
  */
 async function animatePackPlacementReveal(packedContainers, keepOutside, placementSteps) {
   const finalCont = (packedContainers && packedContainers[0])
     ? { ...packedContainers[0] }
     : null;
   if (!finalCont) return;
+
+  const steps = (placementSteps || []).slice();
   const finalItems = (finalCont.items || []).slice();
-  const orderMarks = [];
-  const seenM = new Set();
-  (placementSteps || []).forEach(s => {
-    const m = s.mark || (s.marks && s.marks[0]);
-    if (m && !seenM.has(m)) { seenM.add(m); orderMarks.push(m); }
+  const byMark = new Map();
+  finalItems.forEach(it => {
+    const marks = it.marks && it.marks.length ? it.marks : [it.mark];
+    marks.forEach(m => { if (m) byMark.set(m, it); });
+    if (it.mark) byMark.set(it.mark, it);
   });
-  const ordered = [];
-  const seenIt = new Set();
-  function pushItem(it) {
-    if (!it || seenIt.has(it)) return;
-    seenIt.add(it);
-    ordered.push(it);
-  }
-  orderMarks.forEach(m => {
-    pushItem(finalItems.find(it =>
-      it.mark === m || (it.marks && it.marks.includes(m))));
+  const outsideByMark = new Map();
+  (keepOutside || []).forEach(it => {
+    const marks = it.marks && it.marks.length ? it.marks : [it.mark];
+    marks.forEach(m => { if (m) outsideByMark.set(m, it); });
+    if (it.mark) outsideByMark.set(it.mark, it);
   });
-  finalItems.forEach(pushItem);
 
   const live = {
     ...finalCont,
@@ -2097,42 +2115,212 @@ async function animatePackPlacementReveal(packedContainers, keepOutside, placeme
     weightUtilizationPct: 0,
     volumeUtilizationPct: 0,
   };
-  currentLayout = { containers: [live], oversized: keepOutside || [] };
+  const remainingOutside = (keepOutside || []).slice();
+  currentLayout = { containers: [live], oversized: remainingOutside };
   currentContainerIdx = 0;
   renderContainer(0);
 
   const maxKg = finalCont.maxWeightKg || 26000;
-  const cv = (finalCont.lengthMm || 1) * (finalCont.widthMm || 1) * (finalCont.heightMm || 1);
+  const Lmax = finalCont.lengthMm || 12000;
+  const Wmax = finalCont.widthMm || 2350;
+  const cv = Lmax * Wmax * (finalCont.heightMm || 2690);
   let wSum = 0;
   let vSum = 0;
-  for (let i = 0; i < ordered.length; i++) {
-    const it = ordered[i];
-    live.items.push(it);
-    wSum += (it.unitWeightKg || it.weight || 0);
-    vSum += (it.packFootprintL || it.lengthMm || it.l || 1)
-      * (it.packFootprintW || it.widthMm || it.w || 1)
-      * (it.packFootprintH || it.heightMm || it.h || 1);
-    live.usedWeightKg = typeof round2 === 'function' ? round2(wSum) : +wSum.toFixed(2);
-    live.weightUtilizationPct = typeof round1 === 'function'
-      ? round1(wSum / maxKg * 100) : +(wSum / maxKg * 100).toFixed(1);
-    live.volumeUtilizationPct = typeof round1 === 'function'
-      ? round1(vSum / cv * 100) : +(vSum / cv * 100).toFixed(1);
-    currentLayout = { containers: [live], oversized: keepOutside || [] };
+  let unitIdx = 0;
+  let ghost = null;
+  let unitSrc = null;
+
+  function syncLive(extraOutside) {
+    const outs = extraOutside != null ? extraOutside : remainingOutside;
+    currentLayout = { containers: [live], oversized: outs };
     renderContainer(0);
-    const tag = (it.floorAnchor || it.baseLayerLock || it.isAssembly)
-      ? 'FLOOR ANCHOR' : 'load';
-    try {
-      showToast(
-        `Pack ${i + 1}/${ordered.length} · ${tag} · ${it.mark || '?'}`,
-        350
-      );
-    } catch (_) { /* */ }
-    await csPackSleep(
-      (it.floorAnchor || it.baseLayerLock || it.isAssembly) ? 450 : 280
-    );
   }
 
-  // Final authoritative layout (CoG stats from packer)
+  function ghostItemFrom(step, src) {
+    const fl = step.l || src.packFootprintL || src.l || src.lengthMm || 1000;
+    const fw = step.w || src.packFootprintW || src.w || src.widthMm || 200;
+    const fh = step.h || src.packFootprintH || src.h || src.heightMm || 200;
+    const x0 = (step.x != null) ? step.x + fl / 2 : Lmax / 2;
+    const z0 = (step.z != null)
+      ? (step.z + fw / 2 - Wmax / 2)
+      : 0;
+    const y0 = (step.y0 != null) ? step.y0 + fh / 2 : fh / 2;
+    return {
+      ...src,
+      mark: (src.mark || step.mark || '?') + ' · TRY',
+      x: x0,
+      y: y0,
+      z: z0,
+      packFootprintL: fl,
+      packFootprintW: fw,
+      packFootprintH: fh,
+      userRot: step.rot
+        ? { x: step.rot.x || 0, y: step.rot.y || 0, z: step.rot.z || 0 }
+        : { x: 0, y: 0, z: 0 },
+      packYawOnly: step.packComposeRot ? false : (step.packYawOnly !== false),
+      packComposeRot: !!step.packComposeRot,
+      packPoseLock: true,
+      isPackGhost: true,
+      category: src.category || 'other',
+    };
+  }
+
+  function setGhost(step) {
+    if (!unitSrc) return;
+    ghost = ghostItemFrom(step, unitSrc);
+    // Ghost sits in live.items temporarily (amber toast only — same mesh path)
+    const committed = live.items.filter(it => !it.isPackGhost);
+    live.items = [...committed, ghost];
+    syncLive(remainingOutside.filter(o => o.mark !== unitSrc.mark
+      && !(unitSrc.marks || []).includes(o.mark)));
+  }
+
+  function clearGhost() {
+    ghost = null;
+    live.items = live.items.filter(it => !it.isPackGhost);
+  }
+
+  for (let si = 0; si < steps.length; si++) {
+    const s = steps[si];
+    const typ = s.type || (s.mark ? 'commit' : '');
+
+    if (typ === 'unit_start') {
+      unitIdx++;
+      clearGhost();
+      unitSrc = byMark.get(s.mark)
+        || outsideByMark.get(s.mark)
+        || {
+          mark: s.mark,
+          marks: s.marks,
+          l: s.l, w: s.w, h: s.h,
+          lengthMm: s.l, widthMm: s.w, heightMm: s.h,
+          packFootprintL: s.l, packFootprintW: s.w, packFootprintH: s.h,
+          unitWeightKg: s.weight || 0,
+          isAssembly: !!s.isAssembly,
+          category: 'beam',
+        };
+      try {
+        showToast(
+          `① #${unitIdx} · ${Math.round(s.weight || 0)} kg · ${s.mark}`
+          + (s.isAssembly || s.floorAnchor ? ' · BASE try' : ''),
+          900
+        );
+      } catch (_) { /* */ }
+      // Preview at door-centre before first orient
+      setGhost({
+        mark: s.mark, l: s.l, w: s.w, h: s.h,
+        x: 100, z: 100, y0: 0,
+        rot: { x: 0, y: 0, z: 0 },
+        packYawOnly: true,
+      });
+      await csPackSleep(380);
+      continue;
+    }
+
+    if (typ === 'orient') {
+      try {
+        showToast(
+          `↻ rotate ${s.tag} · base ${Math.round((s.baseArea || 0) / 1e4) / 100} m²`
+          + ` · ${Math.round(s.l)}×${Math.round(s.w)}×${Math.round(s.h)}`,
+          700
+        );
+      } catch (_) { /* */ }
+      setGhost({
+        ...s,
+        x: (Lmax - (s.l || 1000)) / 2,
+        z: (Wmax - (s.w || 200)) / 2,
+        y0: 0,
+      });
+      await csPackSleep(s.packComposeRot ? 520 : 400);
+      continue;
+    }
+
+    if (typ === 'slot') {
+      setGhost(s);
+      try {
+        showToast(
+          s.ok
+            ? `✓ slot ${s.tag} · bearing ${Math.round((s.supportFrac || 0) * 100)}%`
+            : `✗ ${s.tag} · ${s.reason || 'no'}`,
+          280
+        );
+      } catch (_) { /* */ }
+      await csPackSleep(s.ok ? 220 : 160);
+      continue;
+    }
+
+    if (typ === 'orient_fail') {
+      try {
+        showToast(`↻ ${s.tag || '?'} fail · ${s.reason || ''}`, 260);
+      } catch (_) { /* */ }
+      await csPackSleep(140);
+      continue;
+    }
+
+    if (typ === 'accept') {
+      // Preview chosen pose before commit step adds the real item
+      setGhost(s);
+      try {
+        showToast(`★ best ${s.tag} · bearing ${Math.round((s.supportFrac || 0) * 100)}%`, 400);
+      } catch (_) { /* */ }
+      await csPackSleep(360);
+      continue;
+    }
+
+    if (typ === 'commit') {
+      const finalIt = byMark.get(s.mark);
+      clearGhost();
+      if (finalIt && !live.items.some(it => it.mark === finalIt.mark)) {
+        live.items.push(finalIt);
+        wSum += (finalIt.unitWeightKg || finalIt.weight || 0);
+        vSum += (finalIt.packFootprintL || finalIt.lengthMm || finalIt.l || 1)
+          * (finalIt.packFootprintW || finalIt.widthMm || finalIt.w || 1)
+          * (finalIt.packFootprintH || finalIt.heightMm || finalIt.h || 1);
+        live.usedWeightKg = typeof round2 === 'function' ? round2(wSum) : +wSum.toFixed(2);
+        live.weightUtilizationPct = typeof round1 === 'function'
+          ? round1(wSum / maxKg * 100) : +(wSum / maxKg * 100).toFixed(1);
+        live.volumeUtilizationPct = typeof round1 === 'function'
+          ? round1(vSum / cv * 100) : +(vSum / cv * 100).toFixed(1);
+        for (let i = remainingOutside.length - 1; i >= 0; i--) {
+          const o = remainingOutside[i];
+          if (o.mark === s.mark || (o.marks || []).includes(s.mark)
+              || (finalIt.marks || []).includes(o.mark))
+            remainingOutside.splice(i, 1);
+        }
+        syncLive();
+        try {
+          showToast(
+            `✔ SEAT ${s.tag || finalIt.packOrientTag || ''} · ${s.mark}`,
+            500
+          );
+        } catch (_) { /* */ }
+        await csPackSleep(480);
+      }
+      continue;
+    }
+
+    if (typ === 'reject') {
+      clearGhost();
+      syncLive();
+      try {
+        showToast(`✘ OUT · ${s.mark} · ${s.reason || 'no fit'}`, 700);
+      } catch (_) { /* */ }
+      await csPackSleep(420);
+      continue;
+    }
+
+    // Legacy steps without type — treat as commit reveal
+    if (s.mark && byMark.has(s.mark)) {
+      const finalIt = byMark.get(s.mark);
+      if (finalIt && !live.items.some(it => it.mark === finalIt.mark)) {
+        live.items.push(finalIt);
+        syncLive();
+        await csPackSleep(300);
+      }
+    }
+  }
+
+  clearGhost();
   currentLayout = {
     containers: packedContainers,
     oversized: keepOutside || [],
@@ -2426,12 +2614,13 @@ async function layoutPlaceSelected() {
   currentContainerIdx = 0;
 
   try {
-    if (animate && packedContainers.length
-        && (packedContainers[0].items || []).length) {
+    const steps = packedLayout.placementSteps || [];
+    const hasTrials = steps.some(s => s && (s.type === 'unit_start' || s.type === 'orient'));
+    if (animate && packedContainers.length && (hasTrials || (packedContainers[0].items || []).length)) {
       await animatePackPlacementReveal(
         packedContainers,
         keepOutside,
-        packedLayout.placementSteps || []
+        steps
       );
     } else {
       currentLayout = {

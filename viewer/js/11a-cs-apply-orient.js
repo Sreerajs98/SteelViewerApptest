@@ -115,9 +115,12 @@ function applyOrientation(it) {
     }
   }
 
-  // ── Z_SHAPE Nesting Angle: two-point ground level (rigid roll) ───────────
+  // ── OPEN+concave tip+joint roll (geometry gate — never profile name) ────
   let nesting_roll_deg = 0;
-  if (typeof csNzIsZShape === 'function' && csNzIsZShape(it)) {
+  const needsLive = (typeof requiresLiveRotateSearch === 'function')
+    ? requiresLiveRotateSearch(it)
+    : (typeof csNzIsZShape === 'function' && csNzIsZShape(it));
+  if (needsLive) {
     if (typeof attachZNestingAngleToOrientation === 'function')
       attachZNestingAngleToOrientation(it, oi || it.orientation_info);
     const zNest = it.orientation_info?.z_nesting || it.orientation_info;

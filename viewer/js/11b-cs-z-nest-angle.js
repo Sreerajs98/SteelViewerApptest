@@ -1,24 +1,47 @@
-/* 11b-cs-z-nest-angle.js — Z Nesting Angle (LIVE tip + web-joint ground)
+/* 11b-cs-z-nest-angle.js — Live tip+joint ground roll (OPEN concave profiles)
  *
  * ╔══════════════════════════════════════════════════════════════════════╗
  * ║  GOAL                                                                ║
  * ║  • Rigid roll about +X only — no ExtrudeGeometry morph               ║
- * ║  • LIVE search: rotate until                                          ║
- * ║      flange TIP  +  flange–WEB JOINT  both sit on ground (minY)      ║
- * ║  • Then drop minY → 0                                                ║
- * ║  • Z only                                                            ║
+ * ║  • Level TWO contact points onto ground (tip + web joint)            ║
+ * ║  • Trigger = GEOMETRY (OPEN + deep concavity) — NEVER profile name   ║
+ * ║  • Physics score only — no viewer cosmetic angle bias                ║
  * ╚══════════════════════════════════════════════════════════════════════╝
  */
 
 const CSNZ_EDGE_MIN_MM = 1.0;
+/** Deep open profiles need tip+joint sit (matches Step2 "deep" class). */
+const CSNZ_LIVE_CONCAVITY_MIN = 0.15;
 
-function csNzIsZShape(it) {
+/**
+ * RULE 1 Stage-2 gate — GEOMETRY ONLY (no shapeKey / mark / profileDesc).
+ * OPEN + concavity_ratio > threshold → live tip+joint ground search.
+ */
+function requiresLiveRotateSearch(it) {
   if (!it) return false;
-  const sk = String(it.shapeKey || it.profileShape || '').toLowerCase();
-  if (sk === 'z_channel' || sk === 'z_shape' || sk === 'z') return true;
-  const desc = String(it.profileDesc || it.mark || '');
-  if (/\d\s*Z\s*\d/i.test(desc) || /^Z\d/i.test(desc.trim())) return true;
-  return false;
+  if (!it.crossSection && typeof extractCrossSection === 'function') {
+    try { extractCrossSection(it); } catch (_) { /* */ }
+  }
+  if (!it.csAnalysis && typeof analyzeCrossSection === 'function') {
+    try { analyzeCrossSection(it); } catch (_) { /* */ }
+  }
+  const an = it.csAnalysis || {};
+  const cs = it.crossSection || {};
+  const openClosed = String(an.open_closed || cs.open_closed || '').toLowerCase();
+  const profileType = String(an.profile_type || '').toUpperCase();
+  const isOpen = openClosed === 'open' || profileType === 'OPEN';
+  if (!isOpen) return false;
+  const conc = Number(an.concavity_ratio != null ? an.concavity_ratio : cs.concavity_ratio);
+  if (!isFinite(conc)) return false;
+  return conc > CSNZ_LIVE_CONCAVITY_MIN;
+}
+
+/**
+ * @deprecated Alias — now geometry-based (requiresLiveRotateSearch).
+ * Do NOT add name/mark checks here.
+ */
+function csNzIsZShape(it) {
+  return requiresLiveRotateSearch(it);
 }
 
 function csNzNormPi(a) {
@@ -44,14 +67,22 @@ function csNzPts(outerPoints) {
   return pts;
 }
 
-/** y after rotateX: y' = v cos θ − u sin θ  (u≈z, v≈y) */
+/** y after rotateX: y' = v cos θ − u sin θ  (u≈section-x, v≈section-y) */
 function csNzRotY(u, v, theta) {
   return v * Math.cos(theta) - u * Math.sin(theta);
 }
 
 /**
- * Build makeZChannel-matching section polygon in mm (centred), same as 03-shapes.
- * Used so LIVE search matches what the viewer actually draws (lips included).
+ * Physics score: tip+joint same Y and both on global minY.
+ * NO cosmetic deg bias.
+ */
+function csNzContactScore(gap, floatSum) {
+  return -(gap * 20 + floatSum * 10);
+}
+
+/**
+ * Synthetic open-channel polygon from sect dims (fallback when outer_points missing).
+ * Dims only — not name-based.
  */
 function csNzMakeZChannelPolyMm(it) {
   const Hmm = Math.max(Number(it?.sectH) || Number(it?.heightMm) || 200, 40);
@@ -97,7 +128,7 @@ function csNzMakeZChannelPolyMm(it) {
 }
 
 /**
- * Identify LEFT flange tip + RIGHT flange–web joint (and the mirror pair).
+ * Identify flange tip + flange–web joint contact pairs (left/right).
  */
 function csNzTipJointPairsFromPoly(ptsIn) {
   const pts = csNzPts(ptsIn);
@@ -110,16 +141,13 @@ function csNzTipJointPairsFromPoly(ptsIn) {
     if (p[1] > maxV) maxV = p[1];
   });
 
-  // Left tip = leftmost point in upper half; right tip = rightmost in lower half
   const topTip = pts.filter(p => p[1] >= (minV + maxV) / 2)
     .reduce((b, p) => (!b || p[0] < b[0] ? p : b), null);
   const botTip = pts.filter(p => p[1] <= (minV + maxV) / 2)
     .reduce((b, p) => (!b || p[0] > b[0] ? p : b), null);
 
-  // Bottom flange outer edge (near minV) — web joint = leftmost of that edge
   const botBand = pts.filter(p => p[1] <= minV + Math.max((maxV - minV) * 0.05, 2));
   const botWebJoint = botBand.slice().sort((a, b) => a[0] - b[0])[0];
-  // Top flange outer — web joint = rightmost of top band (toward web from left tip)
   const topBand = pts.filter(p => p[1] >= maxV - Math.max((maxV - minV) * 0.05, 2));
   const topWebJoint = topBand.slice().sort((a, b) => b[0] - a[0])[0];
 
@@ -133,26 +161,29 @@ function csNzTipJointPairsFromPoly(ptsIn) {
       label,
     });
   };
-  // User: left flange tip + right-side flange/web joint
   add(topTip, botWebJoint, 'leftTip_rightWebJoint');
-  // Mirror (same sit, +X lean preferred in viewer)
   add(botTip, topWebJoint, 'rightTip_leftWebJoint');
   return pairs;
 }
 
 /**
- * LIVE ROTATE search: step degrees, find θ where tip + joint both on ground.
- * score = both same Y and both ≈ global minY.
+ * Option 2 — direct geometric angle: level tip→joint line onto horizontal.
+ * csNzRotY is CLOCKWISE by θ: y' = v·cosθ − u·sinθ
+ * → θ = +atan2(Δv, Δu) puts AB on a constant-Y line. Also try θ+π.
  */
-function csNzLiveRotateFindGroundAngle(ptsIn) {
+function csNzDirectTipJointAngle(ptsIn) {
   const pts = csNzPts(ptsIn);
   const pairs = csNzTipJointPairsFromPoly(pts);
   if (!pts.length || !pairs.length) return null;
 
   let best = null;
   for (const pair of pairs) {
-    for (let deg = -180; deg <= 180; deg += 0.1) {
-      const th = (deg * Math.PI) / 180;
+    const du = pair.joint[0] - pair.tip[0];
+    const dv = pair.joint[1] - pair.tip[1];
+    const base = Math.atan2(dv, du);
+    const trials = [base, base + Math.PI, base - Math.PI];
+    for (let ti = 0; ti < trials.length; ti++) {
+      const th = csNzNormPi(trials[ti]);
       let minY = Infinity;
       for (let i = 0; i < pts.length; i++) {
         const y = csNzRotY(pts[i][0], pts[i][1], th);
@@ -162,47 +193,94 @@ function csNzLiveRotateFindGroundAngle(ptsIn) {
       const yJ = csNzRotY(pair.joint[0], pair.joint[1], th);
       const gap = Math.abs(yT - yJ);
       const floatSum = (yT - minY) + (yJ - minY);
-      // Prefer both touching ground; slight preference for +X (viewer habit)
-      const score = -(gap * 20 + floatSum * 10) + (deg > 0 && deg < 160 ? 0.2 : 0);
+      const score = csNzContactScore(gap, floatSum);
       if (!best || score > best.score) {
         best = {
           nesting_angle: th,
-          deg,
+          deg: csNzDeg(th),
           score,
           gap,
           floatSum,
           tip: pair.tip,
           joint: pair.joint,
           label: pair.label,
+          source: 'direct_atan2',
         };
       }
     }
   }
-  if (!best) return null;
-
-  // Fine refine ±0.2°
-  let refined = best;
-  for (let deg = best.deg - 0.2; deg <= best.deg + 0.2; deg += 0.02) {
-    const th = (deg * Math.PI) / 180;
-    let minY = Infinity;
-    for (let i = 0; i < pts.length; i++) {
-      const y = csNzRotY(pts[i][0], pts[i][1], th);
-      if (y < minY) minY = y;
-    }
-    const yT = csNzRotY(best.tip[0], best.tip[1], th);
-    const yJ = csNzRotY(best.joint[0], best.joint[1], th);
-    const gap = Math.abs(yT - yJ);
-    const floatSum = (yT - minY) + (yJ - minY);
-    const score = -(gap * 20 + floatSum * 10) + (deg > 0 && deg < 160 ? 0.2 : 0);
-    if (score > refined.score) {
-      refined = { ...best, nesting_angle: th, deg, score, gap, floatSum };
-    }
-  }
-  return refined;
+  return best;
 }
 
 /**
- * Nesting angle from LIVE rotate on makeZChannel poly (or Step1 outer_points).
+ * Evaluate contact score at angle θ (degrees) for a fixed tip/joint pair.
+ */
+function csNzEvalPairAtDeg(pts, pair, deg) {
+  const th = (deg * Math.PI) / 180;
+  let minY = Infinity;
+  for (let i = 0; i < pts.length; i++) {
+    const y = csNzRotY(pts[i][0], pts[i][1], th);
+    if (y < minY) minY = y;
+  }
+  const yT = csNzRotY(pair.tip[0], pair.tip[1], th);
+  const yJ = csNzRotY(pair.joint[0], pair.joint[1], th);
+  const gap = Math.abs(yT - yJ);
+  const floatSum = (yT - minY) + (yJ - minY);
+  return {
+    nesting_angle: th,
+    deg,
+    score: csNzContactScore(gap, floatSum),
+    gap,
+    floatSum,
+    tip: pair.tip,
+    joint: pair.joint,
+    label: pair.label,
+  };
+}
+
+/**
+ * LIVE rotate: direct atan2 seed + local refine (physics score only).
+ * Falls back to coarse ±180° search if direct seed missing.
+ */
+function csNzLiveRotateFindGroundAngle(ptsIn) {
+  const pts = csNzPts(ptsIn);
+  const pairs = csNzTipJointPairsFromPoly(pts);
+  if (!pts.length || !pairs.length) return null;
+
+  let best = csNzDirectTipJointAngle(pts);
+
+  // Local refine around direct seed (±5°), then fine ±0.2°
+  if (best) {
+    const pair = { tip: best.tip, joint: best.joint, label: best.label };
+    for (let deg = best.deg - 5; deg <= best.deg + 5; deg += 0.1) {
+      const hit = csNzEvalPairAtDeg(pts, pair, deg);
+      if (hit.score > best.score) best = { ...hit, source: 'direct_refine' };
+    }
+    for (let deg = best.deg - 0.2; deg <= best.deg + 0.2; deg += 0.02) {
+      const hit = csNzEvalPairAtDeg(pts, pair, deg);
+      if (hit.score > best.score) best = { ...hit, source: 'direct_fine' };
+    }
+    return best;
+  }
+
+  // Full search fallback (physics only — no deg bias)
+  for (const pair of pairs) {
+    for (let deg = -180; deg <= 180; deg += 0.25) {
+      const hit = csNzEvalPairAtDeg(pts, pair, deg);
+      if (!best || hit.score > best.score) best = { ...hit, source: 'search' };
+    }
+  }
+  if (!best) return null;
+  const pair = { tip: best.tip, joint: best.joint, label: best.label };
+  for (let deg = best.deg - 0.5; deg <= best.deg + 0.5; deg += 0.02) {
+    const hit = csNzEvalPairAtDeg(pts, pair, deg);
+    if (hit.score > best.score) best = { ...hit, source: 'search_fine' };
+  }
+  return best;
+}
+
+/**
+ * Nesting angle from LIVE/direct rotate on CS outer polygon (or sect fallback).
  */
 function calculateZNestingAngle(outerPoints, it) {
   const empty = {
@@ -220,13 +298,21 @@ function calculateZNestingAngle(outerPoints, it) {
     source: 'empty',
   };
 
-  // Prefer real viewer Z outline (lips) when item dims known
-  let pts = null;
-  if (it && (it.sectH || it.heightMm)) {
+  // Prefer real Step1 outer_points (any OPEN concave profile)
+  let pts = csNzPts(outerPoints);
+  if (pts.length < 4 && it?.crossSection?.outer_points)
+    pts = csNzPts(it.crossSection.outer_points);
+  if (pts.length < 4 && it && typeof extractCrossSection === 'function') {
+    try {
+      const cs = it.crossSection || extractCrossSection(it);
+      if (cs?.outer_points) pts = csNzPts(cs.outer_points);
+    } catch (_) { /* */ }
+  }
+  // Last resort: synthetic channel from sect dims (geometry dims, not names)
+  if (pts.length < 4 && it && (it.sectH || it.heightMm) && (it.sectW || it.widthMm)) {
     try { pts = csNzMakeZChannelPolyMm(it); } catch (_) { pts = null; }
   }
-  if (!pts || pts.length < 4) pts = csNzPts(outerPoints);
-  if (pts.length < 4) return empty;
+  if (!pts || pts.length < 4) return empty;
 
   const hit = csNzLiveRotateFindGroundAngle(pts);
   if (!hit) return empty;
@@ -260,18 +346,18 @@ function calculateZNestingAngle(outerPoints, it) {
     contact_float_mm: +hit.floatSum.toFixed(4),
     contact_label: hit.label,
     live_search_deg: hit.deg,
-    source: 'live_rotate_tip_joint_ground',
-    profile_type: 'Z_SHAPE',
+    source: hit.source || 'live_rotate_tip_joint_ground',
+    profile_type: 'OPEN_CONCAVE',
   };
 }
 
 function attachZNestingAngleToOrientation(it, orientation_info) {
-  if (!csNzIsZShape(it)) return orientation_info || null;
+  if (!requiresLiveRotateSearch(it)) return orientation_info || null;
   const cs = it.crossSection
     || (typeof extractCrossSection === 'function' ? extractCrossSection(it) : null);
   const nest = calculateZNestingAngle(cs?.outer_points, it);
   const oi = orientation_info || it.orientation_info || {};
-  oi.profile_type = 'Z_SHAPE';
+  oi.profile_type = 'OPEN_CONCAVE';
   oi.nesting_angle_rad = nest.nesting_angle_rad;
   oi.nesting_angle_deg = nest.nesting_angle_deg;
   oi.nest_axis_angle_rad = nest.nest_axis_angle_rad;
@@ -311,7 +397,6 @@ function csNzMeshWorldBox(obj) {
       return;
     const pos = ch.geometry.attributes && ch.geometry.attributes.position;
     if (!pos || !pos.count) return;
-    // Prefer baked world via matrix — sample every vertex (Z sections are small)
     for (let i = 0; i < pos.count; i++) {
       v.fromBufferAttribute(pos, i);
       ch.localToWorld(v);
@@ -333,8 +418,6 @@ function csNzMeshWorldBox(obj) {
 
 /**
  * MOVE ONLY (no rotate): translate Y so mesh minY = ground plane.
- * Ground = SCENE_GROUND_Y (0) when defined, else 0.
- * Two-pass for matrix precision. Keeps X/Z and rotation untouched.
  */
 function csNzSnapObjectToGround(obj) {
   if (!obj || typeof THREE === 'undefined') return null;
@@ -347,7 +430,7 @@ function csNzSnapObjectToGround(obj) {
     obj.updateMatrixWorld(true);
     const box = csNzMeshWorldBox(obj);
     if (!box || !isFinite(box.min.y)) break;
-    const dy = groundY - box.min.y; // MOVE down/up — never rotate
+    const dy = groundY - box.min.y;
     if (Math.abs(dy) > 1e-10) {
       obj.position.y += dy;
       moved += dy;
@@ -359,10 +442,6 @@ function csNzSnapObjectToGround(obj) {
     if (floor && Math.abs(floor.min.y - groundY) < 1e-6) break;
   }
   const err = floor ? (floor.min.y - groundY) : null;
-  try {
-    if (Math.abs(moved) > 1e-6)
-      console.info(`[Z ground MOVE] dy=${(moved).toFixed(5)} floor_err=${err}`);
-  } catch (_) { /* */ }
   return {
     ok: !!(floor && Math.abs(err) < 1e-4),
     floor_y: floor ? floor.min.y : null,
@@ -373,15 +452,15 @@ function csNzSnapObjectToGround(obj) {
 }
 
 /**
- * Apply: LIVE-rotate tip+joint pose, then careful ground snap (minY→0).
- * Does NOT change nest angle — only ensures ground touch.
+ * Apply tip+joint ground roll, then snap minY→0.
+ * Gate: requiresLiveRotateSearch (geometry) — not profile name.
  */
 function applyZNestingAngleToObject(obj, it) {
-  if (!obj || typeof THREE === 'undefined' || !csNzIsZShape(it)) return null;
+  if (!obj || typeof THREE === 'undefined') return null;
+  if (!requiresLiveRotateSearch(it)) return null;
   const keepX = obj.position.x;
   const keepZ = obj.position.z;
 
-  // Always recompute from makeZChannel poly (matches drawn mesh)
   const nest = calculateZNestingAngle(null, it);
   if (it) {
     if (!it.orientation_info) it.orientation_info = {};
@@ -420,16 +499,16 @@ function applyZNestingAngleToObject(obj, it) {
   try {
     if (obj.userData) obj.userData.zNestingAngle = info;
     console.info(
-      `[Z nest LIVE] roll=${info.applied_deg}° ground=${info.ground_touch}`
+      `[live-rotate] roll=${info.applied_deg}° ground=${info.ground_touch}`
       + ` floor_y=${info.floor_y} label=${info.contact_label}`
     );
   } catch (_) { /* */ }
   return info;
 }
 
-/** Ground-only snap for Z (pose already correct — staging re-drop). */
+/** Ground-only snap for open-concave items (pose already correct). */
 function snapZItemToGround(obj, it) {
   if (!obj) return null;
-  if (it && typeof csNzIsZShape === 'function' && !csNzIsZShape(it)) return null;
+  if (it && !requiresLiveRotateSearch(it)) return null;
   return csNzSnapObjectToGround(obj);
 }

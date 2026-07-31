@@ -175,9 +175,9 @@ function orientObjectToWarehouseGround(obj, it) {
 
   // Do NOT wipe obj.rotation — analytic builders (rod z=π/2, C x=π/2)
   // already encode face-down / length-horizontal. Measure CURRENT pose.
+  // Do NOT force Y=0 before measure (was skewing complex sub-mesh AABB).
   const keepX = obj.position.x;
   const keepZ = obj.position.z;
-  obj.position.y = 0;
   obj.updateMatrixWorld(true);
 
   const box0 = new THREE.Box3().setFromObject(obj);
@@ -209,16 +209,26 @@ function orientObjectToWarehouseGround(obj, it) {
   }
   obj.updateMatrixWorld(true);
 
-  const box1 = new THREE.Box3().setFromObject(obj);
-  if (isFinite(box1.min.y)) obj.position.y -= box1.min.y;
+  // Single ground snap (mesh-aware when available)
   obj.position.x = keepX;
   obj.position.z = keepZ;
-  obj.updateMatrixWorld(true);
+  if (typeof csNzSnapObjectToGround === 'function') {
+    csNzSnapObjectToGround(obj);
+  } else {
+    const box1 = new THREE.Box3().setFromObject(obj);
+    if (isFinite(box1.min.y)) obj.position.y -= box1.min.y;
+    obj.position.x = keepX;
+    obj.position.z = keepZ;
+    obj.updateMatrixWorld(true);
+  }
 
-  const boxF = new THREE.Box3().setFromObject(obj);
+  const boxF = (typeof csNzMeshWorldBox === 'function')
+    ? csNzMeshWorldBox(obj)
+    : new THREE.Box3().setFromObject(obj);
   const sizeF = new THREE.Vector3();
-  boxF.getSize(sizeF);
+  if (boxF) boxF.getSize(sizeF);
   const tip = sizeF.y / Math.max(Math.min(sizeF.x, sizeF.z), 1e-9);
+  const floorY = boxF && isFinite(boxF.min.y) ? boxF.min.y : 0;
 
   const info = {
     ok: true,
@@ -230,8 +240,8 @@ function orientObjectToWarehouseGround(obj, it) {
     face_area: choice.area,
     extents_before: { x: extX, y: extY, z: extZ },
     extents_after: { x: sizeF.x, y: sizeF.y, z: sizeF.z },
-    floor_y: boxF.min.y,
-    ground_stable: Math.abs(boxF.min.y) < 1e-3 && tip <= WH_TIP_RATIO_MAX,
+    floor_y: floorY,
+    ground_stable: Math.abs(floorY) < 1e-3 && tip <= WH_TIP_RATIO_MAX,
     mutates_geometry: false,
     mark: it?.mark || null,
   };
@@ -244,19 +254,161 @@ function orientObjectToWarehouseGround(obj, it) {
 }
 
 /**
- * Apply warehouse ground to all raw IFC items' display meshes (batch helper).
- * Call after makeShape paths — prefer ensureStableShape which already hooks this.
+ * RULE 1 — SINGLE orientation pipeline for a display mesh.
+ *   Stage1: coarse warehouse AABB face (skipped for OPEN+concave — tip sit wrong)
+ *   Stage2: fine tip+joint live/direct roll when requiresLiveRotateSearch
+ *   Stage3: snap minY → ground
+ * Rigid only — never mutates BufferGeometry / sect / meshPositionsMm.
+ *
+ * @returns {{ ok, method, stages, warehouse?, live?, floor_y, ground_stable }}
  */
-function attachWarehouseGroundToItems(items) {
-  // Metadata stamp only — actual orient runs in ensureStableShape/makeShape
-  let n = 0;
+function groundOrientItem(it, threeObject) {
+  if (!threeObject || typeof THREE === 'undefined') {
+    return { ok: false, reason: 'no_object', stages: [] };
+  }
+  const stages = [];
+  const keepX = threeObject.position.x;
+  const keepZ = threeObject.position.z;
+
+  // Ensure Step1/2 so Stage2 gate is geometry-correct
+  if (it) {
+    if (!it.crossSection && typeof extractCrossSection === 'function') {
+      try { extractCrossSection(it); } catch (_) { /* */ }
+    }
+    if (!it.csAnalysis && typeof analyzeCrossSection === 'function') {
+      try { analyzeCrossSection(it); } catch (_) { /* */ }
+    }
+  }
+
+  // Welded assemblies → dedicated multi-face refine (same as yard BASE cargo)
+  if (it && typeof cstabIsWeldedAssembly === 'function' && cstabIsWeldedAssembly(it)
+      && typeof refineAssemblyGroundPose === 'function') {
+    const ev = refineAssemblyGroundPose(threeObject, it, it.orientation_info || null);
+    stages.push('assembly_refine');
+    const floorY = ev && ev.floor_y != null
+      ? ev.floor_y
+      : (typeof csNzMeshWorldBox === 'function'
+        ? (csNzMeshWorldBox(threeObject) || {}).min?.y
+        : null);
+    const info = {
+      ok: true,
+      method: 'assembly_refine',
+      stages,
+      ev,
+      floor_y: floorY,
+      ground_stable: !!(ev && (ev.ground_stable || Math.abs(ev.floor_y || 0) < 1e-3)),
+      mutates_geometry: false,
+    };
+    try {
+      if (threeObject.userData) threeObject.userData.rule1Ground = info;
+      if (it) it._rule1GroundResult = info;
+    } catch (_) { /* */ }
+    return info;
+  }
+
+  const needsLive = typeof requiresLiveRotateSearch === 'function'
+    && requiresLiveRotateSearch(it);
+
+  let warehouse = null;
+  let live = null;
+
+  if (needsLive && typeof applyZNestingAngleToObject === 'function') {
+    // OPEN+concave: skip coarse AABB tip-sit — tip+joint roll is the rest pose
+    live = applyZNestingAngleToObject(threeObject, it);
+    stages.push('live_rotate');
+  } else if (typeof orientObjectToWarehouseGround === 'function') {
+    warehouse = orientObjectToWarehouseGround(threeObject, it);
+    stages.push('warehouse_aabb');
+  }
+
+  threeObject.position.x = keepX;
+  threeObject.position.z = keepZ;
+  if (typeof csNzSnapObjectToGround === 'function') {
+    csNzSnapObjectToGround(threeObject);
+    stages.push('ground_snap');
+  }
+
+  const boxF = (typeof csNzMeshWorldBox === 'function')
+    ? csNzMeshWorldBox(threeObject)
+    : new THREE.Box3().setFromObject(threeObject);
+  const floorY = boxF && isFinite(boxF.min.y) ? boxF.min.y : null;
+  const info = {
+    ok: floorY != null && Math.abs(floorY) < 1e-3,
+    method: needsLive ? 'live_rotate' : 'warehouse_aabb',
+    stages,
+    warehouse,
+    live,
+    floor_y: floorY,
+    ground_stable: floorY != null && Math.abs(floorY) < 1e-3,
+    mutates_geometry: false,
+    mark: it?.mark || null,
+  };
+  try {
+    if (threeObject.userData) threeObject.userData.rule1Ground = info;
+    if (it) {
+      it._rule1GroundResult = info;
+      it._warehouseGroundPreferred = true;
+    }
+  } catch (_) { /* */ }
+  return info;
+}
+
+/**
+ * RULE 1 batch: orient every display object via groundOrientItem once.
+ * @param {object[]} items
+ * @param {function(object):THREE.Object3D|null} resolveObject — (it) => mesh/group
+ */
+function groundOrientAll(items, resolveObject) {
+  const resolve = typeof resolveObject === 'function' ? resolveObject : null;
+  let ok = 0, fail = 0, skipped = 0;
   (items || []).forEach(it => {
     if (!it) return;
+    const obj = resolve ? resolve(it) : null;
+    if (!obj) {
+      // Prep metadata so makeShape → ensureStableShape runs the same pipeline
+      it._warehouseGroundPreferred = true;
+      it._rule1Ground = true;
+      skipped++;
+      return;
+    }
+    const r = groundOrientItem(it, obj);
+    if (r && r.ok) ok++; else fail++;
+  });
+  try {
+    console.info(
+      `[Rule1 groundOrientAll] ok=${ok} fail=${fail} deferred=${skipped}`
+      + ` of ${(items || []).length}`
+    );
+  } catch (_) { /* */ }
+  return { ok, fail, skipped, total: (items || []).length };
+}
+
+/**
+ * After Step1+2: stamp Rule1 preference + ensure analysis ready for makeShape.
+ * Actual mesh orient runs once via groundOrientItem inside ensureStableShape.
+ */
+function attachWarehouseGroundToItems(items) {
+  let n = 0;
+  let liveN = 0;
+  (items || []).forEach(it => {
+    if (!it) return;
+    if (!it.crossSection && typeof extractCrossSection === 'function') {
+      try { extractCrossSection(it); } catch (_) { /* */ }
+    }
+    if (!it.csAnalysis && typeof analyzeCrossSection === 'function') {
+      try { analyzeCrossSection(it); } catch (_) { /* */ }
+    }
     it._warehouseGroundPreferred = true;
+    it._rule1Ground = true;
+    if (typeof requiresLiveRotateSearch === 'function' && requiresLiveRotateSearch(it))
+      liveN++;
     n++;
   });
   try {
-    console.info(`[warehouse-ground] preferred for ${n} items (applied on makeShape)`);
+    console.info(
+      `[Rule1] prepared ${n} items (${liveN} OPEN+concave → live tip+joint)`
+      + ` — applied once on makeShape via groundOrientItem`
+    );
   } catch (_) { /* */ }
-  return { total: n };
+  return { total: n, liveRotate: liveN };
 }

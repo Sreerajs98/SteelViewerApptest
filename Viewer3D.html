@@ -101,9 +101,9 @@
              title="Live Floor Anchor: heaviest assemblies first on floor (≥80% bearing, yaw 0°/180°), then compact.">
         <input type="checkbox" id="animatePackBox"
                style="width:14px;height:14px;accent-color:var(--green);cursor:pointer">
-        Animate pack (live Floor Anchor)
+        Animate pack (live try: rotate all dirs → seat)
       </label>
-      <button id="btnOptimisePlace" onclick="layoutPlaceSelected()" style="width:100%;margin-top:6px;padding:7px 0;border-radius:6px;border:none;background:var(--green);color:#fff;font-size:12.5px;font-weight:600;cursor:pointer;opacity:0.45" title="Rule #1 Floor Anchor (≥80%, yaw 0/180, floor Y) then Pass2 compact/fill." disabled>
+      <button id="btnOptimisePlace" onclick="layoutPlaceSelected()" style="width:100%;margin-top:6px;padding:7px 0;border-radius:6px;border:none;background:var(--green);color:#fff;font-size:12.5px;font-weight:600;cursor:pointer;opacity:0.45" title="Heavy-first Floor Anchor: try all stable-base directions (yaw + face rolls), ≥80% bearing, then Pass2 compact/fill. Check Animate to watch each try." disabled>
         ✓ Optimise &amp; Move Selected to Container
       </button>
     </div>
