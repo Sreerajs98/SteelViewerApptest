@@ -429,36 +429,63 @@
     assert((o[0].stabilityScore || 0) + 1e-6 >= (o[1].stabilityScore || 0), 'stable first');
   });
 
-  t('W.13a', 'Rule1 gate: GEOMETRY open+concave — not mark/name', () => {
-    if (typeof requiresLiveRotateSearch !== 'function') {
+  t('W.13a', 'Rule1 gate: Z-geometry (opposite flange) — not mark/name', () => {
+    const gate = (typeof needsZStyleGroundFix === 'function')
+      ? needsZStyleGroundFix
+      : requiresLiveRotateSearch;
+    if (typeof gate !== 'function') {
       assert(true, 'skip');
       return;
     }
-    // Non-standard mark "P-200" but OPEN + deep concavity → MUST live-rotate
-    const openDeep = {
-      mark: 'P-200',
-      profileDesc: 'CUSTOM',
-      shapeKey: 'unknown',
-      csAnalysis: { open_closed: 'open', profile_type: 'OPEN', concavity_ratio: 0.42 },
+    // Unknown mark + Z polygon (left high / right low) → TRUE
+    const zPoly = [
+      [-40, 30], [-5, 30], [-5, 5], [5, -5], [40, -5], [40, -30],
+      [5, -30], [5, -10], [-5, 10], [-40, 10],
+    ];
+    const purlinA = {
+      mark: 'PURLIN-A',
+      profileDesc: 'UNKNOWN',
+      shapeKey: 'other',
+      crossSection: { outer_points: zPoly },
+      csAnalysis: {
+        open_closed: 'open', profile_type: 'OPEN',
+        concavity_ratio: 0.72, has_180_symmetry: true, symmetry_180: 0.92,
+      },
     };
-    assert(requiresLiveRotateSearch(openDeep) === true, 'P-200 open deep');
-    // Z-named but CLOSED / low concavity → must NOT trigger on name alone
-    const fakeZ = {
+    assert(gate(purlinA) === true, 'PURLIN-A Z geometry');
+
+    // C-like: web on left, BOTH flanges extend to +U (same side) — not Z
+    const cPoly = [
+      [-30, 40], [35, 40], [35, 32], [-20, 32], [-20, -32], [35, -32], [35, -40], [-30, -40],
+    ];
+    const cItem = {
+      mark: 'C250',
+      shapeKey: 'c_channel',
+      crossSection: { outer_points: cPoly },
+      csAnalysis: {
+        open_closed: 'open', profile_type: 'OPEN',
+        concavity_ratio: 0.70, has_180_symmetry: false, symmetry_180: 0.2,
+      },
+    };
+    assert(gate(cItem) === false, 'C not Z-style');
+
+    // Name says Z but CLOSED / no poly asymmetry → FALSE (no name trust)
+    assert(gate({
       mark: '200Z2',
       profileDesc: '200Z2',
       shapeKey: 'z_channel',
-      csAnalysis: { open_closed: 'closed', profile_type: 'CLOSED', concavity_ratio: 0.01 },
-    };
-    assert(requiresLiveRotateSearch(fakeZ) === false, 'name alone not enough');
-    // Solid / shallow open → no
-    assert(requiresLiveRotateSearch({
+      crossSection: { outer_points: [[0, 0], [1, 0], [1, 1], [0, 1]] },
+      csAnalysis: {
+        open_closed: 'closed', profile_type: 'CLOSED',
+        concavity_ratio: 0.01, has_180_symmetry: false,
+      },
+    }) === false, 'name alone not enough');
+
+    assert(gate({
       mark: 'PL1',
       csAnalysis: { open_closed: 'solid', profile_type: 'SOLID', concavity_ratio: 0 },
+      crossSection: { outer_points: [[0, 0], [10, 0], [10, 1], [0, 1]] },
     }) === false, 'solid no');
-    assert(requiresLiveRotateSearch({
-      mark: 'C1',
-      csAnalysis: { open_closed: 'open', profile_type: 'OPEN', concavity_ratio: 0.05 },
-    }) === false, 'shallow open no');
   });
 
   t('W.13b', 'Direct tip+joint atan2 levels contacts (physics, no deg bias)', () => {

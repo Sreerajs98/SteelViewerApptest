@@ -10,14 +10,20 @@
  */
 
 const CSNZ_EDGE_MIN_MM = 1.0;
-/** Deep open profiles need tip+joint sit (matches Step2 "deep" class). */
-const CSNZ_LIVE_CONCAVITY_MIN = 0.15;
+/**
+ * Z-style ground fix needs deep open concavity.
+ * (C/L also open+concave — opposite-flange / 180° gate separates them.)
+ */
+const CSNZ_LIVE_CONCAVITY_MIN = 0.6;
+/** Left-band vs right-band mean-V separation (normalized) → opposite flanges. */
+const CSNZ_OPPOSITE_FLANGE_MIN = 0.25;
+/** Shoelace centroid vs bbox centre — diagonal offset (secondary signal). */
+const CSNZ_DIAG_OFFSET_MIN = 0.05;
 
 /**
- * RULE 1 Stage-2 gate — GEOMETRY ONLY (no shapeKey / mark / profileDesc).
- * OPEN + concavity_ratio > threshold → live tip+joint ground search.
+ * Ensure Step1+2 geometry exists (never uses mark/profileDesc).
  */
-function requiresLiveRotateSearch(it) {
+function csNzEnsureAnalysis(it) {
   if (!it) return false;
   if (!it.crossSection && typeof extractCrossSection === 'function') {
     try { extractCrossSection(it); } catch (_) { /* */ }
@@ -25,23 +31,142 @@ function requiresLiveRotateSearch(it) {
   if (!it.csAnalysis && typeof analyzeCrossSection === 'function') {
     try { analyzeCrossSection(it); } catch (_) { /* */ }
   }
-  const an = it.csAnalysis || {};
-  const cs = it.crossSection || {};
-  const openClosed = String(an.open_closed || cs.open_closed || '').toLowerCase();
-  const profileType = String(an.profile_type || '').toUpperCase();
-  const isOpen = openClosed === 'open' || profileType === 'OPEN';
-  if (!isOpen) return false;
-  const conc = Number(an.concavity_ratio != null ? an.concavity_ratio : cs.concavity_ratio);
-  if (!isFinite(conc)) return false;
-  return conc > CSNZ_LIVE_CONCAVITY_MIN;
+  return !!(it.crossSection && it.csAnalysis);
+}
+
+/** Outer polygon as [u,v][] from crossSection. */
+function csNzOuterPts(it) {
+  const raw = (it && it.crossSection && it.crossSection.outer_points) || [];
+  return csNzPts(raw);
 }
 
 /**
- * @deprecated Alias — now geometry-based (requiresLiveRotateSearch).
- * Do NOT add name/mark checks here.
+ * Area (shoelace) centroid — better than vertex-average for uneven sampling.
+ * Returns { cx, cy } or null.
+ */
+function csNzPolygonCentroid(pts) {
+  if (!pts || pts.length < 3) return null;
+  let a = 0, cx = 0, cy = 0;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const x0 = pts[j][0], y0 = pts[j][1];
+    const x1 = pts[i][0], y1 = pts[i][1];
+    const cross = x0 * y1 - x1 * y0;
+    a += cross;
+    cx += (x0 + x1) * cross;
+    cy += (y0 + y1) * cross;
+  }
+  a *= 0.5;
+  if (Math.abs(a) < 1e-12) {
+    // Degenerate → vertex mean
+    let sx = 0, sy = 0;
+    pts.forEach(p => { sx += p[0]; sy += p[1]; });
+    return { cx: sx / pts.length, cy: sy / pts.length };
+  }
+  return { cx: cx / (6 * a), cy: cy / (6 * a) };
+}
+
+/**
+ * Opposite-flange measure ∈ [0,1]:
+ * Z: left band high / right band low (or reverse) → large
+ * C: both flanges same side → small
+ */
+function csNzOppositeFlangeScore(pts) {
+  if (!pts || pts.length < 4) return 0;
+  let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+  pts.forEach(p => {
+    if (p[0] < minU) minU = p[0];
+    if (p[0] > maxU) maxU = p[0];
+    if (p[1] < minV) minV = p[1];
+    if (p[1] > maxV) maxV = p[1];
+  });
+  const w = Math.max(maxU - minU, 1e-9);
+  const h = Math.max(maxV - minV, 1e-9);
+  const left = pts.filter(p => p[0] <= minU + w * 0.25);
+  const right = pts.filter(p => p[0] >= maxU - w * 0.25);
+  if (!left.length || !right.length) return 0;
+  const leftV = left.reduce((s, p) => s + p[1], 0) / left.length;
+  const rightV = right.reduce((s, p) => s + p[1], 0) / right.length;
+  return Math.abs(leftV - rightV) / h;
+}
+
+/**
+ * Diagonal CoG asymmetry: shoelace centroid offset from bbox centre in BOTH U&V.
+ * Note: perfect 180°-symmetric Z has centroid ≈ centre — use as secondary only.
+ */
+function csNzDiagonalCogAsymmetry(pts) {
+  const c = csNzPolygonCentroid(pts);
+  if (!c || !pts.length) return { offsetU: 0, offsetV: 0, ok: false };
+  let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+  pts.forEach(p => {
+    if (p[0] < minU) minU = p[0];
+    if (p[0] > maxU) maxU = p[0];
+    if (p[1] < minV) minV = p[1];
+    if (p[1] > maxV) maxV = p[1];
+  });
+  const bboxW = Math.max(maxU - minU, 1e-9);
+  const bboxH = Math.max(maxV - minV, 1e-9);
+  const bboxCX = (minU + maxU) / 2;
+  const bboxCY = (minV + maxV) / 2;
+  const offsetU = Math.abs(c.cx - bboxCX) / bboxW;
+  const offsetV = Math.abs(c.cy - bboxCY) / bboxH;
+  return {
+    offsetU, offsetV,
+    ok: offsetU > CSNZ_DIAG_OFFSET_MIN && offsetV > CSNZ_DIAG_OFFSET_MIN,
+  };
+}
+
+/**
+ * GEOMETRY ONLY — Z-style tip+joint ground fix needed?
+ *
+ * Z unique traits (any IFC name):
+ *   1) OPEN profile
+ *   2) HIGH concavity (≥0.6)
+ *   3) Opposite flanges / 180° anti-symmetry (leans on single flange)
+ *
+ * C: open+concave but flanges SAME side → false (warehouse AABB enough)
+ * L: open but not opposite-flange Z pattern → false
+ *
+ * No shapeKey / mark / profileDesc — works Tekla / Revit / unknown marks.
+ */
+function needsZStyleGroundFix(it) {
+  if (!it) return false;
+  if (!csNzEnsureAnalysis(it)) return false;
+
+  const an = it.csAnalysis || {};
+  const openClosed = String(an.open_closed || '').toLowerCase();
+  const profileType = String(an.profile_type || '').toUpperCase();
+  if (!(openClosed === 'open' || profileType === 'OPEN')) return false;
+
+  const conc = Number(an.concavity_ratio);
+  if (!(conc >= CSNZ_LIVE_CONCAVITY_MIN)) return false;
+
+  const pts = csNzOuterPts(it);
+  if (pts.length < 4) return false;
+
+  // Primary: opposite flanges (Z) vs same-side (C)
+  const opp = csNzOppositeFlangeScore(pts);
+  if (opp >= CSNZ_OPPOSITE_FLANGE_MIN) return true;
+
+  // Primary alt: Step2 already measured 180° symmetry (Z yes, C no)
+  if (an.has_180_symmetry || (Number(an.symmetry_180) || 0) >= 0.85)
+    return true;
+
+  // Secondary: diagonal centroid offset (imperfect / non-centred Z meshes)
+  const diag = csNzDiagonalCogAsymmetry(pts);
+  return !!diag.ok;
+}
+
+/** Alias used across pipeline — same geometry gate. */
+function requiresLiveRotateSearch(it) {
+  return needsZStyleGroundFix(it);
+}
+
+/**
+ * Alias kept for callers (11 / 11a / 14 / 15).
+ * Implementation = needsZStyleGroundFix — NEVER name-based.
  */
 function csNzIsZShape(it) {
-  return requiresLiveRotateSearch(it);
+  return needsZStyleGroundFix(it);
 }
 
 function csNzNormPi(a) {
