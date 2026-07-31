@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Steel Packing — Industrial Logistics Viewer</title>
+<!--
+  Viewer shell — markup only. Logic lives under /viewer:
+    css/viewer.css
+    js/theme-boot.js
+    js/01-staging-ui.js      staging / containers / group UI
+    js/02-scene-core.js      Three.js init, theme, clamps
+    js/03-shapes.js          profiles + makeShape
+    js/04-ifc-assembly.js    xBIM mesh assemblies + bundles
+    js/05-packing.js         expandUnits + layouts
+    js/08-grouping.js        real-world Group by Shape rules
+    js/19-cs-validate.js     STEP 9 — PACK_CONFIG + validation + unfit restore
+    js/09-cross-section.js   STEP 1 — 2D cross-section extract
+    js/10-cs-analyze.js      STEP 2 — open/closed/concavity/symmetry/nest dir
+    js/11-cs-orient.js       STEP 3 — orientation scores only (no shape change)
+    js/11b-cs-z-nest-angle.js Z Nesting Angle — two-point ground level (Z only)
+    js/11a-cs-apply-orient.js STEP 4 — apply orientation + Z nest roll
+    js/12-cs-group.js        STEP 5 — group by cross-section signature (no shape change)
+    js/13-cs-nest-method.js  STEP 6 — nest method from geometry (no shape change)
+    js/14-cs-nest-offset.js  STEP 7 — nest offset auto (no shape change)
+    js/15-cs-stability.js    Auto nest rest-pose / CoG stability (rigid only)
+    js/15a-warehouse-ground.js FIRST PRIORITY — AABB widest-face on ground
+    js/16-taper-pack.js      Tapered/non-uniform station clearance (no static offset)
+    js/17-cs-pack-units.js   STEP 7 — build pack units (no shape change)
+    js/18-cs-container-pack.js STEP 8 — container fit/pack Y-yaw only (no shape change)
+    js/06-render-interact.js render, drag, rotate, place
+    js/07-load-scene.js      loadScene + C# bridge
+  Full pre-split snapshot: Viewer3D.monolith.backup.html
+-->
+<script src="viewer/js/theme-boot.js"></script>
+<link rel="stylesheet" href="viewer/css/viewer.css">
+</head>
+<body>
+
+<!-- ═══════════════ TOP BAR ═══════════════════════════════════ -->
+<div id="topbar">
+  <span id="jobLabel">Steel Packing Viewer</span>
+  <div id="topSep"></div>
+  <button type="button" id="themeToggle" class="tbtn" onclick="toggleTheme()"
+          title="Switch between dark and light (system default) theme">Light</button>
+  <span id="statusMsg">Upload an IFC or Excel file to begin</span>
+  <label class="tbtn primary">
+    Upload IFC / Excel
+    <input type="file" id="fileInput" accept=".xlsx,.json,.ifc" style="display:none">
+  </label>
+</div>
+
+<!-- ═══════════════ 3-PANEL LAYOUT ════════════════════════════ -->
+<div id="layout">
+
+  <!-- ── LEFT: STAGING AREA ──────────────────────────────────── -->
+  <div id="staging">
+    <div id="stagingHeader">
+      <h2>📦 Staging Area <span id="stagingCount" style="color:var(--text3);font-weight:400"></span></h2>
+      <input id="stagingSearch" placeholder="Search mark, name, profile, Bundle…" oninput="filterStaging(this.value)">
+      <div id="workflowHint" style="margin-top:8px;padding:8px 10px;border-radius:6px;border:1px solid var(--border2);background:var(--bg2);font-size:11.5px;color:var(--text2);line-height:1.45">
+        Step 1 — Items loaded. Next: <b style="color:var(--text)">Group by Shape</b>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;margin-top:8px">
+        <label id="selectAllLabel" style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2);cursor:pointer;user-select:none;flex:none"
+               title="Select / deselect all visible items">
+          <input type="checkbox" id="selectAllBox" onclick="toggleSelectAll(this.checked)"
+                 style="width:15px;height:15px;accent-color:var(--blue);cursor:pointer">
+          Select all
+        </label>
+        <span id="selectedCountHint" style="font-size:11px;color:var(--text3)"></span>
+      </div>
+      <div style="display:flex;gap:5px;margin-top:6px">
+        <button id="selModeSet" onclick="setSelectMode('set')" style="flex:1;padding:5px 0;border-radius:5px;border:1px solid var(--blue);background:rgba(59,130,246,0.15);color:var(--text);font-size:11px;cursor:pointer" title="Click a bundle to move/rotate the whole set">
+          Select: Set
+        </button>
+        <button id="selModePiece" onclick="setSelectMode('piece')" style="flex:1;padding:5px 0;border-radius:5px;border:1px solid var(--border2);background:var(--bg3);color:var(--text2);font-size:11px;cursor:pointer" title="Click to move/rotate one piece only">
+          Select: Piece
+        </button>
+      </div>
+      <div style="display:flex;gap:5px;margin-top:6px;align-items:stretch">
+        <label id="freeDragLabel" title="After Group: drag any set in the 3D view (no Move button). Off = orbit only / no accidental moves"
+               style="flex:1.2;display:flex;align-items:center;gap:7px;padding:6px 8px;border-radius:5px;border:1px solid var(--border2);background:var(--bg3);color:var(--text2);font-size:11.5px;cursor:pointer;opacity:0.45;user-select:none;font-weight:600">
+          <input type="checkbox" id="freeDragBox" checked
+                 onclick="event.stopPropagation();setFreeDragOutside(this.checked)"
+                 style="width:15px;height:15px;accent-color:var(--blue);cursor:pointer;flex:none">
+          Drag to rearrange
+        </label>
+        <button id="btnMoveMode" onclick="toggleMoveMode()" style="flex:1;padding:6px 0;border-radius:5px;border:1px solid var(--border2);background:var(--bg3);color:var(--text2);font-size:11px;cursor:pointer;opacity:0.45" title="Drag selected set into the container (stays inside walls)" disabled>
+          → Into container
+        </button>
+      </div>
+      <div style="display:flex;gap:5px;margin-top:6px">
+        <button id="btnGroupByShape" onclick="groupByShape()" style="flex:1;padding:5px 0;border-radius:5px;border:1px solid var(--blue);background:rgba(59,130,246,0.18);color:var(--text);font-size:11.5px;cursor:pointer;font-weight:600" title="Step 2 — required before pick / Optimise">
+          ⊞ Group by Shape
+        </button>
+        <button id="btnUngroup" onclick="ungroupAll()" style="flex:1;padding:5px 0;border-radius:5px;border:1px solid var(--border2);background:var(--bg3);color:var(--text2);font-size:11.5px;cursor:pointer" title="Expand all groups back to individual items">
+          ⊟ Ungroup
+        </button>
+      </div>
+      <label id="animatePackLabel" style="display:flex;align-items:center;gap:6px;margin-top:8px;font-size:11px;color:var(--text2);cursor:pointer;user-select:none"
+             title="Live Floor Anchor: heaviest assemblies first on floor (≥80% bearing, yaw 0°/180°), then compact.">
+        <input type="checkbox" id="animatePackBox"
+               style="width:14px;height:14px;accent-color:var(--green);cursor:pointer">
+        Animate pack (live Floor Anchor)
+      </label>
+      <button id="btnOptimisePlace" onclick="layoutPlaceSelected()" style="width:100%;margin-top:6px;padding:7px 0;border-radius:6px;border:none;background:var(--green);color:#fff;font-size:12.5px;font-weight:600;cursor:pointer;opacity:0.45" title="Rule #1 Floor Anchor (≥80%, yaw 0/180, floor Y) then Pass2 compact/fill." disabled>
+        ✓ Optimise &amp; Move Selected to Container
+      </button>
+    </div>
+    <div id="stagingList">
+      <div id="stagingEmpty" style="padding:20px 14px;color:var(--text3);font-size:12px;text-align:center;line-height:1.7">
+        No items yet.<br>Upload an IFC or Excel file to populate the staging area.
+      </div>
+    </div>
+    <div id="stagingFooter" id="stagingFooter">
+      <span id="stagingStats"></span>
+    </div>
+  </div>
+
+  <!-- ── CENTER: 3D VIEWPORT ─────────────────────────────────── -->
+  <div id="viewport"
+    ondragover="onViewportDragOver(event)"
+    ondragleave="onViewportDragLeave(event)"
+    ondrop="onViewportDrop(event)">
+
+    <div id="canvas-wrap"></div>
+    <div id="fitBanner"></div>
+
+    <!-- Initial drop zone -->
+    <div id="dropZone">
+      <div style="color:var(--text2);font-size:14px">Upload an IFC or shipping list to begin</div>
+      <label>Choose file<input type="file" id="fileInput2" accept=".xlsx,.json" style="display:none"></label>
+    </div>
+
+    <!-- Drag-into-container highlight -->
+    <div id="dropTarget">Drop here to place in active container</div>
+
+    <!-- Mode buttons hidden — packing still runs via staging Optimise & Place -->
+    <div id="modeBar" style="display:none !important">
+      <button class="mbtn active" id="btnQuick" onclick="setMode('quick')">Quick view</button>
+      <button class="mbtn" id="btnOptimize" onclick="setMode('optimize')">Optimize packing</button>
+    </div>
+
+    <!-- Selection detail panel — appears on View / click select -->
+    <div id="info"></div>
+
+    <!-- Viewport stats overlay -->
+    <div id="viewportInfo" style="display:none">
+      <div id="cogDisplay"></div>
+    </div>
+
+    <div id="hint">After Group: drag a set to rearrange · click=select · empty space=orbit · → Into container for packing</div>
+  </div>
+
+  <!-- ── RIGHT: CONTAINER MANAGER ─────────────────────────────── -->
+  <div id="contPanel">
+    <div id="contHeader">
+      <h2>🚢 Containers</h2>
+      <button id="addContBtn" onclick="addContainer()">+ Add New Container</button>
+    </div>
+    <div id="contList">
+      <div id="contEmpty" style="padding:20px 14px;color:var(--text3);font-size:12px;text-align:center;line-height:1.7">
+        No containers yet.<br>Upload a job to auto-generate.
+      </div>
+    </div>
+    <div id="contFooter">
+      <div id="cogDisplay2" style="font-size:11px;color:var(--text2);line-height:1.7"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── Rotation widget ──────────────────────────────────────── -->
+<div id="rotWidget">
+  <div id="rotWidgetTitle">Rotation preview</div>
+  <canvas id="rotPreviewCanvas" width="824" height="600"></canvas>
+  <div id="rotDegHud" style="font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.45;padding:6px 8px;margin:4px 0;background:rgba(0,0,0,0.35);border-radius:6px;color:var(--text)">
+    <div style="font-size:11px;color:var(--text2);margin-bottom:2px">Absolute (now) — ignore for next chat</div>
+    <div><span style="color:#f87171">X</span> <span id="rotHudX">0.0°</span>
+      · <span style="color:#4ade80">Y</span> <span id="rotHudY">0.0°</span>
+      · <span style="color:#60a5fa">Z</span> <span id="rotHudZ">0.0°</span></div>
+    <div style="margin-top:6px;font-size:11px;color:#fbbf24">Change from when you opened (THIS is what to send)</div>
+    <div style="margin-top:2px;font-size:14px">
+      <span style="color:#f87171">ΔX</span> <b id="rotHudDx" style="font-size:18px">0.0°</b>
+      · <span style="color:#4ade80">ΔY</span> <b id="rotHudDy">0.0°</b>
+      · <span style="color:#60a5fa">ΔZ</span> <b id="rotHudDz">0.0°</b>
+      <button type="button" onclick="copyRotDelta()" style="margin-left:8px;font-size:11px;padding:2px 8px;cursor:pointer">Copy Δ</button>
+    </div>
+    <div id="rotHudZHint" style="display:none;margin-top:6px;font-size:12px;color:#fbbf24;line-height:1.4">
+      Z item: ΔX is still 0 until you press <b>X +</b> / <b>X −</b>.<br>
+      Keep tapping until the Z looks right → then <b>Copy Δ</b> and paste in chat.
+    </div>
+  </div>
+  <div class="rotHint">Drag = free rotate · Right-drag = orbit · Wheel = zoom · red=X green=Y blue=Z</div>
+  <div class="rotBtnRow" id="rotStepRow" style="align-items:center;flex-wrap:wrap">
+    <span style="font-size:11px;color:var(--text2);margin-right:2px">Step</span>
+    <button type="button" id="rotStep1" onclick="setRotStep(1)">1°</button>
+    <button type="button" id="rotStep5" onclick="setRotStep(5)">5°</button>
+    <button type="button" id="rotStep15" onclick="setRotStep(15)">15°</button>
+    <button type="button" id="rotStep45" onclick="setRotStep(45)">45°</button>
+    <button type="button" id="rotStep90" onclick="setRotStep(90)">90°</button>
+  </div>
+  <div class="rotBtnRow">
+    <button type="button" onclick="rotPreview('x', +1)" style="font-weight:700;border-color:#f87171;min-width:4.5em">X +</button>
+    <button type="button" onclick="rotPreview('x', -1)" style="font-weight:700;border-color:#f87171;min-width:4.5em">X −</button>
+    <button type="button" onclick="rotPreview('y', +1)">Y +</button>
+    <button type="button" onclick="rotPreview('y', -1)">Y −</button>
+    <button type="button" onclick="rotPreview('z', +1)">Z +</button>
+    <button type="button" onclick="rotPreview('z', -1)">Z −</button>
+  </div>
+  <div class="rotBtnRow">
+    <button class="rotApply" onclick="rotPreviewApply('piece')">✓ Apply to piece</button>
+    <button class="rotApplySet" onclick="rotPreviewApply('set')">✓ Apply to set</button>
+    <button onclick="rotPreviewReset()">Reset</button>
+  </div>
+</div>
+
+<!-- Hidden legacy element placeholders: old JS code references these IDs.
+     They are invisible but prevent "Cannot read null" crashes. -->
+<div style="display:none" aria-hidden="true">
+  <span id="contDims"></span>
+  <span id="pieceCount"></span>
+  <span id="weightUtil"></span>
+  <span id="volUtil"></span>
+  <span id="shapeSum"></span>
+  <span id="cogInfo"></span>
+  <span id="jobTitle"></span>
+  <span id="legend"></span>
+  <div id="tabs"></div>
+  <div id="dataIssues"></div>
+  <div id="note"></div>
+  <div id="panel"></div>
+  <div id="loadAnother"><label><input type="file" id="fileInputLegacy" style="display:none"></label></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="viewer/js/00-loading-rules.js"></script>
+<script src="viewer/js/01-staging-ui.js"></script>
+<script src="viewer/js/02-scene-core.js"></script>
+<script src="viewer/js/03-shapes.js"></script>
+<script src="viewer/js/04-ifc-assembly.js"></script>
+<script src="viewer/js/05-packing.js"></script>
+<script src="viewer/js/08-grouping.js"></script>
+<script src="viewer/js/19-cs-validate.js"></script>
+<script src="viewer/js/09-cross-section.js"></script>
+<script src="viewer/js/10-cs-analyze.js"></script>
+<script src="viewer/js/11-cs-orient.js"></script>
+<script src="viewer/js/11b-cs-z-nest-angle.js"></script>
+<script src="viewer/js/11a-cs-apply-orient.js"></script>
+<script src="viewer/js/12-cs-group.js"></script>
+<script src="viewer/js/13-cs-nest-method.js"></script>
+<script src="viewer/js/14-cs-nest-offset.js"></script>
+<script src="viewer/js/15a-warehouse-ground.js"></script>
+<script src="viewer/js/15-cs-stability.js"></script>
+<script src="viewer/js/16-taper-pack.js"></script>
+<script src="viewer/js/17-cs-pack-units.js"></script>
+<script src="viewer/js/18-cs-container-pack.js"></script>
+<script src="viewer/js/06-render-interact.js"></script>
+<script src="viewer/js/07-load-scene.js"></script>
+<script src="viewer/js/99-grouping-tests.js"></script>
+<script src="viewer/js/99-cs-step1-tests.js"></script>
+<script src="viewer/js/99-cs-step2-tests.js"></script>
+<script src="viewer/js/99-cs-step3-tests.js"></script>
+<script src="viewer/js/99-cs-step4-tests.js"></script>
+<script src="viewer/js/99-cs-step5-tests.js"></script>
+<script src="viewer/js/99-cs-step6-tests.js"></script>
+<script src="viewer/js/99-cs-ground-tests.js"></script>
+<script src="viewer/js/99-cs-z-ground-measure.js"></script>
+<script src="viewer/js/99-cs-step7-tests.js"></script>
+<script src="viewer/js/99-cs-warehouse-tests.js"></script>
+</body>
+</html>

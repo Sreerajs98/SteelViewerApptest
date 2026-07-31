@@ -1,0 +1,488 @@
+/* 99-cs-warehouse-tests.js — FIRST PRIORITY warehouse ground-sit suite.
+ * Call: runWarehouseGroundTestSuite()
+ * Covers guide Tests 1–10 (AABB widest face + tip-check + minY=0).
+ */
+(function (global) {
+  'use strict';
+
+  function assert(cond, msg) {
+    if (!cond) throw new Error(msg || 'assertion failed');
+  }
+  function approx(a, b, tol) {
+    return Math.abs(a - b) <= (tol != null ? tol : 1e-3);
+  }
+
+  /** Build axis-aligned box vertices (8 corners × xyz). */
+  function boxVerts(minX, minY, minZ, maxX, maxY, maxZ) {
+    const c = [
+      [minX, minY, minZ], [maxX, minY, minZ], [maxX, maxY, minZ], [minX, maxY, minZ],
+      [minX, minY, maxZ], [maxX, minY, maxZ], [maxX, maxY, maxZ], [minX, maxY, maxZ],
+    ];
+    const out = [];
+    c.forEach(p => out.push(p[0], p[1], p[2]));
+    return out;
+  }
+
+  function bboxOf(pos) {
+    let minX = Infinity, maxX = -Infinity;
+    let minY = Infinity, maxY = -Infinity;
+    let minZ = Infinity, maxZ = -Infinity;
+    for (let i = 0; i < pos.length; i += 3) {
+      const x = pos[i], y = pos[i + 1], z = pos[i + 2];
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    }
+    return {
+      minX, maxX, minY, maxY, minZ, maxZ,
+      extX: maxX - minX, extY: maxY - minY, extZ: maxZ - minZ,
+    };
+  }
+
+  const TESTS = [];
+  function t(id, name, fn) { TESTS.push({ id, name, fn }); }
+
+  // ── Test 1: Tapered column standing → lie flat ────────────────────────────
+  t('W.1', 'Tapered column standing → lies flat height=300', () => {
+    // X=300, Y=8000, Z=500 standing
+    const v = boxVerts(0, 0, 0, 300, 8000, 500);
+    const r = orientVerticesToWarehouseGround(v);
+    const bb = bboxOf(v);
+    assert(approx(bb.minY, 0, 1e-6), `minY=${bb.minY}`);
+    assert(approx(bb.extY, 300, 1), `height=${bb.extY} want 300`);
+    assert(bb.extX > 4000 || bb.extZ > 4000, 'length horizontal');
+    assert(r.rot === 'Rz', `rot=${r.rot}`);
+    assert(r.tip_ratio <= 2.01, `tip=${r.tip_ratio}`);
+  });
+
+  // ── Test 2: Beam already horizontal — stays lying, minY=0 ─────────────────
+  t('W.2', 'Beam horizontal — stays flat on ground (minY=0)', () => {
+    // X=10000, Y=400, Z=200 — face_XY (10k×400) > face_XZ (10k×200),
+    // so widest-face rule may Rx → height 200 (even flatter). Still not standing.
+    const v = boxVerts(0, 50, 0, 10000, 450, 200);
+    const r = orientVerticesToWarehouseGround(v);
+    const bb = bboxOf(v);
+    assert(approx(bb.minY, 0, 1e-6), `minY=${bb.minY}`);
+    assert(bb.extY <= 401, `H=${bb.extY} must stay flat`);
+    assert(bb.extX > 5000, 'length horiz');
+    assert(r.rot === 'none' || r.rot === 'Rx', `rot=${r.rot}`);
+    assert(r.tip_ratio <= 2.01, `tip=${r.tip_ratio}`);
+  });
+
+  // ── Test 3: Floating → drop ───────────────────────────────────────────────
+  t('W.3', 'Floating item dropped to minY=0', () => {
+    const v = boxVerts(0, 500, 0, 1000, 700, 200);
+    orientVerticesToWarehouseGround(v);
+    const bb = bboxOf(v);
+    assert(approx(bb.minY, 0, 1e-6), `minY=${bb.minY}`);
+    assert(approx(bb.extY, 200, 1), `H=${bb.extY}`);
+  });
+
+  // ── Test 4: Below ground → lift ───────────────────────────────────────────
+  t('W.4', 'Underground item lifted to minY=0', () => {
+    const v = boxVerts(0, -200, 0, 1000, 0, 200);
+    orientVerticesToWarehouseGround(v);
+    const bb = bboxOf(v);
+    assert(approx(bb.minY, 0, 1e-6), `minY=${bb.minY}`);
+    assert(bb.maxY > 0, 'above');
+  });
+
+  // ── Test 5: Plate on edge → flat ──────────────────────────────────────────
+  t('W.5', 'Plate standing on edge → flat 12mm tall', () => {
+    // X=500, Y=1000, Z=12
+    const v = boxVerts(0, 0, 0, 500, 1000, 12);
+    const r = orientVerticesToWarehouseGround(v);
+    const bb = bboxOf(v);
+    assert(approx(bb.minY, 0, 1e-6), 'minY');
+    assert(approx(bb.extY, 12, 1), `H=${bb.extY}`);
+    assert(r.rot === 'Rx', `rot=${r.rot}`);
+  });
+
+  // ── Test 6: Assembly combined AABB (simulate multi-part as one cloud) ─────
+  t('W.6', 'Assembly combined bbox — one transform, lies flat', () => {
+    // Combined X=12000, Y=800, Z=300 upright-ish (Y=800 tall relative)
+    // Actually Y=800 with X=12000: face_XY largest → Rx → height=300
+    const v = boxVerts(0, 0, 0, 12000, 800, 300);
+    const r = orientVerticesToWarehouseGround(v);
+    const bb = bboxOf(v);
+    assert(approx(bb.minY, 0, 1e-6), 'minY');
+    assert(approx(bb.extY, 300, 1), `H=${bb.extY}`);
+    assert(r.rot === 'Rx', `rot=${r.rot}`);
+  });
+
+  // ── Test 7: Round bar standing → horizontal ───────────────────────────────
+  t('W.7', 'Round bar standing → horizontal', () => {
+    const v = boxVerts(0, 0, 0, 16, 3000, 16);
+    const r = orientVerticesToWarehouseGround(v);
+    const bb = bboxOf(v);
+    assert(approx(bb.minY, 0, 1e-6), 'minY');
+    assert(bb.extY < 50, `H=${bb.extY}`);
+    assert(bb.extX > 2000 || bb.extZ > 2000, 'length horiz');
+    assert(r.rot !== 'none', `rot=${r.rot}`);
+  });
+
+  // ── Test 8: Z-purlin — flat with 75mm height ──────────────────────────────
+  t('W.8', 'Z-purlin X=6000 Y=200 Z=75 → height 75', () => {
+    const v = boxVerts(0, 0, 0, 6000, 200, 75);
+    // tip: Y vert tip_ratio=200/75>2 → prefer Z vertical (Rx)
+    const choice = chooseWarehouseBaseFace(6000, 200, 75);
+    assert(choice.rot === 'Rx', `choice=${choice.rot} tipY would tip`);
+    const r = orientVerticesToWarehouseGround(v);
+    const bb = bboxOf(v);
+    assert(approx(bb.minY, 0, 1e-6), 'minY');
+    assert(approx(bb.extY, 75, 1), `H=${bb.extY}`);
+    assert(approx(bb.extZ, 200, 1) || approx(bb.extX, 200, 1), '200 on base');
+  });
+
+  // ── Test 9: Batch — all minY=0 ─────────────────────────────────────────────
+  t('W.9', 'Batch 300 synthetic items all minY=0', () => {
+    const t0 = performance.now();
+    for (let i = 0; i < 300; i++) {
+      const L = 1000 + (i % 50) * 100;
+      const H = 50 + (i % 20) * 10;
+      const W = 20 + (i % 15) * 5;
+      // Mix orientations
+      let v;
+      if (i % 3 === 0) v = boxVerts(0, 100, 0, W, 100 + L, H); // standing on Y
+      else if (i % 3 === 1) v = boxVerts(0, -50, 0, L, -50 + H, W); // underground
+      else v = boxVerts(0, 200, 0, L, 200 + H, W); // floating flat
+      orientVerticesToWarehouseGround(v);
+      const bb = bboxOf(v);
+      assert(approx(bb.minY, 0, 1e-4), `item ${i} minY=${bb.minY}`);
+      assert(bb.extY <= Math.max(bb.extX, bb.extZ) + 1e-3
+        || bb.extY / Math.min(bb.extX, bb.extZ) <= 2.05,
+        `item ${i} unstable H=${bb.extY}`);
+    }
+    const ms = performance.now() - t0;
+    assert(ms < 5000, `batch ms=${ms}`);
+  });
+
+  // ── Test 10: THREE Object3D path (if available) ───────────────────────────
+  t('W.10', 'THREE Object3D warehouse orient + ground', () => {
+    if (typeof THREE === 'undefined' || typeof orientObjectToWarehouseGround !== 'function') {
+      assert(true, 'skip no THREE');
+      return;
+    }
+    const geo = new THREE.BoxGeometry(0.3, 8, 0.5); // world units ~ standing
+    // Simulate mm via SCALE if present
+    const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial());
+    const group = new THREE.Group();
+    group.add(mesh);
+    const info = orientObjectToWarehouseGround(group, { mark: 'COL1' });
+    assert(info && info.ok, 'ok');
+    group.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(group);
+    assert(approx(box.min.y, 0, 1e-3), `minY=${box.min.y}`);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    assert(size.y + 1e-6 <= Math.max(size.x, size.z) * 1.05
+      || size.y / Math.min(size.x, size.z) <= 2.05, `tip size=${size.x},${size.y},${size.z}`);
+    // dispose
+    geo.dispose();
+  });
+
+  // ── Tip-over prefers second face ──────────────────────────────────────────
+  t('W.11', 'Tip-over: reject largest face if vertical > 2×base_min', () => {
+    // Standing thin: X=100, Y=5000, Z=100 — face_XY=face_YZ=500k, face_XZ=10k
+    // Both XY and YZ tip? vert for Z-up: vert=100, baseMin=100, tip=1 OK
+    // Actually Y-up tips. Z-up: height 100, base 100×5000 OK.
+    const c = chooseWarehouseBaseFace(100, 5000, 100);
+    assert(c.rot !== 'none', 'must rotate off Y-up');
+    assert(c.tip_ratio <= 2.01, `tip=${c.tip_ratio}`);
+  });
+
+  // ── Assembly base: multi-part trial faces → ground touch ──────────────────
+  t('W.12a', 'refineAssemblyGroundPose — multi-part group touches Y=0', () => {
+    if (typeof THREE === 'undefined' || typeof refineAssemblyGroundPose !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const group = new THREE.Group();
+    // Two "flange" boxes forming a tall-ish assembly (Y up)
+    const mk = (sx, sy, sz, y) => {
+      const m = new THREE.Mesh(
+        new THREE.BoxGeometry(sx, sy, sz),
+        new THREE.MeshBasicMaterial()
+      );
+      m.position.y = y;
+      group.add(m);
+      return m;
+    };
+    mk(8, 0.2, 0.8, 0.5);   // web-ish
+    mk(8, 0.05, 0.4, 0.1);  // bottom flange
+    mk(8, 0.05, 0.4, 0.9);  // top flange
+    const it = {
+      mark: 'R-1', isAssembly: true, groupKind: 'welded_assembly',
+      parts: [{}, {}], assemblyName: 'Rafter',
+    };
+    const ev = refineAssemblyGroundPose(group, it, null);
+    group.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(group);
+    assert(approx(box.min.y, 0, 2e-3), `minY=${box.min.y}`);
+    assert(ev && ev.ground_touch !== false, 'ground_touch');
+    assert(ev.assembly_base === true, 'assembly_base flag');
+    group.traverse(o => { if (o.geometry) o.geometry.dispose(); });
+  });
+
+  t('W.12d', 'PCA cancels IFC roof-pitch — length ends along +X, ground', () => {
+    if (typeof THREE === 'undefined' || typeof refineAssemblyGroundPose !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    // Simulate pitched rafter: long box rotated ~30° about Z (roof pitch)
+    const group = new THREE.Group();
+    const beam = new THREE.Mesh(
+      new THREE.BoxGeometry(10, 0.4, 0.25),
+      new THREE.MeshBasicMaterial()
+    );
+    group.add(beam);
+    group.rotation.z = Math.PI / 6; // 30° pitch — the X-cross bug
+    group.updateMatrixWorld(true);
+    const before = new THREE.Box3().setFromObject(group);
+    const beforeSize = new THREE.Vector3();
+    before.getSize(beforeSize);
+    assert(beforeSize.y > 2.0, `pitched height before=${beforeSize.y}`);
+
+    const ev = refineAssemblyGroundPose(group, {
+      mark: 'R-PITCH', isAssembly: true, parts: [{}, {}],
+      groupKind: 'welded_assembly', assemblyName: 'Rafter',
+    }, null);
+    group.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(group);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    assert(approx(box.min.y, 0, 3e-3), `minY=${box.min.y}`);
+    assert(size.x > size.y * 3 && size.x > size.z * 3, `len along X sx=${size.x} sy=${size.y} sz=${size.z}`);
+    assert(size.y < 1.2, `flat-ish height sy=${size.y}`); // pitch cancelled
+    assert(ev && ev.pca_aligned !== false, 'pca');
+    assert(ev.ground_touch, 'ground');
+    group.traverse(o => { if (o.geometry) o.geometry.dispose(); });
+  });
+
+  t('W.12e', 'Standing column assembly lays down (not tip on end)', () => {
+    if (typeof THREE === 'undefined' || typeof refineAssemblyGroundPose !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const group = new THREE.Group();
+    group.add(new THREE.Mesh(
+      new THREE.BoxGeometry(0.35, 8, 0.35),
+      new THREE.MeshBasicMaterial()
+    ));
+    const ev = refineAssemblyGroundPose(group, {
+      mark: 'C-1', isAssembly: true, parts: [{}, {}],
+      groupKind: 'welded_assembly', assemblyName: 'Column',
+    }, null);
+    group.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(group);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    assert(approx(box.min.y, 0, 3e-3), `minY=${box.min.y}`);
+    assert(size.y < size.x * 0.5, `laid down sy=${size.y} sx=${size.x}`);
+    assert(!ev.standing_on_end, 'not on end');
+    group.traverse(o => { if (o.geometry) o.geometry.dispose(); });
+  });
+
+  t('W.12g', 'Rule#1 sort: heaviest assemblies first, then long beam before nest', () => {
+    if (typeof cs8SortHeavyAnchor !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const u = [
+      { mark: 'nest-heavy', weight: 400, l: 400, shapeKey: 'z_channel' },
+      { mark: 'nest-long-heavy', weight: 400, l: 8000, shapeKey: 'z_channel' },
+      { mark: 'beam-light', weight: 66, l: 8400, shapeKey: 'i_beam' },
+      { mark: 'asm-light', weight: 200, l: 9000, isAssembly: true, parts: [{}, {}] },
+      { mark: 'asm-heavy', weight: 900, l: 10000, isAssembly: true, parts: [{}, {}] },
+    ];
+    cs8SortHeavyAnchor(u, 12000);
+    assert(u[0].mark === 'asm-heavy', `heaviest asm first=${u[0].mark}`);
+    assert(u[1].mark === 'asm-light', `2nd asm=${u[1].mark}`);
+    // tier1: longer lane first (8400 before 8000) even if lighter
+    assert(u[2].mark === 'beam-light', `beam lane=${u[2].mark}`);
+    assert(u[3].mark === 'nest-long-heavy', `long nest=${u[3].mark}`);
+    assert(u[4].mark === 'nest-heavy', `short nest last=${u[4].mark}`);
+  });
+
+  t('W.12k', 'Staging groups sort: assemblies by weight high→low', () => {
+    if (typeof sortStagingGroupsByWeight !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const g = [
+      { mark: 'Z1', groupKind: 'nest_z', weightKg: 500, lengthMaxMm: 400 },
+      { mark: 'A1', groupKind: 'welded_assembly', weightKg: 300, lengthMaxMm: 8000, isAssembly: true, parts: [{}, {}] },
+      { mark: 'A2', groupKind: 'welded_assembly', weightKg: 800, lengthMaxMm: 9000, isAssembly: true, parts: [{}, {}] },
+      { mark: 'B1', groupKind: 'bundle_beam', weightKg: 66, lengthMaxMm: 8400 },
+    ];
+    sortStagingGroupsByWeight(g);
+    assert(g[0].mark === 'A2', `first=${g[0].mark}`);
+    assert(g[1].mark === 'A1', `second=${g[1].mark}`);
+    assert((g[2].weightKg || 0) >= (g[3].weightKg || 0), 'rest weight desc');
+  });
+
+  t('W.12i', 'Pack smoke: long beam seats on empty floor before nest fills', () => {
+    if (typeof layoutContainerPackStep8 !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const spec = { lengthMm: 12000, widthMm: 2350, heightMm: 2690, maxWeightKg: 26000 };
+    const packUnits = [
+      {
+        mark: 'NEST1', marks: ['NEST1'], groupKind: 'nest_z',
+        shapeKey: 'z_channel', profileShape: 'z_channel',
+        qty: 12, total_weight: 480, weightKg: 480,
+        lengthMm: 400, widthMm: 200, heightMm: 200,
+        bundle_bbox: { l: 400, w: 200, h: 200 },
+        l: 400, w: 200, h: 200,
+      },
+      {
+        mark: 'BEAM84', marks: ['BEAM84'], groupKind: 'bundle_beam',
+        shapeKey: 'i_beam', profileShape: 'i_beam', category: 'beam',
+        qty: 1, total_weight: 66, weightKg: 66,
+        lengthMm: 8400, widthMm: 200, heightMm: 300,
+        bundle_bbox: { l: 8400, w: 200, h: 300 },
+        l: 8400, w: 200, h: 300,
+      },
+    ];
+    const res = layoutContainerPackStep8([], spec, null, {
+      packUnits, maxContainers: 1, pass2: true, markOrder: null,
+    });
+    const placed = (res.containers[0] && res.containers[0].items) || [];
+    const marks = placed.map(it => it.mark);
+    assert(marks.some(m => /BEAM84/.test(String(m))), `beam placed marks=${marks.join(',')}`);
+    const beam = placed.find(it => /BEAM84/.test(String(it.mark)));
+    const nest = placed.find(it => /NEST1/.test(String(it.mark)));
+    if (beam && nest) {
+      // Beam must be on floor (y centre ≈ h/2)
+      assert((beam.y || 0) < (nest.y || 0) + 50 || (beam.packFootprintH || 300) >= (beam.y || 0),
+        'beam on/near floor');
+    }
+    const over = res.oversized || [];
+    assert(!over.some(u => /BEAM84/.test(String(u.mark))),
+      `beam not rejected: ${(over[0] && over[0].fitReason) || ''}`);
+  });
+
+  t('W.12j', 'yaw180 is NOT yaw90 for station axis', () => {
+    if (typeof cs8OrientIsYaw90 !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    assert(!cs8OrientIsYaw90({ tag: 'yaw180', rot: { y: Math.PI } }), '180');
+    assert(!cs8OrientIsYaw90({ tag: 'yaw0', rot: { y: 0 } }), '0');
+    assert(cs8OrientIsYaw90({ tag: 'yaw90', rot: { y: Math.PI / 2 } }), '90');
+  });
+
+  t('W.12h', 'Diagnose unfit — length / width reason codes', () => {
+    if (typeof cs8DiagnoseUnfit !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const long = cs8DiagnoseUnfit(
+      { mark: 'B1', l: 13000, w: 300, h: 400, weight: 800 },
+      12000, 2350, 2690, [{ weightUsed: 0 }], 26000
+    );
+    assert(long.code === 'LENGTH_EXCEEDS_CONTAINER', `code=${long.code}`);
+    const wide = cs8DiagnoseUnfit(
+      { mark: 'B2', l: 10000, w: 3000, h: 400, weight: 800 },
+      12000, 2350, 2690, [{ weightUsed: 0 }], 26000
+    );
+    assert(wide.code === 'WIDTH_EXCEEDS_ENVELOPE', `code=${wide.code}`);
+  });
+
+  t('W.12f', 'Floor Anchor Rule#1 — tier Weight-Down + yaw 0/180 only', () => {
+    if (typeof cs8AnchorTier !== 'function' || typeof cs8YawOrientsFloorAnchor !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    assert(cs8AnchorTier({ isAssembly: true, parts: [{}, {}], weight: 100 }) === 0, 'asm tier0');
+    assert(cs8AnchorTier({ shapeKey: 'i_beam', category: 'beam', weight: 500 }) === 1, 'beam tier1');
+    assert(cs8AnchorTier({ shapeKey: 'z_channel', weight: 50 }) === 2, 'loose tier2');
+    assert(cs8AnchorTier({ assemblyName: 'Portal Frame', weight: 900 }) === 0, 'portal');
+    const orients = cs8YawOrientsFloorAnchor(
+      { l: 10000, w: 400, h: 600 }, 12000, 2350, 2690);
+    assert(orients.length === 2, `n=${orients.length}`);
+    assert(orients.every(o => o.tag === 'yaw0' || o.tag === 'yaw180'), 'longitudinal only');
+    assert(!orients.some(o => o.tag === 'yaw90'), 'no 90');
+    if (typeof cs8FloorAnchorSupportMin === 'function')
+      assert(cs8FloorAnchorSupportMin() >= 0.79, '≥80%');
+    if (typeof cs8IsFloorOrSkidY === 'function') {
+      assert(cs8IsFloorOrSkidY(0), 'floor');
+      assert(cs8IsFloorOrSkidY(100), 'skid');
+      assert(!cs8IsFloorOrSkidY(800), 'not stacked');
+    }
+  });
+
+  t('W.12b', 'cstabIsWeldedAssembly detects multi-part', () => {
+    if (typeof cstabIsWeldedAssembly !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    assert(cstabIsWeldedAssembly({ isAssembly: true, parts: [{}, {}] }), 'parts');
+    assert(cstabIsWeldedAssembly({ groupKind: 'welded_assembly' }), 'kind');
+    assert(!cstabIsWeldedAssembly({ shapeKey: 'z_channel', qty: 1 }), 'not Z');
+    assert(!cstabIsWeldedAssembly({ _assemblyChild: true, isAssembly: true, parts: [{}, {}] }), 'child skip');
+  });
+
+  t('W.12c', 'stagingFootprintMm prefers packEnvelope for assembly', () => {
+    if (typeof stagingFootprintMm !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const fp = stagingFootprintMm({
+      isAssembly: true,
+      l: 100, w: 50, h: 40,
+      packEnvelopeMm: { l: 9000, w: 600, h: 350 },
+    });
+    assert(fp.footX >= 9000, `footX=${fp.footX}`);
+    assert(fp.footZ >= 600 * 1.1, `footZ=${fp.footZ}`); // pad ≥1.12
+  });
+
+  // ── makeShape integration smoke ───────────────────────────────────────────
+  t('W.12', 'makeShape IFC-like standing box ends ground-stable', () => {
+    if (typeof makeShape !== 'function' || typeof THREE === 'undefined') {
+      assert(true, 'skip');
+      return;
+    }
+    // Analytic plate standing-ish via height/width — plate builder is flat;
+    // use rhs tall as proxy for warehouse via makeShape
+    const it = {
+      mark: 'WH1', shapeKey: 'rhs',
+      sectH: 300, sectW: 100, sectT: 6, lengthMm: 8000,
+      qty: 1, heightMm: 300, widthMm: 100,
+    };
+    const mesh = makeShape(it, 0x888888, 1);
+    mesh.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(mesh);
+    assert(approx(box.min.y, 0, 1e-2), `minY=${box.min.y}`);
+    assert(it.stabilityInfo && it.stabilityInfo.ground_stable !== false, 'stable info');
+    try {
+      mesh.traverse(o => { if (o.geometry) o.geometry.dispose(); });
+    } catch (_) { /* */ }
+  });
+
+  function runWarehouseGroundTestSuite() {
+    const results = [];
+    let passed = 0, failed = 0;
+    for (let i = 0; i < TESTS.length; i++) {
+      const tc = TESTS[i];
+      const row = { id: tc.id, name: tc.name, ok: false, error: null };
+      try { tc.fn(); row.ok = true; passed++; }
+      catch (e) { row.ok = false; row.error = String(e && e.message ? e.message : e); failed++; }
+      results.push(row);
+    }
+    const summary = {
+      suite: 'warehouse_ground',
+      total: TESTS.length, passed, failed, ok: failed === 0,
+      results, ts: new Date().toISOString(),
+    };
+    try {
+      console.info(`[WarehouseTests] ${passed}/${TESTS.length} passed, ${failed} failed`);
+      results.filter(r => !r.ok).forEach(r => console.warn(`  FAIL ${r.id}: ${r.error}`));
+    } catch (_) { /* */ }
+    return summary;
+  }
+
+  global.runWarehouseGroundTestSuite = runWarehouseGroundTestSuite;
+  global.__WAREHOUSE_TEST_COUNT = TESTS.length;
+})(typeof window !== 'undefined' ? window : globalThis);

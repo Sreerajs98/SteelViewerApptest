@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>SteelViewerApp</RootNamespace>
+    <NoWarn>$(NoWarn);NU1701</NoWarn>
+    <!-- tools/IfcExport is a separate project; including it pulls a second
+         Program.cs + obj AssemblyInfo → CS0579 duplicate attributes / CS7022 -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);_buildcheck\**;_buildcheck2\**;_buildcheck3\**;tools\**</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2478.35" />
+    <PackageReference Include="ClosedXML" Version="0.104.1" />
+    <PackageReference Include="Xbim.Essentials" Version="6.0.587" />
+    <!-- Meta-package; pulls Engine.Interop + ModelGeometry.Scene + Tessellator (no duplicate top-level refs) -->
+    <PackageReference Include="Xbim.Geometry" Version="6.3.891-netcore" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="Viewer3D.html">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <!-- Split viewer assets (CSS/JS). Keep in sync with Viewer3D.html script tags. -->
+    <None Update="viewer\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SampleData\A1442-01-101-R0_Shipping_List.xlsx">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>
