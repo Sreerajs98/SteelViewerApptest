@@ -304,7 +304,7 @@
     assert(u[4].mark === 'nest-heavy', `short nest last=${u[4].mark}`);
   });
 
-  t('W.12k', 'Staging groups sort: assemblies by weight high→low', () => {
+  t('W.12k', 'Staging groups sort: PURE weight high→low', () => {
     if (typeof sortStagingGroupsByWeight !== 'function') {
       assert(true, 'skip');
       return;
@@ -316,9 +316,10 @@
       { mark: 'B1', groupKind: 'bundle_beam', weightKg: 66, lengthMaxMm: 8400 },
     ];
     sortStagingGroupsByWeight(g);
-    assert(g[0].mark === 'A2', `first=${g[0].mark}`);
-    assert(g[1].mark === 'A1', `second=${g[1].mark}`);
-    assert((g[2].weightKg || 0) >= (g[3].weightKg || 0), 'rest weight desc');
+    assert(g[0].mark === 'A2', `first=${g[0].mark}`); // 800
+    assert(g[1].mark === 'Z1', `second=${g[1].mark}`); // 500 > 300 asm
+    assert(g[2].mark === 'A1', `third=${g[2].mark}`);
+    assert(g[3].mark === 'B1', `last=${g[3].mark}`);
   });
 
   t('W.12i', 'Pack smoke: long beam seats on empty floor before nest fills', () => {

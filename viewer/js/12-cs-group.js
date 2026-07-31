@@ -162,13 +162,13 @@ function groupItemsByCsSignature(items) {
     list.push(csgBuildStageCard(pcs, key));
   });
 
-  // Assemblies first by weight DESC, then other groups weight DESC (high → low)
+  // PURE weight high → low (heaviest group first in staging)
   list.sort((a, b) => {
+    const dW = (b.weightKg || 0) - (a.weightKg || 0);
+    if (Math.abs(dW) > 1e-6) return dW;
     const aw = a.groupKind === 'welded_assembly' ? 0 : 1;
     const bw = b.groupKind === 'welded_assembly' ? 0 : 1;
     if (aw !== bw) return aw - bw;
-    const dW = (b.weightKg || 0) - (a.weightKg || 0);
-    if (Math.abs(dW) > 1e-6) return dW;
     return (b.lengthMaxMm || 0) - (a.lengthMaxMm || 0)
       || String(a.dimLabel || '').localeCompare(String(b.dimLabel || ''));
   });

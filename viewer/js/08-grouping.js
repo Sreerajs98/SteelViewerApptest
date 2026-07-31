@@ -452,15 +452,12 @@ function groupItemsRealWorld(items) {
       default: return 10;
     }
   };
-  // Welded assemblies first (weight high→low), then other families by weight
+  // PURE weight high → low (heaviest first); ties by family rank / length
   list.sort((a, b) => {
-    const ra = rank(a);
-    const rb = rank(b);
-    const aAsm = a.groupKind === 'welded_assembly' ? 0 : 1;
-    const bAsm = b.groupKind === 'welded_assembly' ? 0 : 1;
-    if (aAsm !== bAsm) return aAsm - bAsm;
     const dW = (b.weightKg || 0) - (a.weightKg || 0);
     if (Math.abs(dW) > 1e-6) return dW;
+    const ra = rank(a);
+    const rb = rank(b);
     if (ra !== rb) return ra - rb;
     return (b.lengthMaxMm || 0) - (a.lengthMaxMm || 0);
   });

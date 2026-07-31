@@ -52,27 +52,46 @@ function getFilteredGroups() {
   return assemblyGroups.filter(g => groupSearchText(g).includes(stagingFilter));
 }
 
+/** Best available kg for a staging group (card + members + pack units). */
+function groupSortWeightKg(g) {
+  if (!g) return 0;
+  let kg = Math.max(0, Number(g.weightKg) || 0);
+  const mem = g.memberItems || g.memberPieces || [];
+  if (mem.length) {
+    const sum = mem.reduce((s, p) =>
+      s + Math.max(0, Number(p.unitWeightKg) || 0) * Math.max(1, Number(p.qty) || 1), 0);
+    if (sum > kg) kg = sum;
+  }
+  const pus = g.packUnits || [];
+  if (pus.length) {
+    const puSum = pus.reduce((s, pu) =>
+      s + Math.max(0, Number(pu.total_weight) || Number(pu.weightKg) || 0), 0);
+    if (puSum > kg) kg = puSum;
+  }
+  g.sortWeightKg = kg;
+  return kg;
+}
+
 /**
- * After Group by Shape: heaviest assemblies first, then others high→low kg.
- * Optimise then tries insert in this order (skip if no fit → next).
+ * Group / staging list: PURE weight high → low (no assembly-first).
+ * Ties: welded assemblies first, then longer.
  */
 function sortStagingGroupsByWeight(groups) {
   const list = groups || [];
-  const w = (g) => Math.max(0, Number(g.weightKg) || 0);
   const isAsm = (g) =>
     g.groupKind === 'welded_assembly'
     || !!(g.isAssembly && g.parts && g.parts.length >= 2);
   list.sort((a, b) => {
+    const dw = groupSortWeightKg(b) - groupSortWeightKg(a);
+    if (Math.abs(dw) > 1e-6) return dw;
     const aA = isAsm(a) ? 0 : 1;
     const bA = isAsm(b) ? 0 : 1;
     if (aA !== bA) return aA - bA;
-    const dw = w(b) - w(a);
-    if (Math.abs(dw) > 1e-6) return dw;
     return (b.lengthMaxMm || 0) - (a.lengthMaxMm || 0);
   });
   list.forEach((g, i) => {
     g.id = g.id || `G${i + 1}`;
-    g.weightRank = i + 1; // 1 = heaviest (among current list order)
+    g.weightRank = i + 1; // 1 = heaviest
   });
   return list;
 }
@@ -287,6 +306,10 @@ function renderStagingList() {
   const empty = document.getElementById('stagingEmpty');
   const count = document.getElementById('stagingCount');
 
+  // Always keep staging in weight high→low after Group by Shape
+  if (assemblyGroups.length && typeof isGroupedReady === 'function' && isGroupedReady())
+    sortStagingGroupsByWeight(assemblyGroups);
+
   const filtered = getFilteredGroups();
 
   if (!assemblyGroups.length) {
@@ -343,7 +366,7 @@ function renderStagingList() {
           <div class="ag-name">${g.name || ''}${labelOnly ? ` · <span class="ag-profile-label" title="IFC label only">${labelOnly}</span>` : ''}</div>
           <div class="ag-meta">
             <span class="ag-pill">${g.qty || 1} pcs</span>
-            <span class="ag-pill">${Math.round(g.weightKg || 0)} kg</span>
+            <span class="ag-pill">${Math.round(g.sortWeightKg || g.weightKg || 0)} kg</span>
             ${lenRange ? `<span class="ag-pill">${lenRange}</span>` : ''}
             <span class="ag-pill ${stratClass}">${g.nestMethodLabel || g.strategy || 'Single'}</span>
             ${g.nestingOffsetMm > 0 ? `<span class="ag-pill" title="Step6 nest offset">Δ ${Number(g.nestingOffsetMm).toFixed(1)} mm</span>` : ''}
@@ -951,9 +974,9 @@ function groupByShape() {
   updateWorkflowUI();
   const n = assemblyGroups.length;
   const welded = assemblyGroups.filter(g => g.groupKind === 'welded_assembly').length;
-  const topAsm = heaviestAssemblyGroups(assemblyGroups, 2);
-  const topHint = topAsm.length
-    ? ` · BASE ${topAsm.map(g => `${(g.marks && g.marks[0]) || g.mark}: ${Math.round(g.weightKg || 0)}kg`).join(' + ')}`
+  const top3 = assemblyGroups.slice(0, 3);
+  const topHint = top3.length
+    ? ` · #1–3: ${top3.map(g => `${(g.marks && g.marks[0]) || g.mark} ${Math.round(g.sortWeightKg || g.weightKg || 0)}kg`).join(', ')}`
     : '';
   if (audit && !audit.ok) {
     showToast(
@@ -964,15 +987,15 @@ function groupByShape() {
     );
   } else {
     showToast(
-      `✓ Grouped ${n} (${welded} assy) heavy→light${topHint}`,
-      5000
+      `✓ Grouped ${n} by weight high→low (${welded} assy)${topHint}`,
+      5200
     );
   }
   try {
-    console.info('[Group weight order]', assemblyGroups.slice(0, 8).map(g => ({
+    console.info('[Group weight order]', assemblyGroups.slice(0, 10).map(g => ({
       mark: (g.marks && g.marks[0]) || g.mark,
       kind: g.groupKind,
-      kg: Math.round(g.weightKg || 0),
+      kg: Math.round(g.sortWeightKg || g.weightKg || 0),
     })));
   } catch (_) { /* */ }
 }

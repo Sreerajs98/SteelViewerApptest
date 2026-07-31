@@ -40,12 +40,9 @@ const FILL_FACTORS = {
 function applyWeightCorrection(items) {
   items.forEach(it => {
     if (!it.weightEstimated) return;             // real property-set weight → trust it
-    const detected = detectProfileShape(it.profileDesc, it.assemblyName);
-    const shape = detected ? detected.shape : null;
-    const fill = shape && FILL_FACTORS[shape] !== undefined
-      ? FILL_FACTORS[shape]
-      : 0.35;                                     // safe default for unknown thin-walled
-    it.unitWeightKg = it.unitWeightKg * fill;
+    if (it._weightCorrected) return;
+    // C# EstimateSteelWeightKg already applied bbox×7850×0.08.
+    // Do NOT multiply by FILL_FACTORS again (was crushing e.g. 3655kg → 731kg).
     it._weightCorrected = true;
   });
 }
