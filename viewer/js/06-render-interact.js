@@ -2260,8 +2260,10 @@ function yardSettlePackedMeshes(entries, cont) {
     }
   });
 
-  // After ALL yard settle passes: restore packer orientation (do NOT re-snap to
-  // packer Y — that re-floats cargo gravity already seated on the floor/support).
+  // After yard settle: restore packer orientation. Quaternion restore shifts the
+  // world AABB → must re-seat foot Y to packer, then gravity-drop unsupported
+  // seats (snap alone used to re-float when packer Y was wrong; packer floor
+  // seats are trustworthy now, and gravity after snap kills residual air gaps).
   function restoreLockedOrients(entries) {
     (entries || []).forEach(c => {
       const it = c.item;
@@ -2273,39 +2275,54 @@ function yardSettlePackedMeshes(entries, cont) {
       c.mesh.updateMatrixWorld(true);
     });
   }
+  function reseatAfterOrientRestore(entries) {
+    (entries || []).forEach(c => {
+      if (!c || !c.mesh || !c.item) return;
+      if (c.item._orientLocked || c.item.packOrientTag)
+        snapMeshToPackerFootY(c.mesh, c.item);
+    });
+    if (entries && entries.length) restackWithGravity(entries);
+  }
+  function nailUnsupportedToFloor(entries) {
+    (entries || []).forEach(c => {
+      if (!c || c.outsideContainer || !c.mesh) return;
+      c.mesh.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(c.mesh);
+      if (!(box.min.y > 0.03)) return;
+      let supported = false;
+      for (let i = 0; i < entries.length; i++) {
+        const o = entries[i];
+        if (o === c || o.outsideContainer) continue;
+        o.mesh.updateMatrixWorld(true);
+        const ob = new THREE.Box3().setFromObject(o.mesh);
+        const ox = Math.min(box.max.x, ob.max.x) - Math.max(box.min.x, ob.min.x);
+        const oz = Math.min(box.max.z, ob.max.z) - Math.max(box.min.z, ob.min.z);
+        if (ox > 0.01 && oz > 0.01 && Math.abs(ob.max.y - box.min.y) <= 0.04) {
+          supported = true;
+          break;
+        }
+      }
+      if (!supported) {
+        c.mesh.position.y -= box.min.y;
+        c.mesh.updateMatrixWorld(true);
+      }
+    });
+  }
   const settled = list.filter(c => !c.outsideContainer);
-  restoreLockedOrients(settled);
   if (settled.length) {
-    restackWithGravity(settled);
     restoreLockedOrients(settled);
-    restackWithGravity(settled);
+    reseatAfterOrientRestore(settled);
     restoreLockedOrients(settled);
+    reseatAfterOrientRestore(settled);
+    restoreLockedOrients(settled);
+    reseatAfterOrientRestore(settled);
   }
   // Final nail: anything still mid-air with no support → floor
-  settled.forEach(c => {
-    if (c.outsideContainer) return;
-    c.mesh.updateMatrixWorld(true);
-    const box = new THREE.Box3().setFromObject(c.mesh);
-    if (!(box.min.y > 0.03)) return;
-    let supported = false;
-    for (let i = 0; i < settled.length; i++) {
-      const o = settled[i];
-      if (o === c || o.outsideContainer) continue;
-      o.mesh.updateMatrixWorld(true);
-      const ob = new THREE.Box3().setFromObject(o.mesh);
-      const ox = Math.min(box.max.x, ob.max.x) - Math.max(box.min.x, ob.min.x);
-      const oz = Math.min(box.max.z, ob.max.z) - Math.max(box.min.z, ob.min.z);
-      if (ox > 0.01 && oz > 0.01 && Math.abs(ob.max.y - box.min.y) <= 0.04) {
-        supported = true;
-        break;
-      }
-    }
-    if (!supported) {
-      c.mesh.position.y -= box.min.y;
-      c.mesh.updateMatrixWorld(true);
-    }
-  });
+  nailUnsupportedToFloor(settled);
+  // Last orient restore MUST reseat too (bare restore was leaving floats)
   restoreLockedOrients(settled);
+  reseatAfterOrientRestore(settled);
+  nailUnsupportedToFloor(settled);
 
   // Sync packer records to settled mesh (keeps later Optimise/seed honest)
   list.filter(c => !c.outsideContainer).forEach(c => {
