@@ -281,11 +281,21 @@ function refineAssemblyGroundPose(group, it, orientationInfo) {
     candidates.push(row);
     if (!best || score > best.score) best = row;
   }
-  // Prefer any face that fits a 40ft envelope over a higher-scoring pitched sit
+  // Prefer shippable sits; among those, face-down (Y ≤ Z) + lowest height
   const shipOk = candidates.filter(c => c.ships);
-  if (shipOk.length) {
-    shipOk.sort((a, b) => b.score - a.score);
-    best = shipOk[0];
+  const pool = shipOk.length ? shipOk : candidates;
+  if (pool.length) {
+    pool.sort((a, b) => {
+      const aFace = (a.ev?.size?.y || 0) <= (a.ev?.size?.z || 1) * 1.08 ? 1 : 0;
+      const bFace = (b.ev?.size?.y || 0) <= (b.ev?.size?.z || 1) * 1.08 ? 1 : 0;
+      if (aFace !== bFace) return bFace - aFace;
+      const ay = a.ev?.size?.y || 1e9;
+      const by = b.ev?.size?.y || 1e9;
+      if (ay < by * 0.92) return -1;
+      if (by < ay * 0.92) return 1;
+      return b.score - a.score;
+    });
+    best = pool[0];
   }
 
   if (!best) return evaluateMeshGroupStability(group);
@@ -344,6 +354,449 @@ function refineAssemblyGroundPose(group, it, orientationInfo) {
     console.info(
       `[assembly-ship] ${it?.mark || '?'} pose=${best.tag}`
       + ` ground=${finalEv.ground_touch} pca=${finalEv.pca_aligned}`
+      + ` tip=${(finalEv.tip_ratio || 0).toFixed(2)}`
+    );
+  } catch (_) { /* */ }
+  return finalEv;
+}
+
+/**
+ * Base-layer FIRST (heaviest) item — LYING ONLY (never stand upright).
+ * Hard rule: longest AABB axis must be world X (container length).
+ * Never accept standing_on_end / length-up poses.
+ *
+ * Search: X/Y/Z at 0,±1,±5,±15,±45,±90° (+ Rx±90 face rolls) → max ground support.
+ *
+ * @returns {{ rot:{x,y,z}, tag:string, pl:number, pw:number, ph:number,
+ *             score:number, baseArea:number, ground:boolean, lying:boolean }|null}
+ */
+function searchBaseLayerGroundPose(it, Lmax, Wmax, Hmax) {
+  if (!it || typeof THREE === 'undefined' || typeof makeShape !== 'function')
+    return null;
+  const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.01;
+  const Lmm = Math.max(+Lmax || 12192, 1);
+  const Wmm = Math.max(+Wmax || 2438, 1);
+  const Hmm = Math.max(+Hmax || 2690, 1);
+  const anglesDeg = [0, 1, 5, 15, 45, 90, -1, -5, -15, -45, -90];
+  // Expected member span — reject poses that stand the piece up
+  const spanHint = Math.max(
+    +it.lengthMm || 0, +it.l || 0, +it.packLengthMm || 0,
+    +it.stableBundleMm?.l || 0, 1);
+
+  let mesh = null;
+  try {
+    mesh = makeShape({
+      ...it,
+      qty: 1,
+      lengthMm: it.lengthMm || it.l || it.packLengthMm || 1000,
+      widthMm: it.widthMm || it.w || it.packWidthMm || 200,
+      heightMm: it.heightMm || it.h || it.packHeightMm || 200,
+      _keepGroupByBundle: false,
+      _skipNestRoll: false,
+      packPoseLock: false,
+    }, 0xffffff, 1);
+  } catch (_) {
+    return null;
+  }
+  if (!mesh) return null;
+
+  const qRest = mesh.quaternion.clone();
+  let best = null;
+  let bestOrtho = null;
+  let bestFits = null; // best among container-fitting lying poses
+
+  function measure() {
+    mesh.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(mesh);
+    if (!isFinite(box.min.x)) return null;
+    if (Math.abs(box.min.y) > 1e-6) {
+      mesh.position.y -= box.min.y;
+      mesh.updateMatrixWorld(true);
+      box.setFromObject(mesh);
+    }
+    const ev = (typeof evaluateMeshGroupStability === 'function')
+      ? evaluateMeshGroupStability(mesh)
+      : null;
+    if (!ev) return null;
+    const pl = Math.max((box.max.x - box.min.x) / sc, 1);
+    const ph = Math.max((box.max.y - box.min.y) / sc, 1);
+    const pw = Math.max((box.max.z - box.min.z) / sc, 1);
+    // LYING: longest on X, never stand on end (container may force non-ideal face)
+    const longest = Math.max(pl, pw, ph);
+    const faceDown = ph <= pw * 1.08;
+    const lying = pl >= longest * 0.92
+      && pl >= ph * 1.15
+      && !ev.standing_on_end
+      && ph <= Hmm * 1.02
+      && pl >= Math.min(spanHint, Lmm) * 0.55;
+    if (!lying) return null; // hard reject upright / end-stand
+
+    const fits = pl <= Lmm * 1.02 && pw <= Wmm * 1.02 && ph <= Hmm * 1.02;
+    const floorOk = Math.abs(ev.floor_y || 0) < 1e-3;
+    // Max ground support — prefer face-down when it still fits the box
+    let score = (ev.base_area || 0) / (sc * sc) * 20;
+    if (floorOk) score += 1e9;
+    if (ev.stable) score += 5e8;
+    if (ev.length_horizontal) score += 3e8;
+    if (fits) score += 1e8;
+    else score -= 5e9;
+    if (faceDown) score += 6e8;
+    else score -= 2e8;
+    if (ev.thin_edge_sit) score -= 4e8;
+    if (ev.up_is_thinnest) score += 4e8;
+    score -= (ev.cog_height || 0) / sc * 100;
+    score -= (ev.tip_ratio || 0) * 1e5;
+    // Prefer low profile + wide Z contact (flat flange, not fin)
+    score -= ph * 400;
+    score += pw * 120;
+    return {
+      score, pl, pw, ph, fits, floorOk, lying: true,
+      baseArea: (ev.base_area || 0) / (sc * sc),
+      stable: !!ev.stable,
+      q: mesh.quaternion.clone(),
+    };
+  }
+
+  function isOrthoEuler(rx, ry, rz) {
+    const tol = 2 * Math.PI / 180;
+    const near = (a, b) => Math.abs(a - b) <= tol
+      || Math.abs(Math.abs(a - b) - Math.PI) <= tol;
+    const ax = [0, Math.PI / 2, -Math.PI / 2, Math.PI, -Math.PI];
+    const ok = (v) => ax.some(t => near(v, t));
+    return ok(rx) && ok(ry) && ok(rz);
+  }
+
+  function tryEuler(rx, ry, rz, tag) {
+    mesh.quaternion.copy(qRest);
+    if (rx || ry || rz) {
+      const qAdd = new THREE.Quaternion().setFromEuler(
+        new THREE.Euler(rx, ry, rz, 'XYZ'));
+      mesh.quaternion.premultiply(qAdd);
+    }
+    mesh.rotation.setFromQuaternion(mesh.quaternion);
+    mesh.position.set(0, 0, 0);
+    const row = measure();
+    if (!row || !row.lying) return;
+    row.tag = tag;
+    row.rot = { x: rx, y: ry, z: rz };
+    if (!best || row.score > best.score) best = row;
+    if (row.fits && (!bestFits || row.score > bestFits.score)) bestFits = row;
+    if (isOrthoEuler(rx, ry, rz)) {
+      if (!bestOrtho || row.score > bestOrtho.score) bestOrtho = row;
+    }
+  }
+
+  // Face-roll to lie flat (Rx±90) first — then fine angles for best ground sit
+  for (let ai = 0; ai < anglesDeg.length; ai++) {
+    const d = anglesDeg[ai];
+    const r = d * Math.PI / 180;
+    tryEuler(Math.PI / 2, r, 0, `Rx90_Ry${d}`);
+    tryEuler(-Math.PI / 2, r, 0, `Rx-90_Ry${d}`);
+    tryEuler(Math.PI / 2, 0, r, `Rx90_Rz${d}`);
+    tryEuler(-Math.PI / 2, 0, r, `Rx-90_Rz${d}`);
+    tryEuler(r, 0, 0, `Rx${d}`);
+    tryEuler(0, r, 0, `Ry${d}`);
+    tryEuler(0, 0, r, `Rz${d}`);
+  }
+
+  try {
+    if (mesh && typeof disposeTempMesh === 'function') disposeTempMesh(mesh);
+    else if (mesh) {
+      mesh.traverse(o => { if (o.geometry) o.geometry.dispose(); });
+    }
+  } catch (_) { /* */ }
+
+  // Container must win: never pick a flatter pose that does not fit 40ft
+  if (bestFits) best = bestFits;
+  if (!best || !best.lying) return null;
+  // Prefer flatter ortho ONLY when it still fits
+  if (bestOrtho && bestOrtho.lying && bestOrtho.fits
+      && bestOrtho.ph < best.ph * 0.85) {
+    best = bestOrtho;
+  } else if (bestOrtho && bestOrtho.lying && bestOrtho.fits
+      && bestOrtho.score >= best.score * 0.92) {
+    best = bestOrtho;
+  }
+  if (!best.fits || !best.lying) return null;
+
+  try {
+    console.info(
+      `[base-ground] ${it.mark || '?'} LYING → ${best.tag}`
+      + ` base=${Math.round(best.baseArea)}mm²`
+      + ` LWH=${Math.round(best.pl)}×${Math.round(best.pw)}×${Math.round(best.ph)}`
+      + ` stable=${best.stable} ground=${best.floorOk}`
+    );
+  } catch (_) { /* */ }
+  return {
+    rot: best.rot,
+    tag: best.tag,
+    pl: best.pl,
+    pw: best.pw,
+    ph: best.ph,
+    score: best.score,
+    baseArea: best.baseArea,
+    ground: best.floorOk,
+    stable: best.stable,
+    lying: true,
+  };
+}
+
+/**
+ * Group-By / yard staging: cancel IFC pitch & diagonal lean.
+ * Hard rules — every piece must:
+ *   1) Lie flat (longest principal → world +X, never stand on end)
+ *   2) Sit axis-aligned (ortho face rolls only — no soft ±pitch)
+ *   3) Touch ground (minY → 0) with widest stable base
+ * Rigid only — does not mutate BufferGeometry.
+ *
+ * @returns {object|null} stability eval + warehouse stamp
+ */
+function straightenYardItemOnGround(mesh, it) {
+  if (!mesh || typeof THREE === 'undefined') return null;
+
+  const keepX = mesh.position.x;
+  const keepZ = mesh.position.z;
+  const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.01;
+
+  // Allow re-orient even if makeShape already stamped stability
+  try {
+    if (mesh.userData) mesh.userData._stabilityApplied = false;
+  } catch (_) { /* */ }
+
+  // 1) Cancel IFC roof-pitch / upright columns → length along +X
+  const alignInfo = (typeof cstabAlignLongestToWorldX === 'function')
+    ? cstabAlignLongestToWorldX(mesh)
+    : { ok: false };
+  const qFlat = mesh.quaternion.clone();
+
+  // 2) Ortho face rolls ONLY — no ±5…30° soft pitch (that left "charinjj" lean)
+  const trials = [
+    { tag: 'flat', qx: 0, qy: 0, qz: 0 },
+    { tag: 'Rx90', qx: Math.PI / 2, qy: 0, qz: 0 },
+    { tag: 'Rx180', qx: Math.PI, qy: 0, qz: 0 },
+    { tag: 'Rx270', qx: -Math.PI / 2, qy: 0, qz: 0 },
+    { tag: 'Rz90', qx: 0, qy: 0, qz: Math.PI / 2 },
+    { tag: 'Rz270', qx: 0, qy: 0, qz: -Math.PI / 2 },
+    { tag: 'Ry90', qx: 0, qy: Math.PI / 2, qz: 0 },
+    { tag: 'Ry270', qx: 0, qy: -Math.PI / 2, qz: 0 },
+    { tag: 'Ry180', qx: 0, qy: Math.PI, qz: 0 },
+    { tag: 'Rx90_Ry90', qx: Math.PI / 2, qy: Math.PI / 2, qz: 0 },
+    { tag: 'Rx90_Ry180', qx: Math.PI / 2, qy: Math.PI, qz: 0 },
+    { tag: 'Rx90_Ry270', qx: Math.PI / 2, qy: -Math.PI / 2, qz: 0 },
+  ];
+
+  function snapGround() {
+    mesh.position.x = keepX;
+    mesh.position.z = keepZ;
+    mesh.position.y = 0;
+    mesh.updateMatrixWorld(true);
+    if (typeof csNzSnapObjectToGround === 'function') {
+      csNzSnapObjectToGround(mesh);
+    } else {
+      const box = new THREE.Box3().setFromObject(mesh);
+      if (isFinite(box.min.y)) mesh.position.y -= box.min.y;
+    }
+    mesh.position.x = keepX;
+    mesh.position.z = keepZ;
+    mesh.updateMatrixWorld(true);
+  }
+
+  function scorePose(ev) {
+    const sx = ev.size?.x || 1;
+    const sy = ev.size?.y || 1;
+    const sz = ev.size?.z || 1;
+    const longest = Math.max(sx, sy, sz);
+    const thinnest = Math.min(sx, sy, sz);
+    // Kidathy / max ground support:
+    //  • length on X
+    //  • cross-section flat: height Y ≤ width Z (not wall-on-edge)
+    //  • never stand on end
+    const faceDown = sy <= sz * 1.08;
+    const lying = sx >= longest * 0.92
+      && sx >= sy * 1.12
+      && faceDown
+      && !ev.standing_on_end
+      && !ev.thin_edge_sit;
+    const floorOk = Math.abs(ev.floor_y || 0) < 1e-3;
+    // Primary: MAX ground footprint (sx×sz) — widest face down
+    let score = (ev.base_area || 0) * 25;
+    if (!lying) score -= 5e8;
+    else score += 2e8;
+    if (floorOk) score += 1e8;
+    if (ev.stable) score += 5e7;
+    if (ev.length_horizontal) score += 2e7;
+    if (ev.standing_on_end) score -= 1e9;
+    if (ev.thin_edge_sit) score -= 1e9;
+    if (!faceDown) score -= 1e9;
+    // Flange / plate face down: Y must be the thinnest axis
+    if (ev.up_is_thinnest || Math.abs(sy - thinnest) < 1e-6) score += 2e8;
+    else if (sy > thinnest * 1.5) score -= 1e8;
+    // Strongly prefer low profile (flat) over tall wall
+    score -= sy * 2000;
+    score += sz * 80;
+    score -= (ev.cog_height || 0) * 200;
+    score -= (ev.tip_ratio || 0) * 3e4;
+    // Height/width aspect — hard punish wall-like sits (even if tabs inflate Z)
+    const crossAspect = sy / Math.max(sz, 1e-9);
+    if (crossAspect > 1.05) score -= 5e7 * (crossAspect - 1.05);
+    return { score, lying, floorOk };
+  }
+
+  let best = null;
+  for (const tr of trials) {
+    mesh.quaternion.copy(qFlat);
+    if (tr.qx || tr.qy || tr.qz) {
+      const e = new THREE.Euler(tr.qx, tr.qy, tr.qz, 'XYZ');
+      mesh.quaternion.premultiply(new THREE.Quaternion().setFromEuler(e));
+    }
+    mesh.rotation.setFromQuaternion(mesh.quaternion);
+    snapGround();
+    const ev = evaluateMeshGroupStability(mesh);
+    const scv = scorePose(ev);
+    const row = {
+      score: scv.score,
+      lying: scv.lying,
+      floorOk: scv.floorOk,
+      tag: tr.tag,
+      ev,
+      q: mesh.quaternion.clone(),
+      py: mesh.position.y,
+    };
+    if (!best || row.score > best.score) best = row;
+  }
+
+  // Prefer lying; among lying prefer lowest height (true flat / max support)
+  {
+    let bestLie = null;
+    let bestFlat = null; // up_is_thinnest among lying
+    for (const tr of trials) {
+      mesh.quaternion.copy(qFlat);
+      if (tr.qx || tr.qy || tr.qz) {
+        const e = new THREE.Euler(tr.qx, tr.qy, tr.qz, 'XYZ');
+        mesh.quaternion.premultiply(new THREE.Quaternion().setFromEuler(e));
+      }
+      mesh.rotation.setFromQuaternion(mesh.quaternion);
+      snapGround();
+      const ev = evaluateMeshGroupStability(mesh);
+      const scv = scorePose(ev);
+      if (!scv.lying) continue;
+      const sy = ev.size?.y || 1;
+      const row = {
+        score: scv.score, lying: true, floorOk: scv.floorOk,
+        tag: tr.tag, ev, q: mesh.quaternion.clone(), py: mesh.position.y,
+        sy,
+      };
+      if (!bestLie || row.score > bestLie.score) bestLie = row;
+      if (ev.up_is_thinnest) {
+        if (!bestFlat || sy < bestFlat.sy - 1e-9
+            || (Math.abs(sy - bestFlat.sy) < 1e-6 && row.score > bestFlat.score))
+          bestFlat = row;
+      }
+    }
+    if (bestFlat) best = bestFlat;
+    else if (bestLie) best = bestLie;
+  }
+
+  if (!best) {
+    snapGround();
+    return evaluateMeshGroupStability(mesh);
+  }
+
+  mesh.quaternion.copy(best.q);
+  mesh.rotation.setFromQuaternion(best.q);
+  mesh.position.set(keepX, best.py, keepZ);
+  mesh.updateMatrixWorld(true);
+  snapGround();
+
+  // After PCA+ortho, re-align if residual lean left length off X
+  if (typeof cstabAlignLongestToWorldX === 'function') {
+    const boxA = new THREE.Box3().setFromObject(mesh);
+    const sx = (boxA.max.x - boxA.min.x);
+    const sy = (boxA.max.y - boxA.min.y);
+    const sz = (boxA.max.z - boxA.min.z);
+    const longest = Math.max(sx, sy, sz);
+    if (sx < longest * 0.9) {
+      cstabAlignLongestToWorldX(mesh);
+      snapGround();
+    }
+  }
+
+  // Fin → flat: if still on thin edge (wall sit), roll ±90° about X once
+  {
+    let evNow = evaluateMeshGroupStability(mesh);
+    if (evNow.thin_edge_sit || (!evNow.up_is_thinnest && !evNow.standing_on_end)) {
+      const q0 = mesh.quaternion.clone();
+      const py0 = mesh.position.y;
+      let rescue = null;
+      for (const ang of [Math.PI / 2, -Math.PI / 2, Math.PI]) {
+        mesh.quaternion.copy(q0);
+        mesh.quaternion.premultiply(
+          new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), ang));
+        mesh.rotation.setFromQuaternion(mesh.quaternion);
+        snapGround();
+        const evR = evaluateMeshGroupStability(mesh);
+        const scR = scorePose(evR);
+        if (!scR.lying) continue;
+        if (!rescue || scR.score > rescue.score) {
+          rescue = {
+            score: scR.score, q: mesh.quaternion.clone(), py: mesh.position.y,
+            tag: `rescue_Rx${Math.round(ang * 180 / Math.PI)}`,
+          };
+        }
+      }
+      if (rescue && rescue.score > (best.score || 0) * 0.5) {
+        mesh.quaternion.copy(rescue.q);
+        mesh.rotation.setFromQuaternion(rescue.q);
+        mesh.position.set(keepX, rescue.py, keepZ);
+        snapGround();
+        best.tag = `${best.tag}+${rescue.tag}`;
+        best.score = rescue.score;
+      } else {
+        mesh.quaternion.copy(q0);
+        mesh.rotation.setFromQuaternion(q0);
+        mesh.position.set(keepX, py0, keepZ);
+        snapGround();
+      }
+    }
+  }
+
+  const finalEv = evaluateMeshGroupStability(mesh);
+  finalEv.applied_rotation = { tag: best.tag };
+  finalEv.pca_aligned = !!(alignInfo && alignInfo.ok);
+  finalEv.yard_straighten = true;
+  finalEv.ground_touch = Math.abs(finalEv.floor_y || 0) < 1e-3;
+  finalEv.ground_stable = finalEv.ground_touch && !finalEv.standing_on_end;
+  finalEv.warehouse = {
+    ok: true,
+    method: 'yard_straighten',
+    rot: best.tag,
+    tip_ratio: finalEv.tip_ratio,
+    ground_stable: finalEv.ground_stable,
+    mark: it?.mark || null,
+  };
+
+  if (it) {
+    it.warehouseGround = finalEv.warehouse;
+    it._yardStraightened = true;
+    if (finalEv.size && sc > 0) {
+      it.stableBundleMm = {
+        l: finalEv.size.x / sc,
+        h: finalEv.size.y / sc,
+        w: finalEv.size.z / sc,
+        source: 'yard_straighten',
+      };
+    }
+  }
+  try {
+    if (!mesh.userData) mesh.userData = {};
+    mesh.userData._stabilityApplied = true;
+    mesh.userData.yardStraighten = finalEv.warehouse;
+  } catch (_) { /* */ }
+
+  try {
+    console.info(
+      `[yard-straight] ${it?.mark || '?'} pose=${best.tag}`
+      + ` ground=${finalEv.ground_touch} lying=${!finalEv.standing_on_end}`
       + ` tip=${(finalEv.tip_ratio || 0).toFixed(2)}`
     );
   } catch (_) { /* */ }
@@ -413,9 +866,16 @@ function evaluateMeshGroupStability(group) {
   // Length should be the long horizontal axis (X preferred)
   const length_horizontal = sx + 1e-6 >= sy && sx + 1e-6 >= sz * 0.85;
   const standing_on_end = sy + 1e-6 >= sx * 0.95 && sy + 1e-6 >= sz * 0.95;
-  // Thin-edge sit: tall AND tiny base in one axis
-  const thin_edge_sit = (sy > Math.max(sx, sz) * 1.15)
+  // Thin-edge tower: height taller than plan span
+  const thin_edge_tower = (sy > Math.max(sx, sz) * 1.15)
     && (Math.min(sx, sz) < Math.max(sx, sz) * 0.35);
+  // Long fin / blade: length on X but standing on narrow Z (wall-on-edge).
+  // Classic tower test misses this — sy << sx so old rule never fired.
+  const thin_edge_fin = length_horizontal
+    && (sy > sz * 1.25)
+    && (sz < sx * 0.15)
+    && (sy > thinnest * 1.4);
+  const thin_edge_sit = thin_edge_tower || thin_edge_fin;
 
   return {
     stable,
@@ -452,9 +912,9 @@ function applyStableRestPose(group, orientationInfo, itemOrOpts) {
   const qty = Math.max(1, Number(it?.qty) || 1);
   const nestKids = cstabCountPieceMeshes(group);
 
-  // Multi-piece nest stacks: do NOT tip the whole nest onto its side.
-  // Warehouse AABB on a tall nest prefers laying it flat — wrong for yard nest display.
-  if (qty > 1 && nestKids > 1) {
+  // Multi-piece nest stacks: do NOT tip the whole nest onto its side —
+  // EXCEPT Group-By yard straighten (must lie horizontal / no diagonal lean).
+  if (qty > 1 && nestKids > 1 && !(it && it._yardStraighten)) {
     const locked = cstabLockedRestPose(sk, it, nestKids, qty);
     if (locked) {
       group.rotation.set(locked.x, locked.y, locked.z);
@@ -708,6 +1168,10 @@ function measureStableBundleMm(it) {
       widthMm: it.widthMm || it.w || 200,
       heightMm: it.heightMm || it.h || 200,
       qty: it.qty || 1,
+      // Match Group-By yard pose so spacing uses flat AABB (not IFC pitch)
+      _yardStraighten: true,
+      assemblyShipPose: !!(it.isAssembly || it.assemblyShipPose
+        || it.groupKind === 'welded_assembly'),
     }, 0xffffff, 1);
     mesh.updateMatrixWorld(true);
     const box = new THREE.Box3().setFromObject(mesh);

@@ -568,6 +568,7 @@ public class MainForm : Form
                           // Pack quality: unsupported mid-air + mesh AABB dig-in
                           let floatCount = 0;
                           let overlapCount = 0;
+                          let maxMeshMinY = 0, maxMeshCy = 0, tallNestTip = 0;
                           const meshBoxes = [];
                           for (const c of list) {
                             if (!c || c.outsideContainer || !c.mesh) continue;
@@ -575,13 +576,33 @@ public class MainForm : Form
                               c.mesh.updateMatrixWorld(true);
                               const box = new THREE.Box3().setFromObject(c.mesh);
                               if (!isFinite(box.min.y)) continue;
-                              meshBoxes.push({ box: box, mark: (c.item && c.item.mark) || '' });
+                              const gk = String((c.item && c.item.groupKind) || '');
+                              const sk = String((c.item && (c.item.shapeKey || c.item.profileShape)) || '');
+                              meshBoxes.push({
+                                box: box,
+                                mark: (c.item && c.item.mark) || '',
+                                nest: /^nest_/.test(gk) || sk === 'z_channel'
+                                  || sk === 'c_channel' || sk === 'l_angle',
+                                y0: (c.item && c.item.y) || 0,
+                                fh: (c.item && c.item.packFootprintH) || 0,
+                                lock: !!(c.item && (c.item.packPoseLock
+                                  || c.item._orientLocked || c.item.floorAnchor)),
+                                gk: gk || sk || null,
+                              });
                             } catch (_) { /* */ }
                           }
+                          const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.01;
                           const eps = 1e-3;
-                          const floorEps = 0.03; // 30mm — skid / floor sit OK
+                          const floorEps = 30 * sc;   // 30mm
+                          const supportTol = 40 * sc; // 40mm
+                          const xzTol = 10 * sc;      // 10mm
                           for (let i = 0; i < meshBoxes.length; i++) {
                             const a = meshBoxes[i].box;
+                            const nestLike = !!meshBoxes[i].nest;
+                            const h = a.max.y - a.min.y;
+                            const cy = (a.min.y + a.max.y) * 0.5;
+                            if (a.min.y > maxMeshMinY) maxMeshMinY = a.min.y;
+                            if (cy > maxMeshCy) maxMeshCy = cy;
                             // Stacked on another mesh = OK; mid-air with no support = float
                             if (a.min.y > floorEps) {
                               let supported = false;
@@ -590,10 +611,16 @@ public class MainForm : Form
                                 const b = meshBoxes[j].box;
                                 const ox = Math.min(a.max.x, b.max.x) - Math.max(a.min.x, b.min.x);
                                 const oz = Math.min(a.max.z, b.max.z) - Math.max(a.min.z, b.min.z);
-                                if (ox <= 0.01 || oz <= 0.01) continue;
-                                if (Math.abs(b.max.y - a.min.y) <= 0.04) { supported = true; break; }
+                                if (ox <= xzTol || oz <= xzTol) continue;
+                                if (Math.abs(b.max.y - a.min.y) <= supportTol) { supported = true; break; }
                               }
                               if (!supported) floatCount++;
+                            } else if (nestLike) {
+                              // Tip-sit: nest taller than ~550mm with centroid high vs footprint
+                              const fh = Math.max(meshBoxes[i].fh || 0, 1) * sc;
+                              if (h > Math.max(550 * sc, fh * 1.8) && cy > h * 0.4) {
+                                floatCount++; tallNestTip++;
+                              }
                             }
                           }
                           for (let i = 0; i < meshBoxes.length; i++) {
@@ -653,6 +680,26 @@ public class MainForm : Form
                             outsideCount: outside.length,
                             floatCount: floatCount,
                             overlapCount: overlapCount,
+                            meshY: {
+                              maxMinY: maxMeshMinY,
+                              maxCy: maxMeshCy,
+                              tallNestTip: tallNestTip,
+                              n: meshBoxes.length,
+                              high: meshBoxes
+                                .map(m => ({
+                                  mark: m.mark,
+                                  nest: m.nest,
+                                  lock: m.lock,
+                                  gk: m.gk,
+                                  minY: +m.box.min.y.toFixed(3),
+                                  cy: +((m.box.min.y + m.box.max.y) * 0.5).toFixed(3),
+                                  h: +(m.box.max.y - m.box.min.y).toFixed(3),
+                                  itemY: m.y0,
+                                  fh: m.fh,
+                                }))
+                                .sort((a, b) => b.minY - a.minY)
+                                .slice(0, 8),
+                            },
                             packStrategy: (typeof currentLayout !== 'undefined'
                               && currentLayout && currentLayout.packStrategy)
                               || (window.__lastPackStrategy || null),

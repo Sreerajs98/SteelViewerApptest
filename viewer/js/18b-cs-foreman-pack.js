@@ -294,23 +294,14 @@ function layoutForemanPack(unitsIn, spec, opts) {
       weightKg: fmWeight(u),
       constraintTier: fmTier(u, Lmax),
       _yaw: (u.userRot && u.userRot.y) || 0,
+      // Nest rest-pose is already baked in makeShape (Group-By). Packer adds YAW only.
+      // Do NOT copy stabilityInfo.applied_rotation X/Z — that double-tilted Z purlins.
       _rot: (() => {
         const sk = String(u.shapeKey || '').toLowerCase();
         const gk = String(u.groupKind || '').toLowerCase();
         const isNest = gk.startsWith('nest_')
           || sk === 'z_channel' || sk === 'c_channel' || sk === 'l_angle';
-        if (isNest) {
-          // Use stability system's computed ground pose (staging rest-pose)
-          const ar = (u.stabilityInfo && u.stabilityInfo.applied_rotation)
-            || (u.rule1_orientation && u.rule1_orientation.rot)
-            || (u.orientation_info && u.orientation_info.applied_rotation);
-          if (ar && (Math.abs(ar.x || 0) > 1e-9
-              || Math.abs(ar.y || 0) > 1e-9
-              || Math.abs(ar.z || 0) > 1e-9)) {
-            return { x: ar.x || 0, y: ar.y || 0, z: ar.z || 0 };
-          }
-          return { x: 0, y: 0, z: 0 };
-        }
+        if (isNest) return { x: 0, y: 0, z: 0 };
         return u.userRot || { x: 0, y: 0, z: 0 };
       })(),
     };
@@ -429,6 +420,10 @@ function layoutForemanPack(unitsIn, spec, opts) {
       y0 = rect.y;
       // No roof-layer stacks (beside tall asms, not on top of them)
       if (y0 > Hceil * 0.45) return null;
+      // Tall cargo (assemblies / deep nests) never stacks — floor only
+      if (ph > Hceil * 0.40) return null;
+      if (item && (item.constraintTier === 0 || item.isAssembly
+          || item.groupKind === 'welded_assembly')) return null;
     }
 
     const box = {
@@ -915,6 +910,117 @@ function layoutForemanPack(unitsIn, spec, opts) {
     return floorRects.concat([full]);
   }
 
+  // ── PHASE 0: First base-layer assembly — ground-stability rotate search ─
+  // Rafter/column #1: try X/Y/Z at 1/5/15/45/90° → pick max ground support,
+  // lock footprints, seat on floor at rear-home BEFORE other floor cargo.
+  // Only real IFC assemblies (skip warehouse stub parts like {name:'web'}).
+  {
+    function fmPartsLookReal(parts) {
+      if (!parts || parts.length < 2) return false;
+      return parts.some(p => p && (
+        typeof p.isObject3D === 'boolean'
+        || typeof p.getWorldPosition === 'function'
+        || (p.geometry && p.geometry.attributes)
+        || Number(p.lengthMm) > 500
+        || (Array.isArray(p.positions) && p.positions.length > 6)
+        || (Array.isArray(p.vertices) && p.vertices.length > 6)
+        || (p.parts && p.parts.length)
+        || (p.meshes && p.meshes.length)
+        || (p.children && p.children.length)
+      ));
+    }
+    const allowSearch = o.baseGroundSearch !== false;
+    // Heaviest real assembly first — user: weight max item on base, LYING only
+    let firstAsm = null;
+    if (allowSearch) {
+      const cands = state.remainingItems.filter(u => {
+        if (!u || u._skipBaseGroundSearch) return false;
+        const asm = !!(u.isAssembly || u.groupKind === 'welded_assembly'
+          || u.groupKind === 'assembly_single');
+        if (!asm) return false;
+        const pl = +u.packLengthMm || +u.l || 0;
+        if (pl < Lmax * 0.55) return false;
+        const sbSrc = String((u.stableBundleMm && u.stableBundleMm.source) || '');
+        const measured = /measured|assembly|rest_pose|base_ground|pitched/i.test(sbSrc);
+        return fmPartsLookReal(u.parts) || measured;
+      });
+      cands.sort((a, b) => fmWeight(b) - fmWeight(a)
+        || (+b.packLengthMm || 0) - (+a.packLengthMm || 0));
+      firstAsm = cands[0] || null;
+    }
+    if (firstAsm && typeof searchBaseLayerGroundPose === 'function') {
+      const hit = searchBaseLayerGroundPose(firstAsm, Lmax, Wmax, Hceil);
+      // Only commit LYING poses (longest axis on container X)
+      if (hit && hit.lying && hit.pl > hit.ph * 1.15
+          && hit.pl > 0 && hit.pw > 0 && hit.ph > 0) {
+        firstAsm.packLengthMm = hit.pl;
+        firstAsm.packWidthMm = hit.pw;
+        firstAsm.packHeightMm = hit.ph;
+        firstAsm.packFootprintL = hit.pl;
+        firstAsm.packFootprintW = hit.pw;
+        firstAsm.packFootprintH = hit.ph;
+        firstAsm.l = hit.pl;
+        firstAsm.w = hit.pw;
+        firstAsm.h = hit.ph;
+        firstAsm._rot = {
+          x: hit.rot.x || 0,
+          y: hit.rot.y || 0,
+          z: hit.rot.z || 0,
+        };
+        firstAsm._yaw = hit.rot.y || 0;
+        firstAsm._baseGroundSearch = {
+          tag: hit.tag,
+          baseArea: hit.baseArea,
+          score: hit.score,
+          ground: hit.ground,
+          stable: hit.stable,
+          lying: true,
+        };
+        firstAsm.stableBundleMm = {
+          ...(firstAsm.stableBundleMm || {}),
+          l: hit.pl, w: hit.pw, h: hit.ph,
+          source: 'base_ground_search',
+        };
+        // Do NOT shrink seat to sectW (~240): that forced a thin-fin pack
+        // footprint while the mesh still sat tall — kills ground support.
+        // Keep searchBaseLayerGroundPose width (face-down / max base).
+        const floorRects = ensureFloorRect();
+        let seated = false;
+        for (let ri = 0; ri < floorRects.length && !seated; ri++) {
+          const rect = floorRects[ri];
+          if (rect.y > FM_EPS) continue;
+          const pose = inchPlace(
+            firstAsm, rect,
+            firstAsm.packLengthMm, firstAsm.packWidthMm, firstAsm.packHeightMm,
+            true);
+          if (!pose) continue;
+          seated = commit({
+            item: firstAsm,
+            rect,
+            pose,
+            yaw: firstAsm._yaw || 0,
+            tag: hit.tag || 'base_ground',
+            score: 1e6,
+          });
+        }
+        try {
+          console.info(
+            `[FM-BASE1] ${firstAsm.mark || '?'} LYING seated=${seated}`
+            + ` pose=${hit.tag}`
+            + ` foot=${Math.round(firstAsm.packLengthMm)}×${Math.round(firstAsm.packWidthMm)}×${Math.round(firstAsm.packHeightMm)}`
+          );
+        } catch (_) { /* */ }
+      } else if (hit) {
+        try {
+          console.warn(
+            `[FM-BASE1] skip — not lying ${hit.tag}`
+            + ` LWH=${Math.round(hit.pl)}×${Math.round(hit.pw)}×${Math.round(hit.ph)}`
+          );
+        } catch (_) { /* */ }
+      }
+    }
+  }
+
   // ── PHASE 1: Floor layer ───────────────────────────────────────────────
   let guard = 0;
   const maxPlace = Math.max(units.length * 4, 80);
@@ -1042,21 +1148,39 @@ function layoutForemanPack(unitsIn, spec, opts) {
 
   state.placedItems.forEach(p => {
     const u = p.item;
+    const nest = fmIsNest(u);
     const cx = p.x + p.pl / 2;
     const cy = p.y + p.ph / 2;
     const cz = p.z + p.pw / 2 - Wmax / 2;
     c.boxes.push(p.box);
     if (cz >= 0) c.rightWeight += p.weightKg;
     else c.leftWeight += p.weightKg;
+    // Nests: keep Group-By construction dims for makeShape (sect/qty/nestPieces).
+    // Pack footprint is seating only — overwriting L/W/H rebuilt a wrong bundle.
+    const shapeL = nest
+      ? Math.max(+u.lengthMm || +u.l || p.pl, 1)
+      : p.pl;
+    const shapeW = nest
+      ? Math.max(+u.sectW || +u.unitWidth || +u.widthMm || +u.w || p.pw, 1)
+      : p.pw;
+    const shapeH = nest
+      ? Math.max(+u.sectH || +u.unitHeight || +u.heightMm || +u.h || p.ph, 1)
+      : p.ph;
     c.items.push({
       ...u,
-      // Packer contract dims = locked footprint (not IFC construction L/W/H)
-      lengthMm: p.pl,
-      widthMm: p.pw,
-      heightMm: p.ph,
-      l: p.pl,
-      w: p.pw,
-      h: p.ph,
+      // Shape dims = Group-By construction (sect/nest). Footprint = seat only.
+      lengthMm: shapeL,
+      widthMm: shapeW,
+      heightMm: shapeH,
+      l: nest ? shapeL : p.pl,
+      w: nest ? shapeW : p.pw,
+      h: nest ? shapeH : p.ph,
+      unitHeight: nest
+        ? Math.max(+u.sectH || +u.unitHeight || shapeH, 1)
+        : (u.unitHeight || p.ph),
+      unitWidth: nest
+        ? Math.max(+u.sectW || +u.unitWidth || shapeW, 1)
+        : (u.unitWidth || p.pw),
       packFootprintL: p.pl,
       packFootprintW: p.pw,
       packFootprintH: p.ph,
@@ -1066,13 +1190,16 @@ function layoutForemanPack(unitsIn, spec, opts) {
       isAssembly: !!(u.isAssembly || u.groupKind === 'welded_assembly'
         || u.groupKind === 'assembly_single'),
       userRot: {
-        x: (u._rot && u._rot.x) || 0,
+        x: nest ? 0 : ((u._rot && u._rot.x) || 0),
         y: (p.yaw || 0) + ((u._rot && u._rot.y) || 0),
-        z: (u._rot && u._rot.z) || 0,
+        z: nest ? 0 : ((u._rot && u._rot.z) || 0),
       },
-      packYawOnly: !(fmIsNest(u) && u._rot
-        && (Math.abs(u._rot.x || 0) > 1e-9 || Math.abs(u._rot.z || 0) > 1e-9)),
-      packComposeRot: false,
+      // Base-ground search used full Euler — compose for that first assembly only
+      packYawOnly: nest ? true
+        : !(u._baseGroundSearch || (u._rot
+          && (Math.abs(u._rot.x || 0) > 1e-9 || Math.abs(u._rot.z || 0) > 1e-9))),
+      packComposeRot: !!(!nest && u._baseGroundSearch),
+      baseGroundSearch: u._baseGroundSearch || null,
       packPoseLock: true,
       packOrientTag: p.tag || 'yaw0',
       baseLayerLock: p.tier <= 1,
@@ -1081,6 +1208,14 @@ function layoutForemanPack(unitsIn, spec, opts) {
       unitWeightKg: p.weightKg,
       weight: p.weightKg,
       groupKind: u.groupKind || u.category || null,
+      // Keep Group-By nest roll / nestPieces / nestingInfo EXACTLY (do not zero)
+      orientation_info: u.orientation_info || null,
+      nestingInfo: u.nestingInfo || null,
+      nestPieces: u.nestPieces || null,
+      nestMethod: u.nestMethod || null,
+      nestingOffsetMm: u.nestingOffsetMm || u.nesting_offset || null,
+      qty: Math.max(1, +u.qty || (u.nestPieces && u.nestPieces.length) || 1),
+      _keepGroupByBundle: nest,
       _supportFrac: 1,
       mutates_geometry: false,
     });
@@ -1130,6 +1265,21 @@ function layoutForemanPack(unitsIn, spec, opts) {
     maxBottomY: state.placedItems.reduce((m, p) => Math.max(m, p.y), 0),
     longPlaced: state.placedItems.filter(p => p.pl >= Lmax * 0.7).length,
     floorFreeRects: state.freeRects.filter(r => r.y <= FM_EPS).length,
+    base1: (() => {
+      const p0 = state.placedItems.find(p => p.item && p.item._baseGroundSearch);
+      if (!p0) return null;
+      const b = p0.item._baseGroundSearch;
+      return {
+        mark: p0.mark,
+        tag: b.tag,
+        baseArea: Math.round(b.baseArea || 0),
+        ground: !!b.ground,
+        stable: !!b.stable,
+        pl: Math.round(p0.pl),
+        pw: Math.round(p0.pw),
+        ph: Math.round(p0.ph),
+      };
+    })(),
     rf012In: rfU ? {
       mark: rfU.mark,
       marks: rfU.marks,

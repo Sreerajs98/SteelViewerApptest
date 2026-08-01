@@ -985,6 +985,17 @@ function makeLAngleBundle(it, color, opacity) {
 // All top-level results get CoG rest-pose via ensureStableShape (rigid only).
 function makeShape(it, color, opacity) {
   const mesh = makeShapeRaw(it, color, opacity);
+  // Optimise nest: keep exact Group-By bundle (incl. nest roll) — no re-ground
+  if (it && it._keepGroupByBundle) {
+    try {
+      mesh.updateMatrixWorld(true);
+      if (typeof THREE !== 'undefined') {
+        const box = new THREE.Box3().setFromObject(mesh);
+        if (isFinite(box.min.y)) mesh.position.y -= box.min.y;
+      }
+    } catch (_) { /* */ }
+    return mesh;
+  }
   if (typeof ensureStableShape === 'function') return ensureStableShape(mesh, it);
   return mesh;
 }

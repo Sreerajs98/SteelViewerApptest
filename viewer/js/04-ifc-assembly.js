@@ -728,6 +728,8 @@ function makeZPurlinBundle(it, color, opacity) {
   const nestMode = (typeof chooseStableNestMode === 'function')
     ? chooseStableNestMode(it, columns[0].length)
     : (isInterlock ? 'collision_flip' : 'diagonal_same');
+  // Never strip nest roll — Group-By nested Z look REQUIRES nesting_angle / offsets.
+  const skipNestRoll = false;
 
   // Rest-pose CoG stability applied once in makeShape → ensureStableShape
   function finishStable(g) {
@@ -771,8 +773,10 @@ function makeZPurlinBundle(it, color, opacity) {
       mesh.position.y = -bundleH / 2 + H / 2 + (pl.y_offset_mm || 0) * SCALE;
       mesh.position.z = -bundleW / 2 + W / 2 + (pl.z_offset_mm || 0) * SCALE;
       if (flip) mesh.rotation.x += Math.PI;
-      // Nesting Angle: two-point ground level (from Step3 polygon)
-      const nestRoll = Number(it.orientation_info?.nesting_angle_rad) || 0;
+      // Nesting Angle: two-point ground (Step3) — OFF when packing Group-By bundle
+      const nestRoll = skipNestRoll
+        ? 0
+        : (Number(it.orientation_info?.nesting_angle_rad) || 0);
       if (Math.abs(nestRoll) > 1e-5) mesh.rotation.x += nestRoll;
       mesh.userData.nestFlip = flip;
       group.add(mesh);
@@ -795,14 +799,17 @@ function makeZPurlinBundle(it, color, opacity) {
     const step0 = nestOffMm > 0
       ? nestOffMm * SCALE
       : Math.max(stackStepMm, 0.5) * SCALE;
+    // Keep Group-By nest offsets (tilted axis / step). Only tip-joint ROLL is skipped.
     const useTilt = !!(nestInfo && nestInfo.use_tilted_nest_axis);
     const axis = useTilt ? (Number(nestInfo.nest_axis_angle_rad) || 0) : 0;
     const stepY = useTilt ? step0 * Math.cos(axis) : step0;
     const stepZ = useTilt ? step0 * Math.sin(axis) : 0;
-    const nestRoll = (typeof calculateZNestingAngle === 'function'
-      && it.orientation_info?.nesting_angle_rad != null)
-      ? Number(it.orientation_info.nesting_angle_rad) || 0
-      : 0;
+    const nestRoll = skipNestRoll
+      ? 0
+      : ((typeof calculateZNestingAngle === 'function'
+        && it.orientation_info?.nesting_angle_rad != null)
+        ? Number(it.orientation_info.nesting_angle_rad) || 0
+        : 0);
 
     columns.forEach((col, si) => {
       if (!col.length) return;

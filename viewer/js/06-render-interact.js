@@ -190,15 +190,45 @@ function renderContainer(idx) {
   let pieceCount = 0;
   cont.items.forEach(it => {
     const color = COLORS[it.category] ?? COLORS.other;
-    const box = makeShape(it, color);
-    box.position.set(it.x*SCALE, it.y*SCALE, it.z*SCALE);
-    // Keep packer / user orientation (yaw-only, face-roll compose, or absolute).
-    applyPackItemRotation(box, it);
-    // Packer Y is AABB center; rest-pose mesh origin is often floor-sat → foot-snap
+    // Nest packs: same Group-By shape inputs (sect/qty/nestPieces/nest angle).
+    // Do NOT zero nesting_angle — that is what makes the nested Z bundle look.
+    let shapeIt = it;
+    if (typeof packItemKeepGroupByPose === 'function' && packItemKeepGroupByPose(it)) {
+      const sectH = Math.max(+it.sectH || +it.unitHeight || 0, 0);
+      const sectW = Math.max(+it.sectW || +it.unitWidth || 0, 0);
+      let memberL = Math.max(+it.lengthMm || +it.l || 0, 0);
+      if (it.nestPieces && it.nestPieces.length) {
+        memberL = Math.max(memberL, ...it.nestPieces.map(np => +np.lengthMm || 0));
+      }
+      shapeIt = {
+        ...it,
+        lengthMm: memberL || it.lengthMm,
+        widthMm: sectW || it.widthMm,
+        heightMm: sectH || it.heightMm,
+        unitHeight: sectH || it.unitHeight,
+        unitWidth: sectW || it.unitWidth,
+        qty: Math.max(1, +it.qty || (it.nestPieces && it.nestPieces.length) || 1),
+        nestPieces: it.nestPieces ? it.nestPieces.map(np => ({ ...np })) : null,
+        nestingInfo: it.nestingInfo ? { ...it.nestingInfo } : null,
+        nestMethod: it.nestMethod || null,
+        nestingOffsetMm: it.nestingOffsetMm || it.nesting_offset || null,
+        orientation_info: it.orientation_info ? { ...it.orientation_info } : null,
+        _keepGroupByBundle: true,
+        packPoseLock: true,
+      };
+    }
+    const box = makeShape(shapeIt, color);
+    box.position.set(it.x * SCALE, it.y * SCALE, it.z * SCALE);
+    applyPackItemRotation(box, shapeIt);
     snapMeshToPackerFootY(box, it);
     scene.add(box);
     const sid = it.stagingGroupId || findStagingIdForUnit(it);
     if (sid && !it.stagingGroupId) it.stagingGroupId = sid;
+    if (shapeIt._keepGroupByBundle) {
+      it._keepGroupByBundle = true;
+      it._orientLocked = true;
+      if (shapeIt._lockedQuaternion) it._lockedQuaternion = shapeIt._lockedQuaternion;
+    }
     clickable.push({ mesh: box, item: it, stagingGroupId: sid || null });
     pieceCount += it.qty;
   });
@@ -233,6 +263,8 @@ function renderContainer(idx) {
     // For truly oversized items (bigger than container), cap display size.
     const MAX_DISP = 3000;
     currentLayout.oversized.forEach((it, i) => {
+      const yardView = !!(currentLayout?.isGroupedView || currentLayout?.isOutsideView
+        || it._yardStraighten || it.outsideContainer);
       const itemForRender = {
         ...it,
         lengthMm: it.lengthMm || it.l || 500,
@@ -252,6 +284,9 @@ function renderContainer(idx) {
         parts: it.parts,
         pathPointsMm: it.pathPointsMm || null,
         pathDiamMm: it.pathDiamMm || 0,
+        // Yard: makeShape → groundOrient uses ortho straighten (no pitch lean)
+        _yardStraighten: yardView || !!it._yardStraighten,
+        assemblyShipPose: !!it.assemblyShipPose || !!it.isAssembly,
       };
       const color = COLORS[it.category] ?? COLORS.other; // real color, not red
       const mesh = makeShape(itemForRender, color, 0.93);
@@ -271,6 +306,12 @@ function renderContainer(idx) {
         );
       }
       applyPackItemRotation(mesh, it);
+      // Final yard pass: cancel any residual IFC pitch after pack rotation
+      if (yardView && typeof straightenYardItemOnGround === 'function'
+          && !it.exactPoseLock && !it.restoredFromOptimise) {
+        straightenYardItemOnGround(mesh, itemForRender);
+        if (itemForRender.stableBundleMm) it.stableBundleMm = itemForRender.stableBundleMm;
+      }
       scene.add(mesh);
       clickable.push({ mesh, item: {
         mark: it.mark, assemblyName: it.assemblyName,
@@ -1319,7 +1360,17 @@ function restackWithGravity(entries) {
       support = floorY;
 
     const dy = support - it.box.min.y;
-    if (Math.abs(dy) > 1e-5) it.e.mesh.position.y += dy;
+    const lock = !!(it.e.item && (it.e.item.packPoseLock || it.e.item.floorAnchor
+      || it.e.item._orientLocked));
+    // packPoseLock: DROP only. Raising onto fat IFC assembly AABBs parks
+    // Z/C nests as a mid-air sheet (looks like no gravity; CLI still float=0
+    // because mesh tip rests on the oversized assembly box).
+    if (lock && dy > 1e-5) {
+      if (typeof snapMeshToPackerFootY === 'function')
+        snapMeshToPackerFootY(it.e.mesh, it.e.item);
+    } else if (Math.abs(dy) > 1e-5) {
+      it.e.mesh.position.y += dy;
+    }
     it.e.mesh.updateMatrixWorld(true);
     it.box.setFromObject(it.e.mesh);
     // Never sink below floor
@@ -1340,7 +1391,8 @@ function resolveAabbOverlaps(entries) {
   if (!entries || entries.length < 2) return;
   // Tiny eps: separate dig-in only; final pose is flush (touch), not gapped
   const eps = 1e-4;
-  const floorBand = 0.55; // metres — both near floor → prefer XZ, not Y float
+  const scR = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.01;
+  const floorBand = 400 * scR; // ~400mm — both near floor → prefer XZ, not Y float
   for (let pass = 0; pass < 16; pass++) {
     let moved = false;
     const boxes = entries.map(e => {
@@ -1357,11 +1409,15 @@ function resolveAabbOverlaps(entries) {
         if (ox <= eps || oy <= eps || oz <= eps) continue;
 
         const bothFloor = a.min.y < floorBand && b.min.y < floorBand;
+        const lockA = !!(A.e.item && (A.e.item.packPoseLock || A.e.item._orientLocked
+          || A.e.item.floorAnchor));
+        const lockB = !!(B.e.item && (B.e.item.packPoseLock || B.e.item._orientLocked
+          || B.e.item.floorAnchor));
         let axis = 'y', pen = oy;
         if (ox < pen) { axis = 'x'; pen = ox; }
         if (oz < pen) { axis = 'z'; pen = oz; }
-        // Floor layer: never create mid-air by Y-lift — shove in X/Z
-        if (bothFloor && (ox > eps || oz > eps)) {
+        // Floor / packer-locked: never Y-lift into mid-air — shove in X/Z
+        if ((bothFloor || lockA || lockB) && (ox > eps || oz > eps)) {
           axis = (ox <= oz || oz <= eps) ? (ox > eps ? 'x' : 'z') : 'z';
           if (ox > eps && oz > eps) axis = ox <= oz ? 'x' : 'z';
           pen = axis === 'x' ? ox : oz;
@@ -1884,8 +1940,8 @@ function layoutInspection() {
       : ((typeof csNzIsZShape === 'function' && csNzIsZShape(u))
         || /z_channel|z_shape/i.test(String(u.shapeKey || u.profileShape || '')));
 
-    // Assemblies: length along +X (PCA ship pose), side-by-side in +Z —
-    // never leave IFC yaw / pitch in staging (that made the X-cross mess).
+    // ALL yard pieces: length along +X, horizontal, ground-stable —
+    // never leave IFC pitch / diagonal lean in staging ("charinjj").
     const place = {
       ...u,
       x: xCursor + fp.footX / 2,
@@ -1899,13 +1955,12 @@ function layoutInspection() {
       outsideContainer: true,
       stagingGroupId: stagingId,
       mutates_geometry: false,
+      // Group-By: straighten every item (rods, beams, assemblies) before Optimise
+      _yardStraighten: true,
+      userRot: { x: 0, y: 0, z: 0 },
+      packYawOnly: true,
     };
-    if (isAsm) {
-      // Lock yaw to 0 — ship pose already aligned length→X inside makeShape
-      place.userRot = { x: 0, y: 0, z: 0 };
-      place.packYawOnly = true;
-      place.assemblyShipPose = true;
-    }
+    if (isAsm) place.assemblyShipPose = true;
     outItems.push(place);
 
     // Assemblies: advance along length (X) so next sits in FRONT (door/yard walk),
@@ -1996,6 +2051,10 @@ function layoutOutside() {
         outsideContainer: true,
         stagingGroupId: stagingId,
         mutates_geometry: false,
+        _yardStraighten: true,
+        userRot: { x: 0, y: 0, z: 0 },
+        packYawOnly: true,
+        assemblyShipPose: isAsm,
       });
       xCursor += fp.footX + gap;
       rowMaxW = Math.max(rowMaxW, fp.footZ);
@@ -2075,6 +2134,8 @@ function alignMeshToPackFootprint(mesh, it) {
   if (!(tL > 0 && tW > 0 && tH > 0)) return false;
   const target = [tL, tH, tW]; // world X,Y,Z mm
   const tol = Math.max(80, Math.min(tL, tW, tH) * 0.08);
+  const wantFlat = typeof packItemNeedsFlatAlign === 'function'
+    && packItemNeedsFlatAlign(it);
 
   const measure = () => {
     mesh.updateMatrixWorld(true);
@@ -2084,42 +2145,77 @@ function alignMeshToPackFootprint(mesh, it) {
     const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.001;
     return [s.x / sc, s.y / sc, s.z / sc];
   };
-  const errOf = (d) =>
-    Math.abs(d[0] - target[0]) + Math.abs(d[1] - target[1]) + Math.abs(d[2] - target[2]);
+  // Nests/braces: punish tall poses hard — AABB L1 match alone kept IFC roof
+  // pitch (diagonal purple sheet) when footprint H was also wrong/tall.
+  const errOf = (d) => {
+    const eL = Math.abs(d[0] - target[0]);
+    const eH = Math.abs(d[1] - target[1]);
+    const eW = Math.abs(d[2] - target[2]);
+    if (!wantFlat) return eL + eH + eW;
+    const tallPen = Math.max(0, d[1] - target[1]) * 14
+      + Math.max(0, d[1] - Math.min(tL, tW, tH) * 1.35) * 20;
+    return eH * 10 + eL + eW + tallPen;
+  };
 
   const qRest = mesh.quaternion.clone();
-  let best = { err: errOf(measure()), q: qRest.clone() };
-  if (best.err <= tol * 3) return true; // already matches footprint
+  let d0 = measure();
+  let best = { err: errOf(d0), q: qRest.clone(), h: d0[1] };
+  // Already flat + footprint OK → keep. Pitched-but-AABB-ok must NOT early-out.
+  if (wantFlat) {
+    if (d0[1] <= target[1] * 1.25 && best.err <= tol * 3) return true;
+  } else if (best.err <= tol * 3) {
+    return true;
+  }
 
   const ur = it.userRot || {};
   const trials = [
     { x: ur.x || 0, y: ur.y || 0, z: ur.z || 0 },
+    { x: 0, y: 0, z: 0 },
     { x: Math.PI / 2, y: 0, z: 0 },
     { x: -Math.PI / 2, y: 0, z: 0 },
+    { x: Math.PI, y: 0, z: 0 },
     { x: 0, y: 0, z: Math.PI / 2 },
     { x: 0, y: 0, z: -Math.PI / 2 },
     { x: Math.PI / 2, y: Math.PI, z: 0 },
+    { x: -Math.PI / 2, y: Math.PI, z: 0 },
     { x: Math.PI / 2, y: Math.PI / 2, z: 0 },
     { x: -Math.PI / 2, y: Math.PI / 2, z: 0 },
+    { x: Math.PI / 2, y: -Math.PI / 2, z: 0 },
+    { x: -Math.PI / 2, y: -Math.PI / 2, z: 0 },
     { x: 0, y: Math.PI / 2, z: Math.PI / 2 },
+    { x: 0, y: -Math.PI / 2, z: Math.PI / 2 },
+    { x: 0, y: Math.PI / 2, z: -Math.PI / 2 },
   ];
-  // Fine pitch-cancel — residual IFC roof slope after rest-pose
-  [-30, -20, -15, -10, -5, 5, 10, 15, 20, 30].forEach(d => {
-    const r = d * Math.PI / 180;
-    trials.push({ x: 0, y: r, z: 0 });
-    trials.push({ x: 0, y: 0, z: r });
-    trials.push({ x: Math.PI / 2, y: r, z: 0 });
-    trials.push({ x: ur.x || 0, y: (ur.y || 0) + r, z: ur.z || 0 });
-  });
+  // Fine pitch-cancel for assemblies only — small yaw on nests re-locks roof slope
+  if (!wantFlat) {
+    [-30, -20, -15, -10, -5, 5, 10, 15, 20, 30].forEach(d => {
+      const r = d * Math.PI / 180;
+      trials.push({ x: 0, y: r, z: 0 });
+      trials.push({ x: 0, y: 0, z: r });
+      trials.push({ x: Math.PI / 2, y: r, z: 0 });
+      trials.push({ x: ur.x || 0, y: (ur.y || 0) + r, z: ur.z || 0 });
+    });
+  } else {
+    // Tiny flatten only (±8°) around axis-aligned candidates
+    [-8, -4, 4, 8].forEach(d => {
+      const r = d * Math.PI / 180;
+      trials.push({ x: Math.PI / 2 + r, y: 0, z: 0 });
+      trials.push({ x: -Math.PI / 2 + r, y: 0, z: 0 });
+      trials.push({ x: (ur.x || 0) + r, y: ur.y || 0, z: ur.z || 0 });
+    });
+  }
   for (let i = 0; i < trials.length; i++) {
     const t = trials[i];
     mesh.quaternion.copy(qRest);
     const e = new THREE.Euler(t.x, t.y, t.z, 'XYZ');
     mesh.quaternion.premultiply(new THREE.Quaternion().setFromEuler(e));
     mesh.rotation.setFromQuaternion(mesh.quaternion);
-    const err = errOf(measure());
-    if (err < best.err) best = { err, q: mesh.quaternion.clone() };
-    if (err <= tol) break;
+    const d = measure();
+    const err = errOf(d);
+    if (err < best.err - 1e-6 || (Math.abs(err - best.err) <= 1e-6 && d[1] < best.h)) {
+      best = { err, q: mesh.quaternion.clone(), h: d[1] };
+    }
+    if (err <= tol && (!wantFlat || d[1] <= target[1] * 1.3)) break;
   }
   mesh.quaternion.copy(best.q);
   mesh.rotation.setFromQuaternion(mesh.quaternion);
@@ -2179,15 +2275,18 @@ function yardSettlePackedMeshes(entries, cont) {
     c.mesh.position.z = (it.z || 0) * sc;
     const asm = !!(it.isAssembly || it.groupKind === 'welded_assembly'
       || (it.parts && it.parts.length > 1));
-    const needFlat = typeof packItemNeedsFlatAlign === 'function'
-      ? packItemNeedsFlatAlign(it) : false;
-    if ((asm || needFlat) && typeof alignMeshToPackFootprint === 'function') {
+    const keepNest = typeof packItemKeepGroupByPose === 'function'
+      ? packItemKeepGroupByPose(it)
+      : (typeof packItemNeedsFlatAlign === 'function' && packItemNeedsFlatAlign(it));
+    // Assemblies only: cancel residual IFC pitch via footprint align.
+    // Nests: NEVER realign — Group-By nest pose must survive Optimise.
+    if (asm && !keepNest && typeof alignMeshToPackFootprint === 'function') {
       alignMeshToPackFootprint(c.mesh, it);
       it._orientLocked = true;
       if (typeof THREE !== 'undefined')
         it._lockedQuaternion = c.mesh.quaternion.clone();
     }
-    // Restore locked orient if render already froze it
+    // Restore locked orient if render already froze it (nests locked in applyPackItemRotation)
     if (it._orientLocked && it._lockedQuaternion && typeof THREE !== 'undefined') {
       c.mesh.quaternion.copy(it._lockedQuaternion);
       c.mesh.rotation.setFromQuaternion(c.mesh.quaternion);
@@ -2275,17 +2374,59 @@ function yardSettlePackedMeshes(entries, cont) {
       c.mesh.updateMatrixWorld(true);
     });
   }
-  function reseatAfterOrientRestore(entries) {
+  function packerFootY0mm(it) {
+    const fh = Number(it.packFootprintH) || Number(it.heightMm) || Number(it.h) || 0;
+    const yCenter = it.y != null ? Number(it.y) : fh / 2;
+    return yCenter - fh / 2;
+  }
+  /** Trust packer foot — never leave cargo on fat mesh “shelves”. */
+  function forcePackerFeet(entries) {
+    const foreman = !!(typeof currentLayout !== 'undefined' && currentLayout
+      && (currentLayout.packStrategy === 'foreman_space_first'
+        || (currentLayout.packPasses && currentLayout.packPasses.foreman)));
+    const Hmax = (typeof currentLayout !== 'undefined' && currentLayout
+      && currentLayout.containers && currentLayout.containers[0]
+      && currentLayout.containers[0].heightMm)
+      || (typeof rawScene !== 'undefined' && rawScene && rawScene.containerSpec
+        && rawScene.containerSpec.heightMm)
+      || 2591;
     (entries || []).forEach(c => {
       if (!c || !c.mesh || !c.item) return;
-      if (c.item._orientLocked || c.item.packOrientTag)
-        snapMeshToPackerFootY(c.mesh, c.item);
+      const it = c.item;
+      if (!foreman && !(it.packPoseLock || it._orientLocked
+          || it.floorAnchor || it.packOrientTag))
+        return;
+      const fh = Number(it.packFootprintH) || Number(it.heightMm) || Number(it.h) || 0;
+      const asm = !!(it.isAssembly || it.groupKind === 'welded_assembly'
+        || it.groupKind === 'assembly_single');
+      // Tall assemblies must sit on the floor — never on a 200mm nest “shelf”
+      if (asm && fh > Hmax * 0.40) {
+        const y0 = packerFootY0mm(it);
+        if (y0 > 50) {
+          it.y = fh / 2;
+          it.floorAnchor = true;
+        }
+      }
+      snapMeshToPackerFootY(c.mesh, it);
     });
-    if (entries && entries.length) restackWithGravity(entries);
+  }
+  function reseatAfterOrientRestore(entries) {
+    restoreLockedOrients(entries);
+    forcePackerFeet(entries);
+    // Gravity only for unlocked leftovers — locked seats stay on packer Y
+    const unlocked = (entries || []).filter(c =>
+      c && c.item && !c.item.packPoseLock && !c.item._orientLocked && !c.item.floorAnchor);
+    if (unlocked.length) restackWithGravity(unlocked);
   }
   function nailUnsupportedToFloor(entries) {
     (entries || []).forEach(c => {
       if (!c || c.outsideContainer || !c.mesh) return;
+      const it = c.item;
+      // Locked / foreman: always packer foot (mesh AABB support is a lie for lanes)
+      if (it && (it.packPoseLock || it._orientLocked || it.floorAnchor)) {
+        snapMeshToPackerFootY(c.mesh, it);
+        return;
+      }
       c.mesh.updateMatrixWorld(true);
       const box = new THREE.Box3().setFromObject(c.mesh);
       if (!(box.min.y > 0.03)) return;
@@ -2310,19 +2451,14 @@ function yardSettlePackedMeshes(entries, cont) {
   }
   const settled = list.filter(c => !c.outsideContainer);
   if (settled.length) {
-    restoreLockedOrients(settled);
     reseatAfterOrientRestore(settled);
-    restoreLockedOrients(settled);
-    reseatAfterOrientRestore(settled);
-    restoreLockedOrients(settled);
     reseatAfterOrientRestore(settled);
   }
-  // Final nail: anything still mid-air with no support → floor
   nailUnsupportedToFloor(settled);
-  // Last orient restore MUST reseat too (bare restore was leaving floats)
   restoreLockedOrients(settled);
-  reseatAfterOrientRestore(settled);
-  nailUnsupportedToFloor(settled);
+  forcePackerFeet(settled);
+  // Absolute last: locked cargo cannot sit above packer foot
+  forcePackerFeet(settled);
 
   // Sync packer records to settled mesh (keeps later Optimise/seed honest)
   list.filter(c => !c.outsideContainer).forEach(c => {
@@ -2568,8 +2704,12 @@ function packOrientTagToRot(it) {
   return { x, y, z };
 }
 
-/** Z / C / L nest packs — must lie flat after Optimise (not IFC pitch). */
-function packItemNeedsFlatAlign(it) {
+/**
+ * Z / C / L nest + flange-brace packs.
+ * Group-By already builds the correct nested rest-pose via makeShape/ensureStableShape.
+ * Optimise must KEEP that pose — only packer YAW may change.
+ */
+function packItemKeepGroupByPose(it) {
   if (!it) return false;
   const gk = String(it.groupKind || '').toLowerCase();
   const sk = String(it.shapeKey || it.profileShape || '').toLowerCase();
@@ -2579,6 +2719,11 @@ function packItemNeedsFlatAlign(it) {
     String(it.mark || '') + ' ' + ((it.marks || []).join(' '))))
     return true;
   return false;
+}
+
+/** @deprecated use packItemKeepGroupByPose — name kept for call sites */
+function packItemNeedsFlatAlign(it) {
+  return packItemKeepGroupByPose(it);
 }
 
 /** Apply packer rotation onto a mesh that already has makeShape rest-pose. */
@@ -2596,20 +2741,15 @@ function applyPackItemRotation(mesh, it) {
       it._lockedQuaternion = mesh.quaternion.clone();
   }
 
-  // Nest / brace: apply stability ground rot, then footprint-align (cancels IFC pitch)
-  if (packItemNeedsFlatAlign(it)
-      && it.packFootprintL > 0 && it.packFootprintW > 0 && it.packFootprintH > 0
-      && typeof alignMeshToPackFootprint === 'function') {
-    const ur0 = it.userRot || {};
-    if (Math.abs(ur0.x || 0) > 1e-9 || Math.abs(ur0.z || 0) > 1e-9) {
-      mesh.rotation.set(
-        ur0.x || 0,
-        (mesh.rotation.y || 0) + (ur0.y || 0),
-        ur0.z || 0
-      );
-      mesh.updateMatrixWorld(true);
-    }
-    alignMeshToPackFootprint(mesh, it);
+  // Nest / brace: KEEP Group-By rest-pose (makeShape/ensureStableShape).
+  // Do NOT alignMeshToPackFootprint or re-apply X/Z — that tipped Z onto its edge.
+  if (packItemKeepGroupByPose(it)) {
+    const tagYaw = packOrientTagToRot(it).y || 0;
+    const urYaw = (it.userRot && it.userRot.y) || 0;
+    // userRot already carries packOrientTag yaw when set by packer — don't double
+    const yaw = it.userRot ? urYaw : tagYaw;
+    if (Math.abs(yaw) > 1e-9) mesh.rotation.y += yaw;
+    mesh.updateMatrixWorld(true);
     lockOrient();
     return;
   }
@@ -2639,24 +2779,12 @@ function applyPackItemRotation(mesh, it) {
       mesh.rotation.z += ur.z || 0;
     }
   } else if (it.packYawOnly !== false) {
-    // Nest Z/C/L: apply full stability rotation (X/Z), not yaw-only
-    const isNest = typeof packItemNeedsFlatAlign === 'function'
-      ? packItemNeedsFlatAlign(it)
-      : false;
-    if (isNest && (Math.abs(ur.x || 0) > 1e-9 || Math.abs(ur.z || 0) > 1e-9)) {
-      mesh.rotation.set(
-        ur.x || 0,
-        (mesh.rotation.y || 0) + (ur.y || 0),
-        ur.z || 0
-      );
-    } else {
-      mesh.rotation.y += (ur.y || 0);
-    }
+    mesh.rotation.y += (ur.y || 0);
   } else {
     mesh.rotation.set(ur.x || 0, ur.y || 0, ur.z || 0);
   }
 
-  if (it.packOrientTag || packItemNeedsFlatAlign(it)) lockOrient();
+  if (it.packOrientTag) lockOrient();
 }
 
 /**
@@ -2872,11 +3000,22 @@ async function layoutPlaceSelected() {
   // STEP 8: pack units in #1→#n order (already weight-ranked)
   const packUnits = [];
   checkedGroups.forEach(g => {
-    // Always rebuild at Optimise — Group-time units may predate axis/span fixes
-    const pus = (typeof createPackUnits === 'function')
-      ? createPackUnits(g)
-      : (g.packUnits || []);
-    if (pus && pus.length) g.packUnits = pus;
+    // Nest Z/C/L: KEEP Group-By packUnits (exact nest bundle). Rebuilding at
+    // Optimise was dropping nest offsets / angle and redrawing upright stacks.
+    const nestGk = String(g.groupKind || '').toLowerCase();
+    const nestSk = String(g.shapeKey || g.profileShape || '').toLowerCase();
+    const isNestGroup = /^nest_[zcl]$/.test(nestGk)
+      || nestSk === 'z_channel' || nestSk === 'c_channel' || nestSk === 'l_angle';
+    let pus;
+    if (isNestGroup && g.packUnits && g.packUnits.length) {
+      pus = g.packUnits;
+    } else {
+      // Assemblies: rebuild so axis/span fixes apply
+      pus = (typeof createPackUnits === 'function')
+        ? createPackUnits(g)
+        : (g.packUnits || []);
+      if (pus && pus.length) g.packUnits = pus;
+    }
     const gw = Math.max(0, Number(g.sortWeightKg || g.weightKg) || 0);
     const r1 = g.rule1_orientation
       || (g.stabilityInfo && g.stabilityInfo.rule1_orientation)

@@ -280,6 +280,32 @@ function groundOrientItem(it, threeObject) {
     }
   }
 
+  // Group-By / yard: force lying + axis-aligned + ground (no soft pitch lean)
+  if (it && (it._yardStraighten || it.assemblyShipPose)
+      && typeof straightenYardItemOnGround === 'function') {
+    const ev = straightenYardItemOnGround(threeObject, it);
+    stages.push('yard_straighten');
+    const floorY = ev && ev.floor_y != null
+      ? ev.floor_y
+      : (typeof csNzMeshWorldBox === 'function'
+        ? (csNzMeshWorldBox(threeObject) || {}).min?.y
+        : null);
+    const info = {
+      ok: true,
+      method: 'yard_straighten',
+      stages,
+      ev,
+      floor_y: floorY,
+      ground_stable: !!(ev && (ev.ground_stable || Math.abs(ev.floor_y || 0) < 1e-3)),
+      mutates_geometry: false,
+    };
+    try {
+      if (threeObject.userData) threeObject.userData.rule1Ground = info;
+      if (it) it._rule1GroundResult = info;
+    } catch (_) { /* */ }
+    return info;
+  }
+
   // Welded assemblies → dedicated multi-face refine (same as yard BASE cargo)
   if (it && typeof cstabIsWeldedAssembly === 'function' && cstabIsWeldedAssembly(it)
       && typeof refineAssemblyGroundPose === 'function') {
