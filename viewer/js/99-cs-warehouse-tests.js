@@ -304,15 +304,16 @@
     assert(u[4].mark === 'nest-heavy', `short nest last=${u[4].mark}`);
   });
 
-  t('W.12k', 'Staging groups sort: PURE weight high→low', () => {
+  t('W.12k', 'Staging sort: assembly=piece kg, nest=bundle kg', () => {
     if (typeof sortStagingGroupsByWeight !== 'function') {
       assert(true, 'skip');
       return;
     }
+    // qty=1 cards — piece weight == group weight
     const g = [
       { mark: 'Z1', groupKind: 'nest_z', weightKg: 500, lengthMaxMm: 400 },
-      { mark: 'A1', groupKind: 'welded_assembly', weightKg: 300, lengthMaxMm: 8000, isAssembly: true, parts: [{}, {}] },
-      { mark: 'A2', groupKind: 'welded_assembly', weightKg: 800, lengthMaxMm: 9000, isAssembly: true, parts: [{}, {}] },
+      { mark: 'A1', groupKind: 'welded_assembly', weightKg: 300, qty: 1, lengthMaxMm: 8000, isAssembly: true, parts: [{}, {}] },
+      { mark: 'A2', groupKind: 'welded_assembly', weightKg: 800, qty: 1, lengthMaxMm: 9000, isAssembly: true, parts: [{}, {}] },
       { mark: 'B1', groupKind: 'bundle_beam', weightKg: 66, lengthMaxMm: 8400 },
     ];
     sortStagingGroupsByWeight(g);
@@ -320,6 +321,28 @@
     assert(g[1].mark === 'Z1', `second=${g[1].mark}`); // 500 > 300 asm
     assert(g[2].mark === 'A1', `third=${g[2].mark}`);
     assert(g[3].mark === 'B1', `last=${g[3].mark}`);
+
+    // Multi-qty: C-1 3×3000=9000 → sort 3000; R-1 5×2000=10000 → 2000; Z nest set 540
+    const g2 = [
+      {
+        mark: 'R1', groupKind: 'welded_assembly', weightKg: 10000, qty: 5,
+        isAssembly: true, parts: [{}, {}],
+        memberPieces: Array.from({ length: 5 }, () => ({ unitWeightKg: 2000, qty: 1 })),
+      },
+      {
+        mark: 'C1', groupKind: 'welded_assembly', weightKg: 9000, qty: 3,
+        isAssembly: true, parts: [{}, {}],
+        memberPieces: Array.from({ length: 3 }, () => ({ unitWeightKg: 3000, qty: 1 })),
+      },
+      {
+        mark: 'Z50', groupKind: 'nest_z', weightKg: 2250, qty: 50,
+        packUnits: [{ total_weight: 540, weightKg: 540, qty: 12 }],
+      },
+    ];
+    sortStagingGroupsByWeight(g2);
+    assert(g2[0].mark === 'C1', `g2 first=${g2[0].mark} (3000/pc)`);
+    assert(g2[1].mark === 'R1', `g2 second=${g2[1].mark} (2000/pc)`);
+    assert(g2[2].mark === 'Z50', `g2 third=${g2[2].mark} (540 bundle)`);
   });
 
   t('W.12i', 'Pack smoke: long beam seats on empty floor before nest fills', () => {
@@ -652,22 +675,30 @@
     assert(placed.length >= 2, `placed=${placed.length} (want ≥2 of 3)`);
   });
 
-  t('W.17', 'Pack numbers: selected groups → #1 heaviest (not click order)', () => {
+  t('W.17', 'Pack numbers: #1 = heaviest pack unit (assy piece / nest bundle)', () => {
     if (typeof renumberCheckOrderByWeight !== 'function'
-        || typeof groupSortWeightKg !== 'function') {
+        || typeof groupPackSortWeightKg !== 'function') {
       assert(true, 'skip');
       return;
     }
     const fake = [
       { id: 'A', checked: true, checkOrder: 1, weightKg: 100, groupKind: 'loose_small' },
-      { id: 'B', checked: true, checkOrder: 2, weightKg: 5000, groupKind: 'welded_assembly', isAssembly: true },
+      {
+        id: 'B', checked: true, checkOrder: 2, weightKg: 10000, qty: 5,
+        groupKind: 'welded_assembly', isAssembly: true, parts: [{}, {}],
+        memberPieces: Array.from({ length: 5 }, () => ({ unitWeightKg: 2000, qty: 1 })),
+      },
       { id: 'C', checked: true, checkOrder: 3, weightKg: 800, groupKind: 'bundle_beam' },
-      { id: 'D', checked: false, checkOrder: 99, weightKg: 9000, groupKind: 'welded_assembly' },
+      {
+        id: 'D', checked: false, checkOrder: 99, weightKg: 9000, qty: 3,
+        groupKind: 'welded_assembly', isAssembly: true, parts: [{}, {}],
+      },
     ];
     renumberCheckOrderByWeight(fake);
-    assert(fake.find(x => x.id === 'B').checkOrder === 1, 'B heaviest → #1');
-    assert(fake.find(x => x.id === 'C').checkOrder === 2, 'C → #2');
-    assert(fake.find(x => x.id === 'A').checkOrder === 3, 'A lightest → #3');
+    // B pack key = 2000/pc; C bundle = 800; A = 100 → B #1, C #2, A #3
+    assert(fake.find(x => x.id === 'B').checkOrder === 1, 'B 2000/pc → #1');
+    assert(fake.find(x => x.id === 'C').checkOrder === 2, 'C 800 → #2');
+    assert(fake.find(x => x.id === 'A').checkOrder === 3, 'A 100 → #3');
     assert(fake.find(x => x.id === 'D').checkOrder === 0, 'unchecked → 0');
   });
 

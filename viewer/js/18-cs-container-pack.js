@@ -672,6 +672,19 @@ function cs8UnitWeightKg(u) {
     +u.unitWeightKg || 0, 0
   );
 }
+/**
+ * Weight of the UNIT the worker places:
+ *   Assembly → single piece (qty÷ guard if old multi-qty unit arrives)
+ *   Nest/bundle → full pack-unit weight (already one nest set)
+ */
+function cs8PackSortWeightKg(u) {
+  const total = cs8UnitWeightKg(u);
+  if (cs8IsAssemblyUnit(u)) {
+    const qty = Math.max(1, Number(u.qty) || 1);
+    return total / qty;
+  }
+  return total;
+}
 function cs8UnitLengthMm(u) {
   return Math.max(
     +u.l || 0, +u.lengthMm || 0, +u.lengthMaxMm || 0, +u.lengthMax || 0, 0
@@ -680,9 +693,9 @@ function cs8UnitLengthMm(u) {
 
 /**
  * Optimise insert order (try → if no fit skip → next):
- *   1) ALL assemblies heaviest → lightest (base layer — Rule #1)
- *   2) Beams / long lanes: length first (claim floor), then weight
- *   3) Short loose: weight → length
+ *   1) ALL assemblies heaviest PIECE → lightest (base layer — Rule #1)
+ *   2) Beams / long lanes: length first (claim floor), then bundle weight
+ *   3) Short loose nests: bundle weight → length
  * Click Order ignored.
  */
 function cs8SortHeavyAnchor(units, LmaxHint) {
@@ -692,7 +705,7 @@ function cs8SortHeavyAnchor(units, LmaxHint) {
     const bAsm = cs8IsAssemblyUnit(b) ? 0 : 1;
     if (aAsm !== bAsm) return aAsm - bAsm;
     if (aAsm === 0) {
-      const dw = cs8UnitWeightKg(b) - cs8UnitWeightKg(a);
+      const dw = cs8PackSortWeightKg(b) - cs8PackSortWeightKg(a);
       if (Math.abs(dw) > 1e-3) return dw;
       return cs8UnitLengthMm(b) - cs8UnitLengthMm(a);
     }
@@ -700,7 +713,7 @@ function cs8SortHeavyAnchor(units, LmaxHint) {
     const tb = cs8AnchorTier(b, Lref);
     if (ta !== tb) return ta - tb;
     const dL = cs8UnitLengthMm(b) - cs8UnitLengthMm(a);
-    const dw = cs8UnitWeightKg(b) - cs8UnitWeightKg(a);
+    const dw = cs8PackSortWeightKg(b) - cs8PackSortWeightKg(a);
     if (ta === 1) {
       if (Math.abs(dL) > 100) return dL;
       if (Math.abs(dw) > 1e-3) return dw;

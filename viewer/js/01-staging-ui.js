@@ -52,8 +52,16 @@ function getFilteredGroups() {
   return assemblyGroups.filter(g => groupSearchText(g).includes(stagingFilter));
 }
 
-/** Best available kg for a staging group (card + members + pack units). */
-function groupSortWeightKg(g) {
+/** True welded / multi-part assembly (not Z/C nest bundles). */
+function groupIsWeldedAssembly(g) {
+  return !!(g && (
+    g.groupKind === 'welded_assembly'
+    || !!(g.isAssembly && g.parts && g.parts.length >= 2)
+  ));
+}
+
+/** Best available GROUP TOTAL kg (all pcs / all pack units summed). */
+function groupTotalWeightKg(g) {
   if (!g) return 0;
   let kg = Math.max(0, Number(g.weightKg) || 0);
   const mem = g.memberItems || g.memberPieces || [];
@@ -68,30 +76,91 @@ function groupSortWeightKg(g) {
       s + Math.max(0, Number(pu.total_weight) || Number(pu.weightKg) || 0), 0);
     if (puSum > kg) kg = puSum;
   }
-  g.sortWeightKg = kg;
   return kg;
 }
 
 /**
- * Group / staging list: PURE weight high → low (no assembly-first).
- * Ties: welded assemblies first, then longer.
+ * Pack-order sort key (how cargo enters the container):
+ *   Welded assembly → SINGLE PIECE kg (worker lifts one rafter)
+ *   Z/C/L nest & other bundles → ONE pack-unit / bundle kg (not whole group)
+ */
+function groupPackSortWeightKg(g) {
+  if (!g) return 0;
+  const total = groupTotalWeightKg(g);
+
+  if (groupIsWeldedAssembly(g)) {
+    const mem = g.memberItems || g.memberPieces || [];
+    let maxU = 0;
+    mem.forEach(p => {
+      const u = Math.max(0, Number(p.unitWeightKg) || 0);
+      if (u > maxU) maxU = u;
+    });
+    if (maxU > 0) {
+      g.packSortWeightKg = maxU;
+      g.sortWeightKg = maxU;
+      return maxU;
+    }
+    const pus = g.packUnits || [];
+    if (pus.length) {
+      let maxPu = 0;
+      pus.forEach(pu => {
+        const w = Math.max(0, Number(pu.total_weight) || Number(pu.weightKg) || 0);
+        if (w > maxPu) maxPu = w;
+      });
+      if (maxPu > 0) {
+        g.packSortWeightKg = maxPu;
+        g.sortWeightKg = maxPu;
+        return maxPu;
+      }
+    }
+    const qty = Math.max(1, Number(g.qty) || mem.length || 1);
+    const single = total / qty;
+    g.packSortWeightKg = single;
+    g.sortWeightKg = single;
+    return single;
+  }
+
+  // Cold-formed / beams / rods: one bundle unit weight
+  const pus = g.packUnits || [];
+  if (pus.length) {
+    let maxPu = 0;
+    pus.forEach(pu => {
+      const w = Math.max(0, Number(pu.total_weight) || Number(pu.weightKg) || 0);
+      if (w > maxPu) maxPu = w;
+    });
+    if (maxPu > 0) {
+      g.packSortWeightKg = maxPu;
+      g.sortWeightKg = maxPu;
+      return maxPu;
+    }
+  }
+  g.packSortWeightKg = total;
+  g.sortWeightKg = total;
+  return total;
+}
+
+/** Alias → pack sort key (assemblies=piece, bundles=unit). */
+function groupSortWeightKg(g) {
+  return groupPackSortWeightKg(g);
+}
+
+/**
+ * Staging list: pack-unit weight high → low.
+ * Assemblies by piece kg; Z/C bundles by nest-set kg.
  */
 function sortStagingGroupsByWeight(groups) {
   const list = groups || [];
-  const isAsm = (g) =>
-    g.groupKind === 'welded_assembly'
-    || !!(g.isAssembly && g.parts && g.parts.length >= 2);
   list.sort((a, b) => {
-    const dw = groupSortWeightKg(b) - groupSortWeightKg(a);
+    const dw = groupPackSortWeightKg(b) - groupPackSortWeightKg(a);
     if (Math.abs(dw) > 1e-6) return dw;
-    const aA = isAsm(a) ? 0 : 1;
-    const bA = isAsm(b) ? 0 : 1;
+    const aA = groupIsWeldedAssembly(a) ? 0 : 1;
+    const bA = groupIsWeldedAssembly(b) ? 0 : 1;
     if (aA !== bA) return aA - bA;
     return (b.lengthMaxMm || 0) - (a.lengthMaxMm || 0);
   });
   list.forEach((g, i) => {
     g.id = g.id || `G${i + 1}`;
-    g.weightRank = i + 1; // 1 = heaviest
+    g.weightRank = i + 1; // 1 = heaviest pack unit
   });
   return list;
 }
@@ -100,10 +169,9 @@ function sortStagingGroupsByWeight(groups) {
 function heaviestAssemblyGroups(groups, n) {
   const lim = n != null ? n : 3;
   return (groups || [])
-    .filter(g => g.groupKind === 'welded_assembly'
-      || !!(g.isAssembly && g.parts && g.parts.length >= 2))
+    .filter(g => groupIsWeldedAssembly(g))
     .slice()
-    .sort((a, b) => (b.weightKg || 0) - (a.weightKg || 0))
+    .sort((a, b) => groupPackSortWeightKg(b) - groupPackSortWeightKg(a))
     .slice(0, lim);
 }
 
@@ -125,10 +193,10 @@ function renumberCheckOrderByWeight(groups) {
   const list = groups || assemblyGroups;
   const checked = list.filter(g => g.checked && g.state !== 'oversized');
   checked.sort((a, b) => {
-    const dw = groupSortWeightKg(b) - groupSortWeightKg(a);
+    const dw = groupPackSortWeightKg(b) - groupPackSortWeightKg(a);
     if (Math.abs(dw) > 1e-6) return dw;
-    const aA = (a.groupKind === 'welded_assembly' || a.isAssembly) ? 0 : 1;
-    const bA = (b.groupKind === 'welded_assembly' || b.isAssembly) ? 0 : 1;
+    const aA = groupIsWeldedAssembly(a) ? 0 : 1;
+    const bA = groupIsWeldedAssembly(b) ? 0 : 1;
     if (aA !== bA) return aA - bA;
     return (b.lengthMaxMm || 0) - (a.lengthMaxMm || 0);
   });
