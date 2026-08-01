@@ -556,9 +556,13 @@ function itemPoseFitsInContainer(it, cont) {
   // Face-roll / sole upright / welded assemblies: packer AABB is the contract —
   // IFC mesh may still carry residual roof-pitch that makeShape cannot undo here.
   const assemblyPack = !!(it.isAssembly || it.groupKind === 'welded_assembly'
+    || it.groupKind === 'assembly_single'
     || (it.parts && it.parts.length > 1)
-    || /RAFTER|COLUMN|PORTAL|FRAME/i.test(String(it.assemblyName || it.mark || '')));
-  if (it.packComposeRot || assemblyPack
+    || /RAFTER|COLUMN|PORTAL|FRAME|RF\d|CL\d/i.test(
+      String(it.assemblyName || it.mark || '') + ' '
+      + ((it.marks || []).join(' '))));
+  // Foreman / Step8 locked poses: trust packer footprint (mesh may be pitched)
+  if (it.packPoseLock || it.packComposeRot || assemblyPack
       || (it.packOrientTag && /Rx|Rz|yaw/i.test(String(it.packOrientTag)))) {
     const fp = packFootprintFitsInContainer(it, cont);
     if (fp != null) return fp;

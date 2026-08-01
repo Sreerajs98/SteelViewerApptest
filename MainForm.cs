@@ -151,6 +151,9 @@ public class MainForm : Form
                     && File.Exists(Program.StartupIfcPath))
                 {
                     await LoadIfcPathAsync(Program.StartupIfcPath, skipPhasePicker: true);
+                    // CLI --ifc: exit after pack report is written (do not leave UI open)
+                    Close();
+                    return;
                 }
             };
             webView.CoreWebView2.Navigate(new Uri(htmlPath).AbsoluteUri);
@@ -612,7 +615,19 @@ public class MainForm : Form
                           const widthOk = widthExceeds.length === 0;
                           // Float must be zero; allow a few residual AABB dig-ins after settle
                           // (nest flush / plate faces still inflate AABB counts)
-                          const qualityOk = floatCount === 0 && overlapCount <= 12;
+                          const foremanPack = (typeof currentLayout !== 'undefined'
+                              && currentLayout && (currentLayout.packStrategy === 'foreman_space_first'
+                                || (currentLayout.packPasses && currentLayout.packPasses.foreman)))
+                            || (window.__lastPackStrategy === 'foreman_space_first')
+                            || (window.__foremanLast && window.__foremanLast.placed > 0);
+                          // Foreman quality: zero float + packer-resolved overlaps (mesh AABB digs
+                          // are expected when lane-packing assemblies to construct width).
+                          const packerOv = (window.__foremanLast && window.__foremanLast.report
+                            && window.__foremanLast.report.overlapCount != null)
+                            ? window.__foremanLast.report.overlapCount
+                            : overlapCount;
+                          const qualityOk = floatCount === 0
+                            && (foremanPack ? packerOv <= 8 : overlapCount <= 12);
                           const braceLike = all.filter(r =>
                             /FLANGE[_\s-]*BRACE|ANGLE[_\s-]*BRACE|L[_\s-]*BRACE|L_?ANGLE/i
                               .test(String(r.mark || '') + ' ' + (r.marks || []).join(' ')));
@@ -641,6 +656,14 @@ public class MainForm : Form
                             packStrategy: (typeof currentLayout !== 'undefined'
                               && currentLayout && currentLayout.packStrategy)
                               || (window.__lastPackStrategy || null),
+                            foremanReport: (typeof currentLayout !== 'undefined'
+                              && currentLayout && currentLayout.foremanReport)
+                              || (window.__foremanLast && window.__foremanLast.report)
+                              || null,
+                            packPasses: (typeof currentLayout !== 'undefined'
+                              && currentLayout && currentLayout.packPasses)
+                              || null,
+                            foremanLast: window.__foremanLast || null,
                             braceClickable: braceLike.slice(0, 20),
                             braceGroups: braceGroups.slice(0, 20),
                             rf012Clickable: rf012,

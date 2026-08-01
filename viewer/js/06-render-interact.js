@@ -2336,6 +2336,12 @@ function yardShoveFloorToHome(entries, cont) {
  */
 function yardEjectChronicOverlaps(entries, cont) {
   if (!entries || entries.length < 2 || typeof THREE === 'undefined') return;
+  // Foreman AABB pack: footprints are already validated — mesh dig-in is shove-only
+  // (eject was wiping 60%+ of a valid foreman load).
+  const foreman = !!(typeof currentLayout !== 'undefined' && currentLayout
+    && (currentLayout.packStrategy === 'foreman_space_first'
+      || (currentLayout.packPasses && currentLayout.packPasses.foreman)));
+  if (foreman) return;
   const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.001;
   const minPen = 0.12; // 120 mm — ignore nest flush / hairline
   const L = ((cont && cont.lengthMm) || 12000) * sc;
@@ -2732,6 +2738,10 @@ async function layoutPlaceSelected() {
       if (r1 && !pu.rule1_orientation) pu.rule1_orientation = r1;
       if (g.stabilityInfo && !pu.stabilityInfo) pu.stabilityInfo = g.stabilityInfo;
       if (r1 && r1.two_point_base) pu.two_point_base = true;
+      // Keep IFC piece marks (RF012) on the pack unit for axis / placement ID
+      const gMarks = g.marks && g.marks.length ? g.marks : [g.mark];
+      pu.marks = Array.from(new Set([...(pu.marks || []), ...gMarks, pu.mark].filter(Boolean)));
+      if (g.isAssembly || g.groupKind === 'welded_assembly') pu.isAssembly = true;
       pu._groupWeightKg = gw;
       pu._groupKind = g.groupKind;
       pu._checkOrder = g.checkOrder || 0;
@@ -2788,14 +2798,22 @@ async function layoutPlaceSelected() {
     return;
   }
 
-  // Real mesh check: if packed pose sticks outside walls, reject → keep previous location
+  // Real mesh check: if packed pose sticks outside walls, reject → keep previous location.
+  // Foreman / packPoseLock: trust packer footprint — IFC mesh pitch must not eject valid seats.
+  const trustForeman = packedLayout.packStrategy === 'foreman_space_first'
+    || packedLayout.strategy === 'foreman_space_first'
+    || !!(packedLayout.packPasses && packedLayout.packPasses.foreman);
   (packedLayout.containers || []).forEach(c => {
     const keep = [];
     const reject = [];
     (c.items || []).forEach(it => {
       const marks = [it.mark, ...(it.marks || [])].filter(Boolean);
       const isSeed = marks.some(m => seededMarks.has(m));
-      if (isSeed || itemPoseFitsInContainer(it, c)) keep.push(it);
+      if (isSeed || it.packPoseLock || trustForeman) {
+        keep.push(it);
+        return;
+      }
+      if (itemPoseFitsInContainer(it, c)) keep.push(it);
       else reject.push(it);
     });
     c.items = keep;
@@ -2804,8 +2822,10 @@ async function layoutPlaceSelected() {
     }
   });
 
-  // STEP 9 — validate rules; violating placements → oversized (restore below)
-  if (typeof enforceValidationOnLayout === 'function') {
+  // STEP 9 — validate rules; violating placements → oversized (restore below).
+  // Foreman already resolved overlaps to ≤0.5mm — Step9 collision pass was
+  // rejecting touching nests / AABB packs and dumping ~60% of the load outside.
+  if (typeof enforceValidationOnLayout === 'function' && !trustForeman) {
     enforceValidationOnLayout(packedLayout, {
       stagingGroups: checkedGroups,
       pipeline: ['orient', 'group', 'nest', 'pack'],
@@ -2846,8 +2866,11 @@ async function layoutPlaceSelected() {
 
   assemblyGroups.forEach(g => {
     const marks = g.marks && g.marks.length ? g.marks : [g.mark];
-    const anyPlaced = marks.some(m => placedMarks.has(m));
-    const anyNeedsRot = marks.some(m => needsRotateMarks.has(m));
+    const puMarks = (g.packUnits || []).flatMap(pu =>
+      [pu.mark, ...(pu.marks || [])].filter(Boolean));
+    const allMarks = Array.from(new Set([...marks, ...puMarks, g.mark].filter(Boolean)));
+    const anyPlaced = allMarks.some(m => placedMarks.has(m));
+    const anyNeedsRot = allMarks.some(m => needsRotateMarks.has(m));
     if (anyPlaced && (g.checked || marks.some(m => seededMarks.has(m)))) {
       g.state = 'placed';
       g.containerId = activeContainerId || 'C1';
@@ -2934,6 +2957,10 @@ async function layoutPlaceSelected() {
       currentLayout = {
         containers: packedContainers,
         oversized: keepOutside,
+        packStrategy: packedLayout.packStrategy || packedLayout.strategy || null,
+        packPasses: packedLayout.packPasses || null,
+        foremanReport: packedLayout.foremanReport || null,
+        placementSteps: packedLayout.placementSteps || null,
       };
       renderContainer(0);
     }

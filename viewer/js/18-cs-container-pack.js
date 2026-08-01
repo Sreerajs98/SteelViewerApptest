@@ -462,6 +462,16 @@ var _layoutOptimizedLegacy = (typeof layoutOptimized === 'function'
  */
 function layoutContainerPackStep8(items, spec, rotMap, opts) {
   const o = opts || {};
+  // Foreman space-first brain (default) — exact warehouse loading sequence
+  if (o.forceLegacyPacker !== true && o.foremanPack !== false
+      && typeof layoutContainerPackForeman === 'function') {
+    try {
+      const fm = layoutContainerPackForeman(items, spec, rotMap, o);
+      if (fm && fm.containers) return fm;
+    } catch (e) {
+      try { console.warn('[Foreman] fallback to legacy Step8', e); } catch (_) { /* */ }
+    }
+  }
   const maxContainers = o.maxContainers != null ? o.maxContainers : 1;
   const seedItems = o.seedItems || [];
   const markOrder = o.markOrder instanceof Map ? o.markOrder : null;
@@ -880,22 +890,16 @@ function layoutOptimized(items, spec, rotMap, opts) {
   }
   const nHint = (base.packUnits && base.packUnits.length)
     || (items && items.length) || 0;
-  // Large jobs: length_lanes first (won A1321); optional heavy if time allows.
-  // Very large (>120 units): single strategy — bestOf doubles wall-clock.
-  const strategies = nHint > 120
-    ? [
-        { name: 'length_lanes', sortMode: 'length', pass2: true },
-      ]
-    : (nHint > 50
+  // Foreman first; optional legacy strategies as challengers on small jobs
+  const strategies = [
+    { name: 'foreman_space_first', foreman: true },
+    ...(nHint <= 50
       ? [
-          { name: 'length_lanes', sortMode: 'length', pass2: true },
-          { name: 'heavy_floor', sortMode: 'heavy', pass2: true },
+          { name: 'heavy_floor', sortMode: 'heavy', pass2: true, foreman: false },
+          { name: 'length_lanes', sortMode: 'length', pass2: true, foreman: false },
         ]
-      : [
-          { name: 'heavy_floor', sortMode: 'heavy', pass2: true },
-          { name: 'length_lanes', sortMode: 'length', pass2: true },
-          { name: 'volume_dense', sortMode: 'volume', pass2: true },
-        ]);
+      : []),
+  ];
   let best = null;
   let bestScore = -1e18;
   let bestName = strategies[0].name;
@@ -906,6 +910,8 @@ function layoutOptimized(items, spec, rotMap, opts) {
         ...base,
         pass2: st.pass2 !== false,
         sortMode: st.sortMode,
+        foremanPack: st.foreman !== false,
+        forceLegacyPacker: st.foreman === false,
         _bestOfChild: true,
         _strategyName: st.name,
       });
@@ -915,7 +921,6 @@ function layoutOptimized(items, spec, rotMap, opts) {
         best = res;
         bestName = st.name;
       }
-      // Perfect load — stop early
       if ((res.oversized || []).length === 0
           && ((res.containers || [])[0]?.items || []).length > 0)
         break;
@@ -949,10 +954,14 @@ function cs8NormalizeAssemblyShipAxes(l, w, h, pu) {
   const H0 = Math.max(+h || 0, 0);
   if (!(L0 > 0 && W0 > 0 && H0 > 0)) return null;
   const blob = `${(pu && pu.assemblyName) || ''} ${(pu && pu.mark) || ''}`
-    + ` ${(pu && pu.groupKind) || ''} ${(pu && pu.category) || ''}`;
+    + ` ${(pu && pu.groupKind) || ''} ${(pu && pu.category) || ''}`
+    + ` ${((pu && pu.marks) || []).join(' ')}`;
   const structural = !!(pu && (pu.isAssembly || pu.groupKind === 'welded_assembly'
-    || pu.groupKind === 'bundle_beam'))
-    || /RAFTER|COLUMN|PORTAL|FRAME|BEAM/i.test(blob);
+    || pu.groupKind === 'bundle_beam' || pu.groupKind === 'assembly_single'))
+    || /RAFTER|COLUMN|PORTAL|FRAME|BEAM|RF\d|CL\d/i.test(blob)
+    // IFC axis-swap heuristic: longest edge on W/H, short on L
+    || (Math.max(L0, W0, H0) >= 4000 && Math.min(L0, W0, H0) < 800
+      && Math.max(W0, H0) > Math.max(L0, 1) * 2);
   if (!structural) return null;
   const dims = [L0, W0, H0].slice().sort((a, b) => b - a);
   const longest = dims[0];
@@ -1076,7 +1085,10 @@ function cs8UnitFromPackUnit(pu) {
   let memberL = Math.max(
     pu.lengthMaxMm || pu.lengthMm || bb.l || pu.l || 1, 1);
   const isAsm = !!(pu.isAssembly || pu.groupKind === 'welded_assembly'
-    || (pu.parts && pu.parts.length >= 2));
+    || pu.groupKind === 'assembly_single'
+    || (pu.parts && pu.parts.length >= 2)
+    || /RF\d|CL\d|RAFTER|COLUMN|PORTAL/i.test(String(pu.mark || '') + ' '
+      + ((pu.marks || []).join(' '))));
   let constructH = isAsm
     ? Math.max(pu.heightMm || bb.h || pu.sectH || pu.unitHeight || 1, 1)
     : Math.max(pu.sectH || pu.unitHeight || pu.heightMm || bb.h || 1, 1);
@@ -1204,6 +1216,10 @@ function cs8UnitFromPackUnit(pu) {
     stagingGroupId: pu.stagingGroupId,
     packUnitIndex: pu.packUnitIndex,
     mutates_geometry: false,
+    // Staging order / group hints (foreman sort)
+    _checkOrder: pu._checkOrder || 0,
+    _groupWeightKg: pu._groupWeightKg || 0,
+    _groupKind: pu._groupKind || pu.groupKind || null,
   };
 }
 

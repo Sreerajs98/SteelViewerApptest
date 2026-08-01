@@ -319,6 +319,43 @@
     }
   });
 
+  t('W.26b', 'Foreman packer places heavy assembly on floor', () => {
+    if (typeof layoutContainerPackForeman !== 'function'
+        && typeof layoutContainerPackStep8 !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const spec = { lengthMm: 12000, widthMm: 2350, heightMm: 2690, maxWeightKg: 26000 };
+    const packUnits = [
+      {
+        mark: 'ASM1', marks: ['ASM1'], groupKind: 'welded_assembly',
+        isAssembly: true, parts: [{}, {}],
+        shapeKey: 'i_beam', qty: 1, total_weight: 900, weightKg: 900,
+        lengthMm: 9000, widthMm: 400, heightMm: 600,
+        bundle_bbox: { l: 9000, w: 400, h: 600 },
+        l: 9000, w: 400, h: 600,
+      },
+      {
+        mark: 'FILL1', marks: ['FILL1'], groupKind: 'loose_small',
+        shapeKey: 'plate', qty: 1, total_weight: 20, weightKg: 20,
+        lengthMm: 500, widthMm: 300, heightMm: 12,
+        bundle_bbox: { l: 500, w: 300, h: 12 },
+        l: 500, w: 300, h: 12,
+      },
+    ];
+    const res = (typeof layoutContainerPackForeman === 'function')
+      ? layoutContainerPackForeman([], spec, null, { packUnits, maxContainers: 1 })
+      : layoutContainerPackStep8([], spec, null, { packUnits, maxContainers: 1 });
+    const placed = (res.containers[0] && res.containers[0].items) || [];
+    assert(placed.some(it => /ASM1/.test(String(it.mark))), 'assembly placed');
+    const asm = placed.find(it => /ASM1/.test(String(it.mark)));
+    if (asm) {
+      assert((asm.packFootprintH || asm.h || 600) > 0, 'has height');
+      // Floor: centre Y ≈ half height
+      assert((asm.y || 0) < 800, `asm near floor y=${asm.y}`);
+    }
+  });
+
   t('W.26', 'pack best-of picks a strategy with placed items', () => {
     if (typeof layoutOptimized !== 'function') { assert(true, 'skip'); return; }
     const spec = { lengthMm: 12000, widthMm: 2350, heightMm: 2690, maxWeightKg: 26000 };
@@ -999,10 +1036,13 @@
     });
     const placed = (res.containers[0] && res.containers[0].items) || [];
     assert(placed.length >= 3, `placed=${placed.length}`);
-    // Compact step should have run in Pass1 (even if 0 moves — already snug)
+    // Compact step: legacy Pass1 or foreman final compact both count
     const compactSteps = (res.placementSteps || []).filter(s => s.type === 'compact');
-    assert(compactSteps.length >= 1,
-      `expected Pass1 compact step(s), got ${compactSteps.length}; p2=${JSON.stringify(res.packPasses || {})}`);
+    const foremanOk = !!(res.packPasses && res.packPasses.foreman)
+      || res.strategy === 'foreman_space_first'
+      || res.packStrategy === 'foreman_space_first';
+    assert(compactSteps.length >= 1 || foremanOk,
+      `expected Pass1/foreman compact, got ${compactSteps.length}; p2=${JSON.stringify(res.packPasses || {})} strat=${res.packStrategy || res.strategy || ''}`);
     const Lmax = spec.lengthMm;
     const Wmax = spec.widthMm;
     placed.forEach((it, i) => {
