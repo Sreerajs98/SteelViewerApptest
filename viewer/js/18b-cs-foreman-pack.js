@@ -294,7 +294,25 @@ function layoutForemanPack(unitsIn, spec, opts) {
       weightKg: fmWeight(u),
       constraintTier: fmTier(u, Lmax),
       _yaw: (u.userRot && u.userRot.y) || 0,
-      _rot: u.userRot || { x: 0, y: 0, z: 0 },
+      _rot: (() => {
+        const sk = String(u.shapeKey || '').toLowerCase();
+        const gk = String(u.groupKind || '').toLowerCase();
+        const isNest = gk.startsWith('nest_')
+          || sk === 'z_channel' || sk === 'c_channel' || sk === 'l_angle';
+        if (isNest) {
+          // Use stability system's computed ground pose (staging rest-pose)
+          const ar = (u.stabilityInfo && u.stabilityInfo.applied_rotation)
+            || (u.rule1_orientation && u.rule1_orientation.rot)
+            || (u.orientation_info && u.orientation_info.applied_rotation);
+          if (ar && (Math.abs(ar.x || 0) > 1e-9
+              || Math.abs(ar.y || 0) > 1e-9
+              || Math.abs(ar.z || 0) > 1e-9)) {
+            return { x: ar.x || 0, y: ar.y || 0, z: ar.z || 0 };
+          }
+          return { x: 0, y: 0, z: 0 };
+        }
+        return u.userRot || { x: 0, y: 0, z: 0 };
+      })(),
     };
   });
   state.remainingItems = fmSortTier(units, Lmax);
@@ -401,16 +419,17 @@ function layoutForemanPack(unitsIn, spec, opts) {
     if (x + pl > rect.x + rect.length + FM_EPS) return null;
     if (z + pw > rect.z + rect.width + FM_EPS) return null;
 
-    const probe = {
-      minX: x, maxX: x + pl,
-      minZ: z, maxZ: z + pw,
-      minY: rect.y, maxY: rect.y + ph,
-    };
-    if (collideAny(probe, null, FM_EPS)) return null;
-
-    const ev = supportFracAt(x, z, pl, pw, rect.y);
-    let y0 = Math.max(rect.y, ev.supportY);
-    if (floorOnly && y0 > FM_EPS) return null;
+    // Floor: sit at Y=0 (collision gates occupied seats).
+    // Stack: sit ON this surface only — never jump to taller neighbor heightmap
+    // cells (100mm bleed was floating cargo mid-air beside tall assemblies).
+    let y0;
+    if (floorOnly || rect.y <= FM_EPS) {
+      y0 = 0;
+    } else {
+      y0 = rect.y;
+      // No roof-layer stacks (beside tall asms, not on top of them)
+      if (y0 > Hceil * 0.45) return null;
+    }
 
     const box = {
       minX: x, maxX: x + pl,
@@ -428,6 +447,8 @@ function layoutForemanPack(unitsIn, spec, opts) {
       if (bear.frac + 1e-9 < need) return null;
     }
     if (y0 > FM_EPS && (1 - bear.frac) > FM_OVERHANG + 1e-9) return null;
+    // Stack seat must actually rest on this surface (not empty air)
+    if (y0 > FM_EPS && Math.abs(bear.supportY - y0) > FM_CELL) return null;
 
     return {
       x, z, y0, pl, pw, ph,
@@ -501,7 +522,9 @@ function layoutForemanPack(unitsIn, spec, opts) {
     if (newOff < curOff) score += 500;
     const usage = (pose.pl * pose.pw) / Math.max(rect.length * rect.width, 1);
     score += usage * 300;
-    score -= rect.y * 0.1;
+    // Floor first (foreman): elevated seats only when floor is genuinely full
+    score -= rect.y * 2.0;
+    if (rect.y > FM_EPS) score -= 2500;
     // Prefer rear (low packer X)
     score += (1 - pose.x / Math.max(Lmax, 1)) * 100;
     // Prefer home wall
@@ -578,47 +601,43 @@ function layoutForemanPack(unitsIn, spec, opts) {
     const finalZ = pose.z;
     const pl = pose.pl;
     const pw = pose.pw;
+    const meta = {
+      y: usedRect.y,
+      heightAvailable: usedRect.heightAvailable,
+      supportedBy: usedRect.supportedBy,
+      supportCapacityKg: usedRect.supportCapacityKg,
+    };
 
-    // Right of item (+Z)
+    // Guillotine: keep FULL-LENGTH lanes BESIDE the item (±Z), then
+    // split the item's Z-band along X (front/behind). Missing −Z was
+    // discarding home-side floor when an asm wasn't flush to z=0.
+    const leftW = finalZ - usedRect.z - gapN;
+    if (leftW > FM_MIN_RECT) {
+      newRects.push({
+        x: usedRect.x, z: usedRect.z,
+        length: usedRect.length, width: leftW, ...meta,
+      });
+    }
     const rightW = (usedRect.z + usedRect.width) - (finalZ + pw + gapN);
     if (rightW > FM_MIN_RECT) {
       newRects.push({
-        x: usedRect.x,
-        z: finalZ + pw + gapN,
-        length: usedRect.length,
-        width: rightW,
-        y: usedRect.y,
-        heightAvailable: usedRect.heightAvailable,
-        supportedBy: usedRect.supportedBy,
-        supportCapacityKg: usedRect.supportCapacityKg,
+        x: usedRect.x, z: finalZ + pw + gapN,
+        length: usedRect.length, width: rightW, ...meta,
       });
     }
-    // Toward door (+X) behind item in packer (higher X)
+    // Item Z-band only: toward door (+X) and toward rear (−X)
     const behindL = (usedRect.x + usedRect.length) - (finalX + pl + gapN);
     if (behindL > FM_MIN_RECT) {
       newRects.push({
-        x: finalX + pl + gapN,
-        z: finalZ,
-        length: behindL,
-        width: pw,
-        y: usedRect.y,
-        heightAvailable: usedRect.heightAvailable,
-        supportedBy: usedRect.supportedBy,
-        supportCapacityKg: usedRect.supportCapacityKg,
+        x: finalX + pl + gapN, z: finalZ,
+        length: behindL, width: pw, ...meta,
       });
     }
-    // Toward rear (lower X) in front of item
     const frontL = finalX - usedRect.x - gapN;
     if (frontL > FM_MIN_RECT) {
       newRects.push({
-        x: usedRect.x,
-        z: finalZ,
-        length: frontL,
-        width: pw,
-        y: usedRect.y,
-        heightAvailable: usedRect.heightAvailable,
-        supportedBy: usedRect.supportedBy,
-        supportCapacityKg: usedRect.supportCapacityKg,
+        x: usedRect.x, z: finalZ,
+        length: frontL, width: pw, ...meta,
       });
     }
 
@@ -677,19 +696,13 @@ function layoutForemanPack(unitsIn, spec, opts) {
 
     const topY = finalY + ph;
     const heightAvailable = Hceil - topY;
-    if (heightAvailable > 50) {
+    // Stack surfaces stay in supportSurfaces only — NOT freeRects.
+    // Mixing them into freeRects made Phase 3 prefer "above" over "beside".
+    // Tall assemblies (rafter/column) fill most of the box — stacking ON them
+    // parks cargo at the roof (looks mid-air). Only short cargo may carry a stack.
+    const tallCarrier = ph > Hceil * 0.45 || topY > Hceil * 0.55;
+    if (heightAvailable > 120 && !tallCarrier) {
       state.supportSurfaces.push({
-        x: finalX,
-        z: finalZ,
-        length: pl,
-        width: pw,
-        y: topY,
-        heightAvailable,
-        supportedBy: item.mark,
-        supportCapacityKg: Math.max(wt * 0.5, 50),
-      });
-      // Also expose as stacking free rect
-      state.freeRects.push({
         x: finalX,
         z: finalZ,
         length: pl,
@@ -715,6 +728,20 @@ function layoutForemanPack(unitsIn, spec, opts) {
       pass: finalY <= FM_EPS ? 1 : 2,
       tag: winner.tag,
     });
+    try {
+      if (item.constraintTier <= 1 || pl >= Lmax * 0.7) {
+        const floorR = state.freeRects.filter(r => r.y <= FM_EPS).slice(0, 6);
+        console.info(
+          `[FM-RECT] ${item.mark} @ x=${Math.round(finalX)} z=${Math.round(finalZ)}`
+          + ` pl=${Math.round(pl)} pw=${Math.round(pw)} y=${Math.round(finalY)}`
+          + ` freeFloor=${floorR.length}`
+          + ` rects=${JSON.stringify(floorR.map(r => ({
+            x: Math.round(r.x), z: Math.round(r.z),
+            l: Math.round(r.length), w: Math.round(r.width),
+          })))}`
+        );
+      }
+    } catch (_) { /* */ }
     return true;
   }
 
@@ -768,29 +795,54 @@ function layoutForemanPack(unitsIn, spec, opts) {
     return moved;
   }
 
+  /** Footprint overlap fraction of `p` covered by `o` in XZ. */
+  function footprintOverlapFrac(p, o) {
+    const ox0 = Math.max(p.x, o.x);
+    const ox1 = Math.min(p.x + p.pl, o.x + o.pl);
+    const oz0 = Math.max(p.z, o.z);
+    const oz1 = Math.min(p.z + p.pw, o.z + o.pw);
+    const ov = Math.max(0, ox1 - ox0) * Math.max(0, oz1 - oz0);
+    return ov / Math.max(p.pl * p.pw, 1);
+  }
+
+  /**
+   * Gravity: DROP only onto real support (or floor).
+   * Never RAISE an item onto a grazing XZ neighbor — that created mid-air
+   * towers (maxBottomY >> Hceil) when floor footprints slightly overlapped.
+   */
   function gravitySettleAll() {
-    state.placedItems.forEach(p => {
-      const ev = supportFracAt(p.x, p.z, p.pl, p.pw, 0);
-      let y0 = ev.supportY;
-      // Don't sink through own previous top — exclude self from hm by using placed tops
+    const order = state.placedItems.slice().sort((a, b) => a.y - b.y || b.weightKg - a.weightKg);
+    order.forEach(p => {
       let maxUnder = 0;
       state.placedItems.forEach(o => {
         if (o === p) return;
-        const xOv = !(p.x + p.pl <= o.x || p.x >= o.x + o.pl);
-        const zOv = !(p.z + p.pw <= o.z || p.z >= o.z + o.pw);
-        if (xOv && zOv) maxUnder = Math.max(maxUnder, o.y + o.ph);
+        // Support must be below this item's current bottom (or flush)
+        if (o.y + o.ph > p.y + FM_CELL) return;
+        // Need real bearing — grazing edges must not become "stack seats"
+        if (footprintOverlapFrac(p, o) < FM_STACK_BEAR) return;
+        maxUnder = Math.max(maxUnder, o.y + o.ph);
       });
-      y0 = maxUnder;
-      if (Math.abs(y0 - p.y) > FM_EPS) {
-        p.y = y0;
-        p.box.minY = y0;
-        p.box.maxY = y0 + p.ph;
+      // DROP only
+      if (maxUnder < p.y - FM_EPS) {
+        p.y = maxUnder;
+        p.box.minY = maxUnder;
+        p.box.maxY = maxUnder + p.ph;
+      }
+      // Hard clamp: never leave cargo above container roof
+      if (p.y + p.ph > Hceil + FM_EPS) {
+        p.y = Math.max(0, Hceil - p.ph);
+        p.box.minY = p.y;
+        p.box.maxY = p.y + p.ph;
       }
     });
     state.heightmap.fill(0);
     state.placedItems.forEach(p => hmStamp(p.box));
   }
 
+  /**
+   * Resolve dig-ins with lateral push only (X/Z).
+   * Y-lift was stacking floor items into 10m+ towers.
+   */
   function resolveOverlaps() {
     for (let pass = 0; pass < 20; pass++) {
       let hit = false;
@@ -802,39 +854,30 @@ function layoutForemanPack(unitsIn, spec, opts) {
           const tol = nest ? FM_NEST_TOL : FM_EPS;
           if (!(pen.x > tol && pen.y > tol && pen.z > tol)) continue;
           hit = true;
-          // Push on min axis; prefer move higher / lighter
-          let axis = 'y';
-          let depth = pen.y;
-          if (pen.x < depth) { axis = 'x'; depth = pen.x; }
+          // Prefer smaller lateral axis — never invent vertical stacks here
+          let axis = 'x';
+          let depth = pen.x;
           if (pen.z < depth) { axis = 'z'; depth = pen.z; }
           const wA = A.weightKg, wB = B.weightKg;
-          const moveA = wA <= wB;
+          const moveA = (A.tier === 0 && B.tier !== 0) ? false
+            : (B.tier === 0 && A.tier !== 0) ? true
+            : (wA <= wB);
           const M = moveA ? A : B;
           const other = moveA ? B : A;
-          if (axis === 'y') {
-            if (M.box.minY >= other.box.minY) {
-              M.y += depth;
-            } else {
-              other.y += depth;
-              other.box.minY = other.y;
-              other.box.maxY = other.y + other.ph;
-            }
-          } else if (axis === 'x') {
+          if (axis === 'x') {
             const dir = (M.x + M.pl / 2) >= (other.x + other.pl / 2) ? 1 : -1;
             M.x += dir * depth;
           } else {
             const dir = (M.z + M.pw / 2) >= (other.z + other.pw / 2) ? 1 : -1;
             M.z += dir * depth;
           }
+          // Clamp inside container footprint (Y untouched)
+          if (M.x < gL) M.x = gL;
+          if (M.x + M.pl > Lmax - gL) M.x = Lmax - gL - M.pl;
+          if (M.z < gW) M.z = gW;
+          if (M.z + M.pw > Wmax - gW) M.z = Wmax - gW - M.pw;
           M.box.minX = M.x; M.box.maxX = M.x + M.pl;
           M.box.minY = M.y; M.box.maxY = M.y + M.ph;
-          M.box.minZ = M.z; M.box.maxZ = M.z + M.pw;
-          // Clamp inside
-          if (M.box.minX < gL) { M.x = gL; }
-          if (M.box.maxX > Lmax - gL) { M.x = Lmax - gL - M.pl; }
-          if (M.box.minZ < gW) { M.z = gW; }
-          if (M.box.maxZ > Wmax - gW) { M.z = Wmax - gW - M.pw; }
-          M.box.minX = M.x; M.box.maxX = M.x + M.pl;
           M.box.minZ = M.z; M.box.maxZ = M.z + M.pw;
         }
       }
@@ -915,10 +958,29 @@ function layoutForemanPack(unitsIn, spec, opts) {
     }
   }
 
-  // ── PHASE 2: Stacking ──────────────────────────────────────────────────
+  function stackRectsFromSurfaces() {
+    return state.supportSurfaces
+      .filter(s => s.heightAvailable > 50)
+      .map(s => ({
+        x: s.x, z: s.z, length: s.length, width: s.width,
+        y: s.y, heightAvailable: s.heightAvailable,
+        supportedBy: s.supportedBy,
+        supportCapacityKg: s.supportCapacityKg,
+      }));
+  }
+
+  // ── PHASE 2: Stacking (only after floor layer is done) ─────────────────
   guard = 0;
   while (guard++ < maxPlace) {
-    const stackRects = state.freeRects.filter(r => r.y > FM_EPS && r.heightAvailable > 50);
+    // Still fill floor first if any item still fits on floor
+    const floorWin = pickBest(ensureFloorRect(), true, false);
+    if (floorWin) {
+      if (!commit(floorWin)) {
+        state.remainingItems = state.remainingItems.filter(i => i !== floorWin.item);
+      }
+      continue;
+    }
+    const stackRects = stackRectsFromSurfaces();
     if (!stackRects.length) break;
     const win = pickBest(stackRects, false, false);
     if (!win) break;
@@ -929,21 +991,23 @@ function layoutForemanPack(unitsIn, spec, opts) {
     if (state.placedItems.length % 4 === 0) compactAll();
   }
 
-  // ── PHASE 3: Filler + leftover pass (rotations for tier 3; floor+stack) ─
-  // Keep original tier order; allow filler rotations only
+  // ── PHASE 3: Filler — FLOOR FIRST, stack only if no floor seat ─────────
   guard = 0;
   while (guard++ < maxPlace) {
     if (!state.remainingItems.length) break;
-    const stackRects = state.freeRects.filter(r => r.y > FM_EPS && r.heightAvailable > 50);
     const floorRects = ensureFloorRect();
-    const winStack = stackRects.length ? pickBest(stackRects, false, true) : null;
     const winFloor = pickBest(floorRects, true, true);
-    const best = (!winStack) ? winFloor
-      : (!winFloor) ? winStack
-        : (winStack.score >= winFloor.score ? winStack : winFloor);
-    if (!best) break;
-    if (!commit(best)) {
-      state.remainingItems = state.remainingItems.filter(i => i !== best.item);
+    if (winFloor) {
+      if (!commit(winFloor)) {
+        state.remainingItems = state.remainingItems.filter(i => i !== winFloor.item);
+      }
+      continue;
+    }
+    const stackRects = stackRectsFromSurfaces();
+    const winStack = stackRects.length ? pickBest(stackRects, false, true) : null;
+    if (!winStack) break;
+    if (!commit(winStack)) {
+      state.remainingItems = state.remainingItems.filter(i => i !== winStack.item);
       continue;
     }
   }
@@ -1003,10 +1067,11 @@ function layoutForemanPack(unitsIn, spec, opts) {
         || u.groupKind === 'assembly_single'),
       userRot: {
         x: (u._rot && u._rot.x) || 0,
-        y: p.yaw || 0,
+        y: (p.yaw || 0) + ((u._rot && u._rot.y) || 0),
         z: (u._rot && u._rot.z) || 0,
       },
-      packYawOnly: true,
+      packYawOnly: !(fmIsNest(u) && u._rot
+        && (Math.abs(u._rot.x || 0) > 1e-9 || Math.abs(u._rot.z || 0) > 1e-9)),
       packComposeRot: false,
       packPoseLock: true,
       packOrientTag: p.tag || 'yaw0',
@@ -1036,6 +1101,20 @@ function layoutForemanPack(unitsIn, spec, opts) {
   const isRf012 = (it) => /RF012/i.test(String(it && it.mark || ''))
     || ((it && it.marks) || []).some(m => /RF012/i.test(String(m)));
   const rfU = units.find(isRf012) || null;
+  let floorN = 0, stackN = 0, airN = 0;
+  state.placedItems.forEach(p => {
+    if (p.y <= FM_EPS) { floorN++; return; }
+    let onSupport = false;
+    state.placedItems.forEach(o => {
+      if (o === p) return;
+      const xOv = !(p.x + p.pl <= o.x || p.x >= o.x + o.pl);
+      const zOv = !(p.z + p.pw <= o.z || p.z >= o.z + o.pw);
+      if (xOv && zOv && Math.abs((o.y + o.ph) - p.y) <= 1) onSupport = true;
+    });
+    if (onSupport) stackN++;
+    else airN++;
+  });
+
   const report = {
     itemsPlaced: state.placedItems.length,
     itemsUnplaced: oversized.length,
@@ -1045,6 +1124,12 @@ function layoutForemanPack(unitsIn, spec, opts) {
     cogZ: state.cogZ,
     overlapCount: countRealOverlaps(),
     packStrategy: 'foreman_space_first',
+    floorCount: floorN,
+    stackCount: stackN,
+    airGapCount: airN,
+    maxBottomY: state.placedItems.reduce((m, p) => Math.max(m, p.y), 0),
+    longPlaced: state.placedItems.filter(p => p.pl >= Lmax * 0.7).length,
+    floorFreeRects: state.freeRects.filter(r => r.y <= FM_EPS).length,
     rf012In: rfU ? {
       mark: rfU.mark,
       marks: rfU.marks,
@@ -1053,6 +1138,12 @@ function layoutForemanPack(unitsIn, spec, opts) {
       sb: rfU.stableBundleMm || null,
     } : null,
   };
+  try {
+    console.info(
+      `[FM-Y] floor=${floorN} stack=${stackN} airGap=${airN}`
+      + ` maxBottomY=${Math.round(report.maxBottomY)}`
+    );
+  } catch (_) { /* */ }
 
   try {
     console.info(

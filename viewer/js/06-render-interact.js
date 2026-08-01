@@ -2579,10 +2579,19 @@ function applyPackItemRotation(mesh, it) {
       it._lockedQuaternion = mesh.quaternion.clone();
   }
 
-  // Nest / brace: footprint-align cancels IFC pitch (trials include packer userRot yaw)
+  // Nest / brace: apply stability ground rot, then footprint-align (cancels IFC pitch)
   if (packItemNeedsFlatAlign(it)
       && it.packFootprintL > 0 && it.packFootprintW > 0 && it.packFootprintH > 0
       && typeof alignMeshToPackFootprint === 'function') {
+    const ur0 = it.userRot || {};
+    if (Math.abs(ur0.x || 0) > 1e-9 || Math.abs(ur0.z || 0) > 1e-9) {
+      mesh.rotation.set(
+        ur0.x || 0,
+        (mesh.rotation.y || 0) + (ur0.y || 0),
+        ur0.z || 0
+      );
+      mesh.updateMatrixWorld(true);
+    }
     alignMeshToPackFootprint(mesh, it);
     lockOrient();
     return;
@@ -2613,7 +2622,19 @@ function applyPackItemRotation(mesh, it) {
       mesh.rotation.z += ur.z || 0;
     }
   } else if (it.packYawOnly !== false) {
-    mesh.rotation.y += (ur.y || 0);
+    // Nest Z/C/L: apply full stability rotation (X/Z), not yaw-only
+    const isNest = typeof packItemNeedsFlatAlign === 'function'
+      ? packItemNeedsFlatAlign(it)
+      : false;
+    if (isNest && (Math.abs(ur.x || 0) > 1e-9 || Math.abs(ur.z || 0) > 1e-9)) {
+      mesh.rotation.set(
+        ur.x || 0,
+        (mesh.rotation.y || 0) + (ur.y || 0),
+        ur.z || 0
+      );
+    } else {
+      mesh.rotation.y += (ur.y || 0);
+    }
   } else {
     mesh.rotation.set(ur.x || 0, ur.y || 0, ur.z || 0);
   }
