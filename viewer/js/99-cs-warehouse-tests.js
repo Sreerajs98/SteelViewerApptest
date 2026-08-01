@@ -570,6 +570,55 @@
     }
   });
 
+  t('W.18c', 'tipPen: upright I-beam soft; Z upright hard; flat beam wins when fit', () => {
+    if (typeof cs8StableBaseOrients !== 'function'
+        || typeof cs8OrientTipPenalty !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const Lmax = 12192, Wmax = 2438, Hpack = 2541, Houter = 2591;
+    const opts = { Houter, floorClearMm: 0 };
+
+    // Test 1 — rafter: only upright fits → positive score, Rx90 best
+    const rafter = {
+      mark: 'RF', l: 11608, w: 2508, h: 200, weight: 711,
+      shapeKey: 'i_beam', category: 'beam', groupKind: 'bundle_beam',
+    };
+    const rO = cs8StableBaseOrients(rafter, Lmax, Wmax, Hpack, opts);
+    assert(rO.length >= 1, 'rafter has orient');
+    assert(rO[0].h >= 2400 && rO[0].w <= 350, `rafter best upright got ${rO[0].tag}`);
+    // Score without soleFit boost should still be positive (tipPen soft)
+    const rBase = (rO[0].baseArea || 0) - (rO[0].h || 0) * 40 - (rO[0].tipPen || 0);
+    assert(rBase > 0, `rafter tipPen soft → baseScore=${rBase} (want >0)`);
+    assert((rO[0].tipPen || 0) < 1e6, `rafter tipPen=${rO[0].tipPen} (want tiny)`);
+
+    // Test 2 — normal beam: flat has wider base → yaw0/180 beats upright
+    const beam = {
+      mark: 'B1', l: 9000, w: 400, h: 200, weight: 800,
+      shapeKey: 'i_beam', category: 'beam', groupKind: 'bundle_beam',
+    };
+    const bO = cs8StableBaseOrients(beam, Lmax, Wmax, Hpack, opts);
+    assert(bO.length >= 2, 'beam multi-orient');
+    assert(/yaw0|yaw180/i.test(bO[0].tag), `beam best=${bO[0].tag} (want flat)`);
+    const uprightB = bO.find(o => o.h >= 350 && o.w <= 250);
+    if (uprightB) {
+      assert((bO[0].stabilityScore || 0) > (uprightB.stabilityScore || 0),
+        'flat score > upright fallback');
+    }
+
+    // Test 3 — Z-purlin upright: NOT structural → heavy tipPen
+    const zUp = { l: 6000, w: 75, h: 200 }; // would-be upright face dims
+    const zPen = cs8OrientTipPenalty(zUp, {
+      shapeKey: 'z_channel', groupKind: 'nest_z',
+    }, false);
+    assert(zPen > 1e8, `Z tipPen=${zPen} (want 1e9-scale)`);
+    const beamUp = { l: 11608, w: 200, h: 2508 };
+    const bPen = cs8OrientTipPenalty(beamUp, {
+      shapeKey: 'i_beam', category: 'beam', groupKind: 'bundle_beam',
+    }, false);
+    assert(bPen < 1e5, `I-beam upright tipPen=${bPen} (want tipRatio×100)`);
+  });
+
   t('W.18b', 'Constraint sort: long light beam before heavy short nest', () => {
     if (typeof cs8SortHeavyAnchor !== 'function'
         || typeof cs8ConstraintTier !== 'function') {

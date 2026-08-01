@@ -1018,30 +1018,41 @@ function cs8YawOrientsFloorAnchor(u, Lmax, Wmax, Hmax) {
 }
 
 /**
- * Tip score for a candidate face — MUST NOT bury the only envelope-fit pose.
- * Upright I-beam / assembly on flange is normal shipping (high tipRatio OK).
+ * Tip penalty for a candidate face.
+ *
+ * BUG (fixed): tipPen = 1e9×(tipRatio-2) buried upright I-beams
+ *   (e.g. rafter 11608×200×2508 → score ≈ −10e9) even though
+ *   standing on flanges is normal shipping practice.
+ *
+ * Soft penalty (tipRatio×100) when:
+ *   1) isStructuralUpright — tall (h > baseW×3), baseW > 100, beam/assy
+ *   2) isOnlyFit — sole envelope-fit pose (caller passes onlyFit=true)
+ * Else keep a real tip penalty for skinny non-structural uprights (Z etc.).
  */
-function cs8OrientTipPenalty(f, u) {
-  const tipRatio = f.h / Math.max(Math.min(f.l, f.w), 1);
+function cs8OrientTipPenalty(f, u, onlyFit) {
+  const baseW = Math.min(f.l, f.w);
+  const tipRatio = f.h / Math.max(baseW, 1);
+  if (onlyFit) return tipRatio * 100;
+
   const sk = String((u && (u.shapeKey || u.profileShape)) || '').toLowerCase();
   const cat = String((u && u.category) || '').toLowerCase();
-  const blob = `${(u && u.assemblyName) || ''} ${(u && u.mark) || ''} ${(u && u.groupKind) || ''}`;
-  const structuralUpright = !!(
+  const gk = String((u && u.groupKind) || '').toLowerCase();
+  const blob = `${(u && u.assemblyName) || ''} ${(u && u.mark) || ''} ${gk}`;
+  const isBeamFamily = !!(
     cs8IsAssemblyUnit(u)
     || sk === 'i_beam' || sk === 'built_up' || cat === 'beam'
+    || gk === 'bundle_beam' || gk === 'welded_assembly'
     || /RAFTER|COLUMN|PORTAL|FRAME|BUILT[\s-]?UP/i.test(blob)
   );
-  // Narrow-long base + tall = flange-standing member (shipping-normal)
-  const flangeStand = tipRatio > 2.0
-    && Math.min(f.l, f.w) <= Math.max(f.l, f.w) * 0.08
-    && f.h >= 800;
-  if (structuralUpright || flangeStand) {
-    // Mild rank only — never 1e9-scale bury
-    return tipRatio * 50 + f.h * 0.02;
-  }
-  if (tipRatio > 3.0) return 2e4 * (tipRatio - 3);
-  if (tipRatio > 2.0) return 5e3 * (tipRatio - 2);
-  return tipRatio * 200;
+  // tall + flange-width base + structural family = I-beam on flanges
+  const isStructuralUpright = isBeamFamily
+    && baseW > 100
+    && f.h > baseW * 3;
+  if (isStructuralUpright) return tipRatio * 100;
+
+  // Non-structural skinny upright (e.g. Z on edge) — keep strong penalty
+  if (tipRatio > 2.0) return 1e9 * (tipRatio - 2);
+  return tipRatio * 1e4;
 }
 
 /**
@@ -1076,21 +1087,30 @@ function cs8StableBaseOrients(u, Lmax, Wmax, Hmax, opts) {
     { l: C, w: B, h: A, rot: { x: 0, y: Math.PI / 2, z: Math.PI / 2 }, tag: 'Rz90_yaw90', yawOnly: false },
     { l: B, w: C, h: A, rot: { x: 0, y: 0, z: -Math.PI / 2 }, tag: 'Rz270', yawOnly: false },
   ];
-  const list = [];
+  // First pass: which faces FIT (needed so onlyFit can soft-penalize the last option)
+  const fitted = [];
   const seen = new Set();
   faces.forEach(f => {
     if (f.l > Lmax + CS8_EPS || f.w > Wmax + CS8_EPS) return;
     if (f.h > Habs + CS8_EPS) return;
-    const reducedTop = f.h > Hprefer + CS8_EPS;
-    // Keep yaw0+yaw180 (same box, door face); collapse duplicate face-roll dims
     const key = f.yawOnly
       ? `${Math.round(f.l)}|${Math.round(f.w)}|${Math.round(f.h)}|${f.tag}`
       : `${Math.round(f.l)}|${Math.round(f.w)}|${Math.round(f.h)}`;
     if (seen.has(key)) return;
     seen.add(key);
+    fitted.push(f);
+  });
+  // Unique footprints (yaw0/180 share dims) for only-fit detection
+  const uniqFoot = new Set(fitted.map(f =>
+    `${Math.round(f.l)}|${Math.round(f.w)}|${Math.round(f.h)}`));
+  const onlyFit = uniqFoot.size === 1;
+
+  const list = [];
+  fitted.forEach(f => {
+    const reducedTop = f.h > Hprefer + CS8_EPS;
     const baseArea = f.l * f.w;
     const tipRatio = f.h / Math.max(Math.min(f.l, f.w), 1);
-    const tipPen = cs8OrientTipPenalty(f, u);
+    const tipPen = cs8OrientTipPenalty(f, u, onlyFit);
     const topPen = reducedTop ? 5e3 : 0;
     list.push({
       l: f.l, w: f.w, h: f.h,
@@ -1103,18 +1123,20 @@ function cs8StableBaseOrients(u, Lmax, Wmax, Hmax, opts) {
       baseArea,
       tipRatio,
       reducedTopClearance: reducedTop,
-      soleFit: false,
+      soleFit: onlyFit,
+      tipPen,
       stabilityScore: baseArea - f.h * 40 - tipPen - topPen,
     });
   });
 
-  // Sole envelope-fit pose = ALWAYS first (constraint-first). tipPen cannot bury it.
-  if (list.length === 1) {
-    list[0].soleFit = true;
-    list[0].shipPreferred = true;
-    list[0].stabilityScore += 1e12;
+  // Sole envelope-fit pose = ALWAYS first (constraint-first)
+  if (onlyFit && list.length) {
+    list.forEach(o => {
+      o.soleFit = true;
+      o.shipPreferred = true;
+      o.stabilityScore += 1e12;
+    });
   } else if (list.length > 1) {
-    // Among fits: prefer longitudinal length along container X (lane claimers)
     list.forEach(o => {
       if (o.l >= Lmax * 0.70 && o.w <= Wmax + CS8_EPS && o.h <= Habs + CS8_EPS)
         o.stabilityScore += o.l * 0.5;
