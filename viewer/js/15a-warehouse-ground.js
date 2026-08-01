@@ -280,8 +280,15 @@ function groundOrientItem(it, threeObject) {
     }
   }
 
-  // Group-By / yard: force lying + axis-aligned + ground (no soft pitch lean)
-  if (it && (it._yardStraighten || it.assemblyShipPose)
+  // Group-By / yard: force lying + axis-aligned + ground (no soft pitch lean).
+  // Z-purlins keep legacy nest / Rule1 live-rotate — PCA straighten destroys nest roll.
+  const skipYardStraightenZ = !!(it && (
+    String(it.shapeKey || it.profileShape || '').toLowerCase() === 'z_channel'
+    || String(it.groupKind || '').toLowerCase() === 'nest_z'
+    || (typeof csNzIsZShape === 'function' && csNzIsZShape(it))
+    || (typeof needsZStyleGroundFix === 'function' && needsZStyleGroundFix(it))
+  ));
+  if (it && (it._yardStraighten || it.assemblyShipPose) && !skipYardStraightenZ
       && typeof straightenYardItemOnGround === 'function') {
     const ev = straightenYardItemOnGround(threeObject, it);
     stages.push('yard_straighten');

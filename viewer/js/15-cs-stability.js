@@ -554,6 +554,15 @@ function searchBaseLayerGroundPose(it, Lmax, Wmax, Hmax) {
 function straightenYardItemOnGround(mesh, it) {
   if (!mesh || typeof THREE === 'undefined') return null;
 
+  // Defense: Z-purlins keep legacy nest / Rule1 — PCA destroys nesting_angle.
+  const skZ = String((it && (it.shapeKey || it.profileShape)) || '').toLowerCase();
+  const gkZ = String((it && it.groupKind) || '').toLowerCase();
+  if (skZ === 'z_channel' || skZ === 'z_shape' || gkZ === 'nest_z'
+      || (typeof csNzIsZShape === 'function' && csNzIsZShape(it))
+      || (typeof needsZStyleGroundFix === 'function' && needsZStyleGroundFix(it))) {
+    return null;
+  }
+
   const keepX = mesh.position.x;
   const keepZ = mesh.position.z;
   const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.01;
@@ -569,7 +578,8 @@ function straightenYardItemOnGround(mesh, it) {
     : { ok: false };
   const qFlat = mesh.quaternion.clone();
 
-  // 2) Ortho face rolls ONLY — no ±5…30° soft pitch (that left "charinjj" lean)
+  // 2) Ortho face rolls + tiny tip-cancel (±1/2/5°) so ends touch ground
+  //    (not large soft pitch that looked "charinjj")
   const trials = [
     { tag: 'flat', qx: 0, qy: 0, qz: 0 },
     { tag: 'Rx90', qx: Math.PI / 2, qy: 0, qz: 0 },
@@ -584,6 +594,12 @@ function straightenYardItemOnGround(mesh, it) {
     { tag: 'Rx90_Ry180', qx: Math.PI / 2, qy: Math.PI, qz: 0 },
     { tag: 'Rx90_Ry270', qx: Math.PI / 2, qy: -Math.PI / 2, qz: 0 },
   ];
+  [1, 2, 5, -1, -2, -5].forEach(d => {
+    const r = d * Math.PI / 180;
+    trials.push({ tag: `tipRz${d}`, qx: 0, qy: 0, qz: r });
+    trials.push({ tag: `tipRx${d}`, qx: r, qy: 0, qz: 0 });
+    trials.push({ tag: `Rx90_tipRz${d}`, qx: Math.PI / 2, qy: 0, qz: r });
+  });
 
   function snapGround() {
     mesh.position.x = keepX;
@@ -599,6 +615,35 @@ function straightenYardItemOnGround(mesh, it) {
     mesh.position.x = keepX;
     mesh.position.z = keepZ;
     mesh.updateMatrixWorld(true);
+  }
+
+  /** See-saw / tip gap: after minY→0, do ends along X also touch? */
+  function bottomTipGap() {
+    mesh.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(mesh);
+    if (!isFinite(box.min.x)) return 1e9;
+    const x0 = box.min.x, x1 = box.max.x;
+    const span = Math.max(x1 - x0, 1e-9);
+    const bins = [Infinity, Infinity, Infinity, Infinity, Infinity];
+    const v = new THREE.Vector3();
+    let n = 0;
+    mesh.traverse(o => {
+      if (!o.isMesh || !o.geometry) return;
+      if (o.isLine || o.isLineSegments) return;
+      const pos = o.geometry.attributes && o.geometry.attributes.position;
+      if (!pos || pos.count < 3) return;
+      const step = Math.max(1, Math.floor(pos.count / 40));
+      for (let i = 0; i < pos.count && n < 900; i += step) {
+        v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
+        const t = (v.x - x0) / span;
+        const bi = Math.min(4, Math.max(0, Math.floor(t * 5)));
+        if (v.y < bins[bi]) bins[bi] = v.y;
+        n++;
+      }
+    });
+    const vals = bins.filter(y => isFinite(y));
+    if (vals.length < 3) return 0;
+    return Math.max(...vals) - Math.min(...vals);
   }
 
   function scorePose(ev) {
@@ -618,6 +663,7 @@ function straightenYardItemOnGround(mesh, it) {
       && !ev.standing_on_end
       && !ev.thin_edge_sit;
     const floorOk = Math.abs(ev.floor_y || 0) < 1e-3;
+    const tipGap = bottomTipGap(); // scene units — ends must touch too
     // Primary: MAX ground footprint (sx×sz) — widest face down
     let score = (ev.base_area || 0) * 25;
     if (!lying) score -= 5e8;
@@ -639,7 +685,18 @@ function straightenYardItemOnGround(mesh, it) {
     // Height/width aspect — hard punish wall-like sits (even if tabs inflate Z)
     const crossAspect = sy / Math.max(sz, 1e-9);
     if (crossAspect > 1.05) score -= 5e7 * (crossAspect - 1.05);
-    return { score, lying, floorOk };
+    // Real-world: no see-saw on haunch — punish end float after ground snap
+    score -= tipGap * 5e7;
+    if (tipGap > sy * 0.08) score -= 2e8;
+    // Ship Prep / 40ft: prefer footprints that fit container W×H (not max plan AABB)
+    const wMm = sz / sc;
+    const hMm = sy / sc;
+    if (wMm <= 2438 + 1 && hMm <= 2690 + 1) score += 5e8;
+    else {
+      if (wMm > 2438 + 1) score -= 4e8 * (wMm / 2438);
+      if (hMm > 2690 + 1) score -= 4e8 * (hMm / 2690);
+    }
+    return { score, lying, floorOk, tipGap };
   }
 
   let best = null;
@@ -665,10 +722,14 @@ function straightenYardItemOnGround(mesh, it) {
     if (!best || row.score > best.score) best = row;
   }
 
-  // Prefer lying; among lying prefer lowest height (true flat / max support)
+  // Prefer lying; among lying prefer 40ft-fitting, then flat (up_is_thinnest).
+  // If no lying pose fits the box, accept any length-on-X ground pose that fits
+  // (construct / mid-height seats — real yards do this when max-flat is too wide).
   {
     let bestLie = null;
     let bestFlat = null; // up_is_thinnest among lying
+    let bestFit = null; // lying AND W×H fits 40ft
+    let bestFitAny = null; // any trial that fits 40ft + length on X + ground
     for (const tr of trials) {
       mesh.quaternion.copy(qFlat);
       if (tr.qx || tr.qy || tr.qz) {
@@ -679,21 +740,49 @@ function straightenYardItemOnGround(mesh, it) {
       snapGround();
       const ev = evaluateMeshGroupStability(mesh);
       const scv = scorePose(ev);
-      if (!scv.lying) continue;
+      const sx = ev.size?.x || 1;
       const sy = ev.size?.y || 1;
+      const sz = ev.size?.z || 1;
+      const fits40 = (sz / sc) <= 2438 + 1 && (sy / sc) <= 2690 + 1
+        && (sx / sc) <= 12192 + 1;
+      const lengthOnX = sx >= Math.max(sy, sz) * 0.88;
       const row = {
-        score: scv.score, lying: true, floorOk: scv.floorOk,
+        score: scv.score, lying: !!scv.lying, floorOk: scv.floorOk,
         tag: tr.tag, ev, q: mesh.quaternion.clone(), py: mesh.position.y,
-        sy,
+        sy, tipGap: scv.tipGap, fits40,
       };
+      if (fits40 && lengthOnX && scv.floorOk && !ev.standing_on_end) {
+        if (!bestFitAny
+            || (scv.lying && !bestFitAny.lying)
+            || (scv.lying === bestFitAny.lying
+              && (row.tipGap < bestFitAny.tipGap - 1e-4
+                || (Math.abs(row.tipGap - bestFitAny.tipGap) < 1e-4
+                  && row.score > bestFitAny.score))))
+          bestFitAny = row;
+      }
+      if (!scv.lying) continue;
       if (!bestLie || row.score > bestLie.score) bestLie = row;
+      if (fits40) {
+        if (!bestFit
+            || row.tipGap < bestFit.tipGap - 1e-4
+            || (Math.abs(row.tipGap - bestFit.tipGap) < 1e-4 && row.score > bestFit.score))
+          bestFit = row;
+      }
       if (ev.up_is_thinnest) {
-        if (!bestFlat || sy < bestFlat.sy - 1e-9
-            || (Math.abs(sy - bestFlat.sy) < 1e-6 && row.score > bestFlat.score))
+        if (!bestFlat
+            || row.tipGap < bestFlat.tipGap - 1e-4
+            || (Math.abs(row.tipGap - bestFlat.tipGap) < 1e-4
+              && (sy < bestFlat.sy - 1e-9
+                || (Math.abs(sy - bestFlat.sy) < 1e-6 && row.score > bestFlat.score))))
           bestFlat = row;
       }
     }
-    if (bestFlat) best = bestFlat;
+    // Ship Prep: container-fit beats max-flat-too-wide
+    if (bestFit) best = bestFit;
+    else if (bestFitAny) best = bestFitAny;
+    else if (bestFlat && bestFlat.fits40) best = bestFlat;
+    else if (bestLie && bestLie.fits40) best = bestLie;
+    else if (bestFlat) best = bestFlat;
     else if (bestLie) best = bestLie;
   }
 
@@ -760,17 +849,64 @@ function straightenYardItemOnGround(mesh, it) {
     }
   }
 
+  // Tip-level: cancel residual see-saw so both ends touch the floor
+  {
+    snapGround();
+    let bestTg = bottomTipGap();
+    let bestQ = mesh.quaternion.clone();
+    let bestPy = mesh.position.y;
+    const tipDegs = [0.5, 1, 1.5, 2, 3, 4, 6, 8, 10, 12, 15];
+    const axes = [
+      new THREE.Vector3(1, 0, 0),
+      new THREE.Vector3(0, 0, 1),
+    ];
+    for (let pass = 0; pass < 2; pass++) {
+      let improved = false;
+      for (const axis of axes) {
+        for (const d of tipDegs) {
+          for (const sign of [1, -1]) {
+            mesh.quaternion.copy(bestQ);
+            mesh.quaternion.premultiply(
+              new THREE.Quaternion().setFromAxisAngle(axis, sign * d * Math.PI / 180));
+            mesh.rotation.setFromQuaternion(mesh.quaternion);
+            snapGround();
+            const evR = evaluateMeshGroupStability(mesh);
+            if (evR.standing_on_end || evR.thin_edge_sit) continue;
+            const sy = evR.size?.y || 1;
+            const sz = evR.size?.z || 1;
+            if (sy > sz * 1.12) continue; // keep face-down
+            const tg = bottomTipGap();
+            if (tg < bestTg - 1e-5) {
+              bestTg = tg;
+              bestQ = mesh.quaternion.clone();
+              bestPy = mesh.position.y;
+              improved = true;
+            }
+          }
+        }
+      }
+      if (!improved) break;
+    }
+    mesh.quaternion.copy(bestQ);
+    mesh.rotation.setFromQuaternion(bestQ);
+    mesh.position.set(keepX, bestPy, keepZ);
+    snapGround();
+    if (best) best.tag = `${best.tag}+tipLevel`;
+  }
+
   const finalEv = evaluateMeshGroupStability(mesh);
   finalEv.applied_rotation = { tag: best.tag };
   finalEv.pca_aligned = !!(alignInfo && alignInfo.ok);
   finalEv.yard_straighten = true;
   finalEv.ground_touch = Math.abs(finalEv.floor_y || 0) < 1e-3;
   finalEv.ground_stable = finalEv.ground_touch && !finalEv.standing_on_end;
+  finalEv.tip_gap = bottomTipGap();
   finalEv.warehouse = {
     ok: true,
     method: 'yard_straighten',
     rot: best.tag,
     tip_ratio: finalEv.tip_ratio,
+    tip_gap: finalEv.tip_gap,
     ground_stable: finalEv.ground_stable,
     mark: it?.mark || null,
   };
@@ -778,6 +914,12 @@ function straightenYardItemOnGround(mesh, it) {
   if (it) {
     it.warehouseGround = finalEv.warehouse;
     it._yardStraightened = true;
+    it._freezeGroupByPose = true;
+    // Freeze this exact Group By orientation for Optimise (yaw may still add)
+    try {
+      const q = mesh.quaternion;
+      it._groupByQuat = { x: q.x, y: q.y, z: q.z, w: q.w };
+    } catch (_) { /* */ }
     if (finalEv.size && sc > 0) {
       it.stableBundleMm = {
         l: finalEv.size.x / sc,
@@ -791,13 +933,16 @@ function straightenYardItemOnGround(mesh, it) {
     if (!mesh.userData) mesh.userData = {};
     mesh.userData._stabilityApplied = true;
     mesh.userData.yardStraighten = finalEv.warehouse;
+    if (it && it._groupByQuat) mesh.userData._groupByQuat = { ...it._groupByQuat };
   } catch (_) { /* */ }
 
   try {
+    const tg = bottomTipGap();
     console.info(
       `[yard-straight] ${it?.mark || '?'} pose=${best.tag}`
       + ` ground=${finalEv.ground_touch} lying=${!finalEv.standing_on_end}`
       + ` tip=${(finalEv.tip_ratio || 0).toFixed(2)}`
+      + ` tipGap=${tg.toFixed(4)}`
     );
   } catch (_) { /* */ }
   return finalEv;
@@ -912,9 +1057,13 @@ function applyStableRestPose(group, orientationInfo, itemOrOpts) {
   const qty = Math.max(1, Number(it?.qty) || 1);
   const nestKids = cstabCountPieceMeshes(group);
 
-  // Multi-piece nest stacks: do NOT tip the whole nest onto its side —
-  // EXCEPT Group-By yard straighten (must lie horizontal / no diagonal lean).
-  if (qty > 1 && nestKids > 1 && !(it && it._yardStraighten)) {
+  // Multi-piece nest stacks: do NOT tip the whole nest onto its side.
+  // Yard straighten may override for non-Z — Z nests must keep legacy locked
+  // pose (nesting_angle / interlock). PCA flatten destroyed the old Z look.
+  const isZNest = sk === 'z_channel' || sk === 'z_shape'
+    || String(it?.groupKind || '').toLowerCase() === 'nest_z'
+    || (typeof csNzIsZShape === 'function' && csNzIsZShape(it));
+  if (qty > 1 && nestKids > 1 && (isZNest || !(it && it._yardStraighten))) {
     const locked = cstabLockedRestPose(sk, it, nestKids, qty);
     if (locked) {
       group.rotation.set(locked.x, locked.y, locked.z);
@@ -1182,6 +1331,17 @@ function measureStableBundleMm(it) {
       w: Math.max((box.max.z - box.min.z) / SCALE, 1),
       source: 'measured_rest_pose',
     };
+    // Carry exact Group By orientation into Optimise (yaw-only after this)
+    try {
+      const gq = (mesh.userData && mesh.userData._groupByQuat) || null;
+      if (gq && gq.w != null) {
+        it._groupByQuat = { x: gq.x, y: gq.y, z: gq.z, w: gq.w };
+      } else if (mesh.quaternion) {
+        const q = mesh.quaternion;
+        it._groupByQuat = { x: q.x, y: q.y, z: q.z, w: q.w };
+      }
+      if (it._groupByQuat) it._freezeGroupByPose = true;
+    } catch (_) { /* */ }
     it.stableBundleMm = dims;
     return dims;
   } catch (_) {

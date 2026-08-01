@@ -629,11 +629,32 @@ function cspuMakePackUnit(pieces, stageGroup, idx, method) {
     pathDiamMm: stageGroup.pathDiamMm,
   };
 
-  // Assemblies: measure Group By yard rest-pose (face-down) for pack seat.
-  // Do NOT pitch_to_construct → thin upright (that destroyed Freeze Pose).
-  if (pu.isAssembly && typeof measureStableBundleMm === 'function') {
+  // Ship Prep: load-ready pose (assemblies + nests + plates). Source of truth for Optimise.
+  if (typeof csShipPrepPackUnit === 'function') {
     try {
-      let sb = measureStableBundleMm({
+      const prep = csShipPrepPackUnit(pu);
+      if (pu.stableBundleMm && pu.stableBundleMm.l > 0) {
+        pu.bundle_bbox = {
+          l: pu.stableBundleMm.l,
+          w: pu.stableBundleMm.w,
+          h: pu.stableBundleMm.h,
+          skidMm: pu.skidMm,
+          source: pu.stableBundleMm.source || 'ship_prep',
+        };
+      }
+      if (!(prep && prep.ok) && !pu._shipPrepped) {
+        pu.needs_ship_prep = true;
+        pu._shipPrepped = false;
+      } else {
+        pu.needs_ship_prep = false;
+      }
+    } catch (_) {
+      pu.needs_ship_prep = !pu._shipPrepped;
+    }
+  } else if (pu.isAssembly && typeof measureStableBundleMm === 'function') {
+    // Legacy fallback if ship-prep script missing
+    try {
+      const probe = {
         mark: pu.mark,
         marks: pu.marks,
         profileShape: pu.profileShape || pu.shapeKey,
@@ -650,11 +671,12 @@ function cspuMakePackUnit(pieces, stageGroup, idx, method) {
         orientation_info: orient,
         _yardStraighten: true,
         assemblyShipPose: true,
-      });
+      };
+      let sb = measureStableBundleMm(probe);
       if (sb && sb.l > 0) {
         const faceDown = sb.h <= sb.w * 1.08 + 1e-6;
         const fits40 = sb.w <= 2438 + 1 && sb.h <= 2690 + 1 && sb.l <= 12192 + 1;
-        // Fitting face-down yard seat → freeze. Else legacy sanitize for packability.
+        if (probe._groupByQuat) pu._groupByQuat = { ...probe._groupByQuat };
         if (faceDown && fits40) {
           sb.source = 'yard_straighten';
           pu._freezeGroupByPose = true;
@@ -675,6 +697,25 @@ function cspuMakePackUnit(pieces, stageGroup, idx, method) {
         };
       }
     } catch (_) { /* */ }
+  }
+
+  // Nest packs: stamp ship-prep ready without remorphing nest roll
+  const nestLike = family === 'nest_z' || family === 'nest_c' || family === 'nest_l'
+    || family === 'z_channel' || family === 'c_channel' || family === 'l_angle';
+  if (nestLike) {
+    pu._keepGroupByBundle = true;
+    pu._shipPrepped = true;
+    pu._freezeGroupByPose = true;
+    if (!pu.stableBundleMm && pu.bundle_bbox) {
+      pu.stableBundleMm = {
+        l: pu.bundle_bbox.l || pu.l,
+        w: pu.bundle_bbox.w || pu.w,
+        h: pu.bundle_bbox.h || pu.h,
+        source: 'ship_prep',
+      };
+    } else if (pu.stableBundleMm && !pu.stableBundleMm.source) {
+      pu.stableBundleMm.source = 'ship_prep';
+    }
   }
 
   return pu;

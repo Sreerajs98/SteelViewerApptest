@@ -196,6 +196,7 @@ function renderContainer(idx) {
     if (typeof packItemKeepGroupByPose === 'function' && packItemKeepGroupByPose(it)) {
       const isNest = !!(it.nestPieces && it.nestPieces.length)
         || /^nest_/i.test(String(it.groupKind || ''));
+      const hasGq = !!(it._groupByQuat && (it._groupByQuat.w != null));
       const sectH = Math.max(+it.sectH || +it.unitHeight || 0, 0);
       const sectW = Math.max(+it.sectW || +it.unitWidth || 0, 0);
       let memberL = Math.max(+it.lengthMm || +it.l || 0, 0);
@@ -215,25 +216,37 @@ function renderContainer(idx) {
         nestMethod: it.nestMethod || null,
         nestingOffsetMm: it.nestingOffsetMm || it.nesting_offset || null,
         orientation_info: it.orientation_info ? { ...it.orientation_info } : null,
-        // Nests: skip re-ground (bundle already correct). Assemblies: yard flatten.
+        // Nests: keep bundle. Frozen assemblies: skip re-PCA — apply _groupByQuat.
         _keepGroupByBundle: isNest,
-        _yardStraighten: !isNest && !!(it._freezeGroupByPose || it.packYawOnly || it._yardStraighten),
-        _freezeGroupByPose: !!it._freezeGroupByPose,
+        _skipStability: !isNest && hasGq,
+        _yardStraighten: !isNest && !hasGq
+          && !!(it._freezeGroupByPose || it.packYawOnly || it._yardStraighten),
+        _freezeGroupByPose: !!it._freezeGroupByPose || hasGq,
         packPoseLock: true,
         packYawOnly: true,
       };
     }
     const box = makeShape(shapeIt, color);
     box.position.set(it.x * SCALE, it.y * SCALE, it.z * SCALE);
+    // Exact Group By orientation first, then packer yaw only
+    if (typeof applyGroupByFrozenQuat === 'function')
+      applyGroupByFrozenQuat(box, it);
     applyPackItemRotation(box, shapeIt);
     snapMeshToPackerFootY(box, it);
+    // Real floor contact — prefer live mesh minY (fh can mismatch plates)
+    if (typeof isFloorCargoItem === 'function' ? isFloorCargoItem(it)
+        : (it.floorAnchor || it.y == null
+          || (it.packFootprintH > 0 && it.y <= it.packFootprintH * 0.55))) {
+      if (typeof nailMeshToGroundY === 'function') nailMeshToGroundY(box, 0);
+    }
     scene.add(box);
     const sid = it.stagingGroupId || findStagingIdForUnit(it);
     if (sid && !it.stagingGroupId) it.stagingGroupId = sid;
-    if (shapeIt._keepGroupByBundle) {
-      it._keepGroupByBundle = true;
+    if (shapeIt._keepGroupByBundle || shapeIt._freezeGroupByPose || it._groupByQuat) {
+      it._keepGroupByBundle = !!shapeIt._keepGroupByBundle;
       it._orientLocked = true;
-      if (shapeIt._lockedQuaternion) it._lockedQuaternion = shapeIt._lockedQuaternion;
+      if (typeof THREE !== 'undefined')
+        it._lockedQuaternion = box.quaternion.clone();
     }
     clickable.push({ mesh: box, item: it, stagingGroupId: sid || null });
     pieceCount += it.qty;
@@ -294,7 +307,10 @@ function renderContainer(idx) {
         _yardStraighten: yardView || !!it._yardStraighten,
         assemblyShipPose: !!it.assemblyShipPose || !!it.isAssembly,
       };
-      const color = COLORS[it.category] ?? COLORS.other; // real color, not red
+      // needs_ship_prep → red tint (honest yard QA); else category color
+      const color = (it.needs_ship_prep && !it._shipPrepped)
+        ? 0xcc2222
+        : (COLORS[it.category] ?? COLORS.other);
       const mesh = makeShape(itemForRender, color, 0.93);
 
       // Use pre-computed position if available (from layoutOutside/layoutPlaceSelected)
@@ -312,11 +328,19 @@ function renderContainer(idx) {
         );
       }
       applyPackItemRotation(mesh, it);
-      // Final yard pass: cancel any residual IFC pitch after pack rotation
-      if (yardView && typeof straightenYardItemOnGround === 'function'
-          && !it.exactPoseLock && !it.restoredFromOptimise) {
-        straightenYardItemOnGround(mesh, itemForRender);
+      // Ship Prep: load-ready pose (class router). Z keeps nest; assemblies tip+flat.
+      if (yardView && !it.exactPoseLock && !it.restoredFromOptimise
+          && typeof csShipPrepMesh === 'function') {
+        const prep = csShipPrepMesh(mesh, itemForRender);
         if (itemForRender.stableBundleMm) it.stableBundleMm = itemForRender.stableBundleMm;
+        if (itemForRender._groupByQuat) it._groupByQuat = itemForRender._groupByQuat;
+        if (itemForRender._shipPrepped) it._shipPrepped = true;
+        if (itemForRender._freezeGroupByPose) it._freezeGroupByPose = true;
+        it.needs_ship_prep = !(prep && prep.ok);
+        if (typeof stampGroupByQuatOnStaging === 'function')
+          stampGroupByQuatOnStaging(it, mesh);
+      } else if (typeof nailMeshToGroundY === 'function') {
+        nailMeshToGroundY(mesh, 0);
       }
       scene.add(mesh);
       clickable.push({ mesh, item: {
@@ -337,6 +361,9 @@ function renderContainer(idx) {
         packUnitIndex: it.packUnitIndex,
         isAssembly: !!it.isAssembly,
         parts: it.parts || null,
+        _groupByQuat: it._groupByQuat || itemForRender._groupByQuat || null,
+        _freezeGroupByPose: !!(it._freezeGroupByPose || itemForRender._freezeGroupByPose),
+        stableBundleMm: it.stableBundleMm || itemForRender.stableBundleMm || null,
         pathPointsMm: it.pathPointsMm || null,
         pathDiamMm: it.pathDiamMm || 0,
         outsideContainer: true,
@@ -1328,7 +1355,21 @@ function restackWithGravity(entries) {
   for (const it of infos) {
     it.e.mesh.updateMatrixWorld(true);
     it.box.setFromObject(it.e.mesh);
-    const h = it.box.max.y - it.box.min.y;
+    const item = it.e.item;
+    // Ship Prep floor assemblies: NEVER raise onto cradles / other cargo
+    const absFloor = !!(item && (item.floorAnchor || item.baseLayerLock
+      || (item._shipPrepped && item.isAssembly)
+      || (item.anchorTier != null && item.anchorTier <= 1
+        && (item._freezeGroupByPose || item._shipPrepped))));
+    if (absFloor) {
+      if (typeof nailMeshToGroundY === 'function') nailMeshToGroundY(it.e.mesh, 0);
+      else if (isFinite(it.box.min.y)) it.e.mesh.position.y -= it.box.min.y;
+      it.e.mesh.updateMatrixWorld(true);
+      it.box.setFromObject(it.e.mesh);
+      placed.push(it);
+      continue;
+    }
+
     const x0 = it.box.min.x, x1 = it.box.max.x;
     const z0 = it.box.min.z, z1 = it.box.max.z;
     const area = Math.max((x1 - x0) * (z1 - z0), 1e-8);
@@ -1366,14 +1407,17 @@ function restackWithGravity(entries) {
       support = floorY;
 
     const dy = support - it.box.min.y;
-    const lock = !!(it.e.item && (it.e.item.packPoseLock || it.e.item.floorAnchor
-      || it.e.item._orientLocked));
+    const lock = !!(item && (item.packPoseLock || item.floorAnchor
+      || item._orientLocked));
     // packPoseLock: DROP only. Raising onto fat IFC assembly AABBs parks
     // Z/C nests as a mid-air sheet (looks like no gravity; CLI still float=0
     // because mesh tip rests on the oversized assembly box).
     if (lock && dy > 1e-5) {
-      if (typeof snapMeshToPackerFootY === 'function')
-        snapMeshToPackerFootY(it.e.mesh, it.e.item);
+      if (item && typeof isFloorCargoItem === 'function' && isFloorCargoItem(item)
+          && typeof nailMeshToGroundY === 'function')
+        nailMeshToGroundY(it.e.mesh, 0);
+      else if (typeof snapMeshToPackerFootY === 'function')
+        snapMeshToPackerFootY(it.e.mesh, item);
     } else if (Math.abs(dy) > 1e-5) {
       it.e.mesh.position.y += dy;
     }
@@ -1946,12 +1990,13 @@ function layoutInspection() {
       : ((typeof csNzIsZShape === 'function' && csNzIsZShape(u))
         || /z_channel|z_shape/i.test(String(u.shapeKey || u.profileShape || '')));
 
-    // ALL yard pieces: length along +X, horizontal, ground-stable —
-    // never leave IFC pitch / diagonal lean in staging ("charinjj").
+    // Yard pieces: length along +X, horizontal, ground-stable.
+    // Z-purlins: keep legacy nest / Rule1 pose (no PCA yard straighten).
     const place = {
       ...u,
       x: xCursor + fp.footX / 2,
-      y: (isAsm || isZ) ? 0 : fp.footY / 2,
+      // Universal ground: all yard items start on floor (nail after orient)
+      y: 0,
       z: zStart + fp.footZ / 2,
       l: itemL, w: itemW, h: itemH,
       lengthMm: itemL, widthMm: itemW, heightMm: itemH,
@@ -1961,8 +2006,13 @@ function layoutInspection() {
       outsideContainer: true,
       stagingGroupId: stagingId,
       mutates_geometry: false,
-      // Group-By: straighten every item (rods, beams, assemblies) before Optimise
-      _yardStraighten: true,
+      // Group-By: straighten non-Z. Z keeps old nest / Rule1 live-rotate.
+      _yardStraighten: !isZ,
+      // Nest bundles only — single Z still runs Rule1 live-rotate
+      _keepGroupByBundle: !!(isZ && (
+        (u.nestPieces && u.nestPieces.length > 1)
+        || (u.qty || 1) > 1
+        || String(u.groupKind || '').toLowerCase() === 'nest_z')),
       userRot: { x: 0, y: 0, z: 0 },
       packYawOnly: true,
     };
@@ -2047,7 +2097,8 @@ function layoutOutside() {
         mark: u.mark || it.mark,
         marks: u.marks || [it.mark],
         x: xCursor + fp.footX / 2,
-        y: (isZ || isAsm) ? 0 : fp.footY / 2,
+        // Universal ground: plates/beams/nests start on floor too
+        y: 0,
         z: zStart + fp.footZ / 2,
         l: itemL, w: itemW, h: itemH,
         lengthMm: itemL, widthMm: itemW, heightMm: itemH,
@@ -2057,7 +2108,12 @@ function layoutOutside() {
         outsideContainer: true,
         stagingGroupId: stagingId,
         mutates_geometry: false,
-        _yardStraighten: true,
+        // Z-purlins: legacy nest / Rule1 only (no PCA yard straighten)
+        _yardStraighten: !isZ,
+        _keepGroupByBundle: !!(isZ && (
+          (u.nestPieces && u.nestPieces.length > 1)
+          || (u.qty || it.qty || 1) > 1
+          || String(u.groupKind || it.groupKind || '').toLowerCase() === 'nest_z')),
         userRot: { x: 0, y: 0, z: 0 },
         packYawOnly: true,
         assemblyShipPose: isAsm,
@@ -2248,6 +2304,84 @@ function snapMeshToPackerFootY(mesh, it) {
   return dy;
 }
 
+/** Always nail mesh AABB minY → ground (scene Y). Real-world floor contact. */
+function nailMeshToGroundY(mesh, groundY) {
+  if (!mesh || typeof THREE === 'undefined') return 0;
+  const g = (typeof groundY === 'number') ? groundY
+    : ((typeof SCENE_GROUND_Y === 'number') ? SCENE_GROUND_Y : 0);
+  mesh.updateMatrixWorld(true);
+  if (typeof csNzSnapObjectToGround === 'function' && Math.abs(g) < 1e-9) {
+    const s = csNzSnapObjectToGround(mesh);
+    return (s && s.moved_y) || 0;
+  }
+  const box = new THREE.Box3().setFromObject(mesh);
+  if (!isFinite(box.min.y)) return 0;
+  const dy = g - box.min.y;
+  if (Math.abs(dy) > 1e-6) mesh.position.y += dy;
+  return dy;
+}
+
+/**
+ * Floor cargo? Prefer live seat over packFootprintH (plates often fh≪mesh H).
+ * Used by render + settle so every floor piece nails minY→0.
+ */
+function isFloorCargoItem(it) {
+  if (!it) return false;
+  if (it.floorAnchor || it.baseLayerLock) return true;
+  if (it.anchorTier != null && Number(it.anchorTier) <= 1) return true;
+  const fh = Number(it.packFootprintH) || Number(it.heightMm) || Number(it.h) || 0;
+  const y = it.y != null ? Number(it.y) : null;
+  if (y == null) return true; // yard / unknown → treat as floor until stacked
+  if (fh > 0) {
+    // Center at/near half-height, or packer foot ≤ 50mm
+    if (y <= fh * 0.55 + 1e-6) return true;
+    if ((y - fh / 2) <= 50) return true;
+  } else if (y <= 50) {
+    return true;
+  }
+  return false;
+}
+
+/** Restore Group By rigid orientation (before packer yaw). */
+function applyGroupByFrozenQuat(mesh, it) {
+  if (!mesh || !it || !it._groupByQuat || typeof THREE === 'undefined') return false;
+  const q = it._groupByQuat;
+  if (!(Math.abs(q.w) > 0 || Math.abs(q.x) > 0 || Math.abs(q.y) > 0 || Math.abs(q.z) > 0))
+    return false;
+  mesh.quaternion.set(q.x || 0, q.y || 0, q.z || 0, q.w != null ? q.w : 1);
+  mesh.rotation.setFromQuaternion(mesh.quaternion);
+  mesh.updateMatrixWorld(true);
+  return true;
+}
+
+/** Persist Group By quat onto staging pack units / items (Optimise freeze). */
+function stampGroupByQuatOnStaging(it, mesh) {
+  if (!it || !mesh || typeof THREE === 'undefined') return;
+  const q = mesh.quaternion;
+  const gq = { x: q.x, y: q.y, z: q.z, w: q.w };
+  it._groupByQuat = gq;
+  it._freezeGroupByPose = true;
+  it._orientLocked = true;
+  it._lockedQuaternion = mesh.quaternion.clone();
+  try {
+    const marks = it.marks && it.marks.length ? it.marks : [it.mark];
+    if (typeof assemblyGroups !== 'undefined' && assemblyGroups) {
+      assemblyGroups.forEach(g => {
+        const gMarks = g.marks && g.marks.length ? g.marks : [g.mark];
+        const hit = marks.some(m => m && gMarks.includes(m))
+          || (it.stagingGroupId && g.id === it.stagingGroupId);
+        if (!hit) return;
+        g._groupByQuat = { ...gq };
+        g._freezeGroupByPose = true;
+        (g.packUnits || []).forEach(pu => {
+          pu._groupByQuat = { ...gq };
+          pu._freezeGroupByPose = true;
+        });
+      });
+    }
+  } catch (_) { /* */ }
+}
+
 /** Piece weight for yard order (heavier stays lower). */
 function yardItemWeightKg(it) {
   if (!it) return 0;
@@ -2299,6 +2433,28 @@ function yardSettlePackedMeshes(entries, cont) {
       c.mesh.rotation.setFromQuaternion(c.mesh.quaternion);
     }
     snapMeshToPackerFootY(c.mesh, it);
+    // Floor cargo: hard nail mesh minY → 0 (plates/nests/assemblies)
+    if (isFloorCargoItem(it) && typeof nailMeshToGroundY === 'function')
+      nailMeshToGroundY(c.mesh, 0);
+    // Ship Prep tip-level ownership: kill residual see-saw on long floor assemblies
+    const floorAsm = !!(it.floorAnchor || it._shipPrepped || it.isAssembly
+      || it.groupKind === 'welded_assembly');
+    const lenMm = Math.max(+it.packFootprintL || 0, +it.lengthMm || 0, +it.l || 0, 0);
+    if (floorAsm && lenMm >= 4000 && !/^nest_/i.test(String(it.groupKind || ''))
+        && typeof csShipPrepTipGapMm === 'function'
+        && typeof csShipPrepTipLevel === 'function') {
+      const tg0 = csShipPrepTipGapMm(c.mesh);
+      if (tg0 > 120) {
+        csShipPrepTipLevel(c.mesh, c.mesh.position.x, c.mesh.position.z);
+        if (typeof nailMeshToGroundY === 'function') nailMeshToGroundY(c.mesh, 0);
+        if (it._orientLocked && typeof THREE !== 'undefined')
+          it._lockedQuaternion = c.mesh.quaternion.clone();
+        if (it._groupByQuat) {
+          const q = c.mesh.quaternion;
+          it._groupByQuat = { x: q.x, y: q.y, z: q.z, w: q.w };
+        }
+      }
+    }
   });
 
   // Gravity + overlap on REAL mesh AABBs (ignore packPoseLock)
@@ -2414,7 +2570,11 @@ function yardSettlePackedMeshes(entries, cont) {
           it.floorAnchor = true;
         }
       }
-      snapMeshToPackerFootY(c.mesh, it);
+      if (isFloorCargoItem(it) && typeof nailMeshToGroundY === 'function') {
+        nailMeshToGroundY(c.mesh, 0);
+      } else {
+        snapMeshToPackerFootY(c.mesh, it);
+      }
     });
   }
   function reseatAfterOrientRestore(entries) {
@@ -2429,9 +2589,14 @@ function yardSettlePackedMeshes(entries, cont) {
     (entries || []).forEach(c => {
       if (!c || c.outsideContainer || !c.mesh) return;
       const it = c.item;
-      // Locked / foreman: always packer foot (mesh AABB support is a lie for lanes)
-      if (it && (it.packPoseLock || it._orientLocked || it.floorAnchor)) {
-        snapMeshToPackerFootY(c.mesh, it);
+      // Floor cargo: always live mesh minY → 0 (never trust fh mismatch)
+      if (it && isFloorCargoItem(it)) {
+        if (typeof nailMeshToGroundY === 'function') nailMeshToGroundY(c.mesh, 0);
+        else {
+          c.mesh.updateMatrixWorld(true);
+          const box = new THREE.Box3().setFromObject(c.mesh);
+          if (isFinite(box.min.y)) c.mesh.position.y -= box.min.y;
+        }
         return;
       }
       c.mesh.updateMatrixWorld(true);
@@ -2450,7 +2615,15 @@ function yardSettlePackedMeshes(entries, cont) {
           break;
         }
       }
-      if (!supported) {
+      if (supported) {
+        // Stacked on real mesh — keep; optionally seat to packer shelf
+        if (it && (it.packPoseLock || it._orientLocked))
+          snapMeshToPackerFootY(c.mesh, it);
+        return;
+      }
+      // Mid-air with no support → drop to floor (universal ground)
+      if (typeof nailMeshToGroundY === 'function') nailMeshToGroundY(c.mesh, 0);
+      else {
         c.mesh.position.y -= box.min.y;
         c.mesh.updateMatrixWorld(true);
       }
@@ -2464,8 +2637,9 @@ function yardSettlePackedMeshes(entries, cont) {
   nailUnsupportedToFloor(settled);
   restoreLockedOrients(settled);
   forcePackerFeet(settled);
-  // Absolute last: locked cargo cannot sit above packer foot
+  // Absolute last: floor cargo must touch ground (never trust fh/y mismatch)
   forcePackerFeet(settled);
+  nailUnsupportedToFloor(settled);
 
   // Sync packer records to settled mesh (keeps later Optimise/seed honest)
   list.filter(c => !c.outsideContainer).forEach(c => {
@@ -2532,7 +2706,7 @@ function yardShoveFloorToHome(entries, cont) {
     c.mesh.updateMatrixWorld(true);
     let box = new THREE.Box3().setFromObject(c.mesh);
     if (box.min.y > floorBand) return; // stacked — don't shove
-    for (let pass = 0; pass < 24; pass++) {
+    for (let pass = 0; pass < 32; pass++) {
       const others = boxesExcept(c);
       let moved = false;
       // Toward door end (X↓)
@@ -2545,6 +2719,10 @@ function yardShoveFloorToHome(entries, cont) {
       else c.mesh.position.z += step;
       if (!moved) break;
     }
+    // Density shove must not lift floor cargo — re-nail after XZ slide
+    if (c.item && typeof isFloorCargoItem === 'function' && isFloorCargoItem(c.item)
+        && typeof nailMeshToGroundY === 'function')
+      nailMeshToGroundY(c.mesh, 0);
   });
 }
 
@@ -2719,7 +2897,7 @@ function packOrientTagToRot(it) {
  */
 function packItemKeepGroupByPose(it) {
   if (!it) return false;
-  if (it._keepGroupByBundle || it._freezeGroupByPose) return true;
+  if (it._keepGroupByBundle || it._freezeGroupByPose || it._groupByQuat) return true;
   const gk = String(it.groupKind || '').toLowerCase();
   const sk = String(it.shapeKey || it.profileShape || '').toLowerCase();
   if (/^nest_[zcl]$/.test(gk)) return true;
@@ -2750,14 +2928,23 @@ function applyPackItemRotation(mesh, it) {
       it._lockedQuaternion = mesh.quaternion.clone();
   }
 
-  // Nest / brace: KEEP Group-By rest-pose (makeShape/ensureStableShape).
-  // Do NOT alignMeshToPackFootprint or re-apply X/Z — that tipped Z onto its edge.
-  if (packItemKeepGroupByPose(it)) {
+  // Nest / frozen assembly: KEEP Group-By rest-pose. Yaw only.
+  // Do NOT alignMeshToPackFootprint or re-apply X/Z — that tipped / diagonalized.
+  // CRITICAL: never use mesh.rotation.y += … after setting quaternion — Euler
+  // rewrite destroys pitch/roll and makes cargo look diagonal / floating.
+  if (packItemKeepGroupByPose(it) || it._freezeGroupByPose || it._groupByQuat) {
+    if (typeof applyGroupByFrozenQuat === 'function')
+      applyGroupByFrozenQuat(mesh, it);
     const tagYaw = packOrientTagToRot(it).y || 0;
     const urYaw = (it.userRot && it.userRot.y) || 0;
     // userRot already carries packOrientTag yaw when set by packer — don't double
     const yaw = it.userRot ? urYaw : tagYaw;
-    if (Math.abs(yaw) > 1e-9) mesh.rotation.y += yaw;
+    if (Math.abs(yaw) > 1e-9 && typeof THREE !== 'undefined') {
+      const qYaw = new THREE.Quaternion().setFromAxisAngle(
+        new THREE.Vector3(0, 1, 0), yaw);
+      mesh.quaternion.premultiply(qYaw);
+      mesh.rotation.setFromQuaternion(mesh.quaternion);
+    }
     mesh.updateMatrixWorld(true);
     lockOrient();
     return;
@@ -2788,7 +2975,14 @@ function applyPackItemRotation(mesh, it) {
       mesh.rotation.z += ur.z || 0;
     }
   } else if (it.packYawOnly !== false) {
-    mesh.rotation.y += (ur.y || 0);
+    // Quaternion world yaw — never Euler += (destroys rest pitch/roll)
+    const yaw = ur.y || 0;
+    if (Math.abs(yaw) > 1e-9 && typeof THREE !== 'undefined') {
+      const qYaw = new THREE.Quaternion().setFromAxisAngle(
+        new THREE.Vector3(0, 1, 0), yaw);
+      mesh.quaternion.premultiply(qYaw);
+      mesh.rotation.setFromQuaternion(mesh.quaternion);
+    }
   } else {
     mesh.rotation.set(ur.x || 0, ur.y || 0, ur.z || 0);
   }
@@ -2920,11 +3114,14 @@ async function layoutPlaceSelected() {
     if (!c?.mesh || !c?.item) return;
     c.mesh.updateMatrixWorld(true);
     const marks = c.item.marks && c.item.marks.length ? c.item.marks : [c.item.mark];
+    const q = c.mesh.quaternion;
     const pose = {
       x: c.mesh.position.x / SCALE,
       y: c.mesh.position.y / SCALE,
       z: c.mesh.position.z / SCALE,
       rot: { x: c.mesh.rotation.x, y: c.mesh.rotation.y, z: c.mesh.rotation.z },
+      // Exact Group By orientation (Euler rebuild loses pitch/roll)
+      quat: { x: q.x, y: q.y, z: q.z, w: q.w },
       outside: !!c.outsideContainer,
       // Deep-enough shape snapshot — restore must NEVER use packer dims
       item: {
@@ -2935,6 +3132,10 @@ async function layoutPlaceSelected() {
           : null,
         parts: c.item.parts || null,
         pathPointsMm: c.item.pathPointsMm || null,
+        _groupByQuat: c.item._groupByQuat || {
+          x: q.x, y: q.y, z: q.z, w: q.w,
+        },
+        _freezeGroupByPose: !!(c.item._freezeGroupByPose || c.item._groupByQuat),
       },
     };
     marks.forEach(m => { if (m) prevPose[m] = pose; });
@@ -3055,9 +3256,58 @@ async function layoutPlaceSelected() {
       pu._groupWeightKg = gw;
       pu._groupKind = g.groupKind;
       pu._checkOrder = g.checkOrder || 0;
+      // Freeze Group By world orientation from live yard mesh (WYSIWYG → Optimise)
+      if (!pu._groupByQuat && g._groupByQuat) pu._groupByQuat = { ...g._groupByQuat };
+      if (!pu._groupByQuat) {
+        const marks = pu.marks && pu.marks.length ? pu.marks : [pu.mark];
+        for (let mi = 0; mi < marks.length && !pu._groupByQuat; mi++) {
+          const prev = prevPose[marks[mi]];
+          if (!prev) continue;
+          // Prefer exact mesh quaternion — Euler rebuild loses nest/assembly roll
+          if (prev.quat && prev.quat.w != null) {
+            pu._groupByQuat = { ...prev.quat };
+            pu._freezeGroupByPose = true;
+          } else if (prev.item && prev.item._groupByQuat) {
+            pu._groupByQuat = { ...prev.item._groupByQuat };
+            pu._freezeGroupByPose = true;
+          } else if (prev.rot && typeof THREE !== 'undefined') {
+            const e = new THREE.Euler(
+              prev.rot.x || 0, prev.rot.y || 0, prev.rot.z || 0, 'XYZ');
+            const q = new THREE.Quaternion().setFromEuler(e);
+            pu._groupByQuat = { x: q.x, y: q.y, z: q.z, w: q.w };
+            pu._freezeGroupByPose = true;
+          }
+        }
+      }
+      if (pu._groupByQuat) pu._freezeGroupByPose = true;
+      // Ship Prep gate: ensure load-ready before Optimise (auto-prep if missing)
+      if (typeof csShipPrepReady === 'function' && !csShipPrepReady(pu)
+          && typeof csShipPrepPackUnit === 'function') {
+        try { csShipPrepPackUnit(pu); } catch (_) { /* */ }
+      }
+      if (pu._shipPrepped || (typeof csShipPrepReady === 'function' && csShipPrepReady(pu)))
+        pu._shipPrepped = true;
       packUnits.push(pu);
     });
   });
+  // Refuse Optimise for units that still lack ship-prep (honest — leave outside)
+  const shipReady = [];
+  const shipBlocked = [];
+  packUnits.forEach(pu => {
+    if (typeof csShipPrepReady === 'function' ? csShipPrepReady(pu)
+        : !!(pu._shipPrepped || pu._freezeGroupByPose || pu._keepGroupByBundle
+          || pu._groupByQuat))
+      shipReady.push(pu);
+    else shipBlocked.push(pu);
+  });
+  if (shipBlocked.length) {
+    try {
+      console.warn('[Optimise] ship-prep missing — left outside:',
+        shipBlocked.map(u => u.mark).slice(0, 8));
+    } catch (_) { /* */ }
+  }
+  packUnits.length = 0;
+  shipReady.forEach(u => packUnits.push(u));
   // Keep UI number order; only break ties with packer tier/weight
   if (typeof cs8SortHeavyAnchor === 'function')
     cs8SortHeavyAnchor(packUnits, spec.lengthMm);
@@ -3340,11 +3590,13 @@ function captureCurrentPoses() {
     if (!c?.mesh || !c?.item) return;
     c.mesh.updateMatrixWorld(true);
     const marks = c.item.marks && c.item.marks.length ? c.item.marks : [c.item.mark];
+    const q = c.mesh.quaternion;
     const pose = {
       x: c.mesh.position.x / SCALE,
       y: c.mesh.position.y / SCALE,
       z: c.mesh.position.z / SCALE,
       rot: { x: c.mesh.rotation.x, y: c.mesh.rotation.y, z: c.mesh.rotation.z },
+      quat: { x: q.x, y: q.y, z: q.z, w: q.w },
       outside: !!c.outsideContainer,
       item: {
         ...c.item,
@@ -3354,6 +3606,9 @@ function captureCurrentPoses() {
           : null,
         parts: c.item.parts || null,
         pathPointsMm: c.item.pathPointsMm || null,
+        _groupByQuat: c.item._groupByQuat || {
+          x: q.x, y: q.y, z: q.z, w: q.w,
+        },
       },
     };
     marks.forEach(m => { if (m) prevPose[m] = pose; });

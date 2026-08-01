@@ -569,6 +569,8 @@ public class MainForm : Form
                           let floatCount = 0;
                           let overlapCount = 0;
                           let maxMeshMinY = 0, maxMeshCy = 0, tallNestTip = 0;
+                          let tipGapMmMax = 0;
+                          let tipGapMark = null;
                           const meshBoxes = [];
                           for (const c of list) {
                             if (!c || c.outsideContainer || !c.mesh) continue;
@@ -623,6 +625,41 @@ public class MainForm : Form
                               }
                             }
                           }
+                          // Ship Prep tip-gap: long FLOOR assemblies only (see-saw gate).
+                          // Skip nests, stacked tiers, and footprint/mesh mismatches
+                          // (tall towers nail minY=0 but are not pad-float cases).
+                          for (const c of list) {
+                            if (!c || c.outsideContainer || !c.mesh || !c.item) continue;
+                            const it = c.item;
+                            const floorAsm = !!(it.floorAnchor || it._shipPrepped || it.isAssembly
+                              || it.groupKind === 'welded_assembly');
+                            if (!floorAsm) continue;
+                            if (/^nest_/i.test(String(it.groupKind || ''))) continue;
+                            const lenMm = Math.max(+it.packFootprintL || 0, +it.lengthMm || 0,
+                              +it.l || 0, 0);
+                            if (lenMm < 4000) continue;
+                            const fh = Math.max(+it.packFootprintH || 0, +it.heightMm || 0, +it.h || 0, 0);
+                            const y0 = (it.y != null && fh > 0)
+                              ? (Number(it.y) - fh / 2) : 0;
+                            if (y0 > 80) continue; // stacked — not floor pad
+                            try {
+                              c.mesh.updateMatrixWorld(true);
+                              const mb = new THREE.Box3().setFromObject(c.mesh);
+                              const meshHmm = ((mb.max.y - mb.min.y) / sc);
+                              // Standing tower / mismatch — not a face-down pad check
+                              if (fh > 0 && meshHmm > fh * 2.5) continue;
+                              if (meshHmm > 3500) continue;
+                            } catch (_) { /* */ }
+                            if (typeof csShipPrepTipGapMm === 'function') {
+                              try {
+                                const tg = csShipPrepTipGapMm(c.mesh);
+                                if (tg > tipGapMmMax) {
+                                  tipGapMmMax = tg;
+                                  tipGapMark = String(it.mark || '');
+                                }
+                              } catch (_) { /* */ }
+                            }
+                          }
                           for (let i = 0; i < meshBoxes.length; i++) {
                             for (let j = i + 1; j < meshBoxes.length; j++) {
                               const a = meshBoxes[i].box, b = meshBoxes[j].box;
@@ -653,7 +690,9 @@ public class MainForm : Form
                             && window.__foremanLast.report.overlapCount != null)
                             ? window.__foremanLast.report.overlapCount
                             : overlapCount;
-                          const qualityOk = floatCount === 0
+                          // tipGapMmMax: allow ≤120mm residual on long floor assemblies
+                          const tipOk = !(tipGapMmMax > 120);
+                          const qualityOk = floatCount === 0 && tipOk
                             && (foremanPack ? packerOv <= 8 : overlapCount <= 12);
                           const braceLike = all.filter(r =>
                             /FLANGE[_\s-]*BRACE|ANGLE[_\s-]*BRACE|L[_\s-]*BRACE|L_?ANGLE/i
@@ -675,6 +714,11 @@ public class MainForm : Form
                           window.__cliPackReport = {
                             ok: placedOk && widthOk && qualityOk && !groups.some(g =>
                               /WIDTH_EXCEEDS/i.test(String(g.fitReason || ''))),
+                            qualityOk: qualityOk,
+                            tipOk: tipOk,
+                            widthOk: widthOk,
+                            placedOk: placedOk,
+                            packerOv: packerOv,
                             totalClickable: all.length,
                             inside: all.filter(r => !r.outside).length,
                             outsideCount: outside.length,
@@ -684,6 +728,8 @@ public class MainForm : Form
                               maxMinY: maxMeshMinY,
                               maxCy: maxMeshCy,
                               tallNestTip: tallNestTip,
+                              tipGapMmMax: tipGapMmMax,
+                              tipGapMark: tipGapMark,
                               n: meshBoxes.length,
                               high: meshBoxes
                                 .map(m => ({

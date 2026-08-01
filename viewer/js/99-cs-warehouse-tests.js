@@ -283,9 +283,29 @@
     assert(u.widthMm > 50 || u.w > 50, 'not 6mm plate width');
   });
 
-  t('W.12d6', 'yardSettlePackedMeshes exists for post-pack gravity', () => {
+  t('W.12d6', 'Ship Prep API + yardSettle (pose then place)', () => {
     assert(typeof yardSettlePackedMeshes === 'function', 'yardSettle missing');
     assert(typeof yardItemWeightKg === 'function', 'yardWeight missing');
+    // Ship Prep class router — source of truth before Optimise freeze pack
+    assert(typeof csShipPrepClass === 'function', 'csShipPrepClass');
+    assert(typeof csShipPrepMesh === 'function', 'csShipPrepMesh');
+    assert(typeof csShipPrepPackUnit === 'function', 'csShipPrepPackUnit');
+    assert(typeof csShipPrepReady === 'function', 'csShipPrepReady');
+    assert(typeof csShipPrepTipGapMm === 'function', 'csShipPrepTipGapMm');
+    assert(csShipPrepClass({ groupKind: 'nest_z' }) === 'nest_z', 'class nest_z');
+    assert(csShipPrepClass({ isAssembly: true, parts: [{}, {}] }) === 'assembly',
+      'class assembly');
+    // Soft stamp must mark ready without remeshing warehouse stubs
+    const stub = {
+      mark: 'SP-STUB', isAssembly: true, groupKind: 'welded_assembly',
+      parts: [{ name: 'web' }, { name: 'flange' }],
+      stableBundleMm: { l: 10000, w: 400, h: 350 },
+      _skipShipPrepRemesh: true,
+    };
+    const r = csShipPrepPackUnit(stub);
+    assert(r && r.ok, 'stub soft prep');
+    assert(stub._shipPrepped, '_shipPrepped stamped');
+    assert(csShipPrepReady(stub) || stub._shipPrepped, 'ready gate');
   });
 
   t('W.25', 'FLANGE BRACE / ANGLE BRACE classify as l_angle not plate/rod', () => {

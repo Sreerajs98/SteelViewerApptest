@@ -98,6 +98,9 @@ function fmShipAxesFix(u, Lmax, Wmax, Hmax) {
 function fmHasFrozenGroupByPose(u) {
   if (!u) return false;
   if (u._keepGroupByBundle) return true;
+  // Ship Prep / exact Group By orientation — immutable in Optimise
+  if (u._shipPrepped) return true;
+  if (u._groupByQuat && (u._groupByQuat.w != null)) return true;
   const gk = String(u.groupKind || '').toLowerCase();
   if (gk.startsWith('nest_')) return true;
   const src = String((u.stableBundleMm && u.stableBundleMm.source) || '');
@@ -105,7 +108,7 @@ function fmHasFrozenGroupByPose(u) {
   if (/pitch_to_construct|pitched_unresolved|construct_span_guard|base_ground_search/i.test(src))
     return false;
   if (u._freezeGroupByPose || u._yardStraightened || u._yardStraighten) return true;
-  if (/yard_straighten|groupby/i.test(src)) {
+  if (/ship_prep|yard_straighten|groupby/i.test(src)) {
     const sb0 = u.stableBundleMm;
     return !!(sb0 && sb0.w <= 2438 + 1 && sb0.h <= 2690 + 1
       && sb0.h <= sb0.w * 1.08 + 1e-6);
@@ -311,45 +314,42 @@ function layoutForemanPack(unitsIn, spec, opts) {
       || (sbPin && sbPin.l > 5000
         && (sbPin.w > Wmax + 1 || sbPin.h > sbPin.w * 1.08
           || /pitch_to_construct|pitched/i.test(String(sbPin.source || '')))));
-    if (freezeGB && !frozen && allowRemeasure && !pinOk
+    // Ship Prep / freeze: NEVER remorph (no measure / no searchBaseLayer).
+    const alreadyFrozen = !!(u._shipPrepped || u._groupByQuat || u._freezeGroupByPose
+      || fmHasFrozenGroupByPose(u));
+    if (freezeGB && !frozen && !alreadyFrozen && allowRemeasure && !pinOk
         && (u.isAssembly || u.groupKind === 'welded_assembly'
-          || u.groupKind === 'assembly_single')) {
+          || u.groupKind === 'assembly_single')
+        && typeof csShipPrepPackUnit === 'function') {
       try {
-        let sb = null;
-        if (typeof measureStableBundleMm === 'function') {
-          sb = measureStableBundleMm({
-            ...u,
-            qty: 1,
-            isAssembly: true,
-            groupKind: 'welded_assembly',
-            _yardStraighten: true,
-            assemblyShipPose: true,
-          });
-        }
-        if (!(sb && sb.l > 0 && sb.h <= sb.w * 1.08 + 1e-6
-            && sb.w <= Wmax + 1 && sb.h <= Hceil + 1)
-            && typeof searchBaseLayerGroundPose === 'function') {
-          const hit = searchBaseLayerGroundPose(u, Lmax, Wmax, Hceil);
-          if (hit && hit.lying && hit.pw <= Wmax + 1 && hit.ph <= Hceil + 1
-              && hit.ph <= hit.pw * 1.08 + 1e-6) {
-            sb = {
-              l: hit.pl, w: hit.pw, h: hit.ph,
-              source: 'yard_straighten',
-            };
-          }
-        }
-        if (sb && sb.l > 0 && sb.h <= sb.w * 1.08 + 1e-6
-            && sb.w <= Wmax + 1 && sb.h <= Hceil + 1) {
-          u.stableBundleMm = {
-            l: sb.l, w: sb.w, h: sb.h,
-            source: 'yard_straighten',
-          };
-          u.packFootprintL = sb.l;
-          u.packFootprintW = sb.w;
-          u.packFootprintH = sb.h;
+        // Last chance Ship Prep only — still no searchBaseLayerGroundPose
+        csShipPrepPackUnit(u);
+        if (u.stableBundleMm && u.stableBundleMm.l > 0
+            && u.stableBundleMm.h <= u.stableBundleMm.w * 1.08 + 1e-6
+            && u.stableBundleMm.w <= Wmax + 1 && u.stableBundleMm.h <= Hceil + 1) {
+          u.packFootprintL = u.stableBundleMm.l;
+          u.packFootprintW = u.stableBundleMm.w;
+          u.packFootprintH = u.stableBundleMm.h;
           frozen = true;
         }
       } catch (_) { /* */ }
+    }
+    // Ship-prepped locks pose. If envelope exceeds the box, keep dims honest —
+    // do NOT lane-shrink to constructW (that parks a fat mesh in a thin lane).
+    if (u._shipPrepped) {
+      const sbFit = u.stableBundleMm;
+      const fitsBox = !!(sbFit && sbFit.l > 0
+        && +sbFit.w <= Wmax + 1 && +sbFit.h <= Hceil + 1
+        && +sbFit.l <= Lmax + 1);
+      frozen = true; // always freeze quat / tip — dims from sb below
+      if (!fitsBox) {
+        u._shipPrepOversize = true;
+        try {
+          console.warn('[FM] ship-prep envelope exceeds box — leave outside',
+            u.mark, sbFit && Math.round(sbFit.l), sbFit && Math.round(sbFit.w),
+            sbFit && Math.round(sbFit.h));
+        } catch (_) { /* */ }
+      }
     }
     // Freeze: keep stableBundleMm seat as-is. Else legacy IFC axis fix.
     if (!frozen) {
@@ -385,8 +385,10 @@ function layoutForemanPack(unitsIn, spec, opts) {
         pl = dims[0]; pw = dims[2]; ph = Math.min(dims[1], Hceil);
       }
     }
-    // NEVER shrink frozen Group By width to sectW — that forced thin-fin seats
-    if (!frozen) {
+    // NEVER shrink frozen / ship-prep / quat-locked widths to sectW (thin-fin seats)
+    const lockFoot = !!(frozen || u._shipPrepped || u._groupByQuat
+      || /ship_prep|yard_straighten/i.test(String((u.stableBundleMm && u.stableBundleMm.source) || '')));
+    if (!lockFoot) {
       const constructW = Math.max(+u.widthMm || 0, +u.unitWidth || 0, +u.sectW || 0, 0);
       if ((u.isAssembly || u.groupKind === 'welded_assembly' || u.groupKind === 'assembly_single')
           && constructW >= 80 && constructW <= Wmax
@@ -416,7 +418,20 @@ function layoutForemanPack(unitsIn, spec, opts) {
       _keepGroupByBundle: isNest || !!u._keepGroupByBundle,
     };
   });
-  state.remainingItems = fmSortTier(units, Lmax);
+  // Honest leftovers: ship-prep envelopes that still exceed the box stay outside
+  const oversizeShip = [];
+  const packable = [];
+  units.forEach(u => {
+    if (u && u._shipPrepOversize) {
+      u.fitReason = 'WIDTH_EXCEEDS_SHIP_PREP';
+      u.outsideContainer = true;
+      oversizeShip.push(u);
+    } else {
+      packable.push(u);
+    }
+  });
+  state.remainingItems = fmSortTier(packable, Lmax);
+  state.oversizedItems = (state.oversizedItems || []).concat(oversizeShip);
 
   function hmIdx(ix, iz) {
     if (ix < 0 || iz < 0 || ix >= nx || iz >= nz) return -1;
@@ -627,6 +642,11 @@ function layoutForemanPack(unitsIn, spec, opts) {
     if (newOff < curOff) score += 500;
     const usage = (pose.pl * pose.pw) / Math.max(rect.length * rect.width, 1);
     score += usage * 300;
+    // Leftover free-rect quality after this seat (density without remorph)
+    const leftL = Math.max(0, rect.length - pose.pl);
+    const leftW = Math.max(0, rect.width - pose.pw);
+    const leftover = Math.max(leftL * rect.width, rect.length * leftW);
+    score += Math.min(leftover / Math.max(rect.length * rect.width, 1), 1) * 120;
     // Floor first (foreman): elevated seats only when floor is genuinely full
     score -= rect.y * 2.0;
     if (rect.y > FM_EPS) score -= 2500;
@@ -636,6 +656,9 @@ function layoutForemanPack(unitsIn, spec, opts) {
     score += (1 - pose.z / Math.max(Wmax, 1)) * 40;
     // Soft CoG bonus
     if (pose.cog.offX <= FM_COG_SOFT && pose.cog.offZ <= FM_COG_SOFT) score += 80;
+    // Nest / frozen: slight home-corner bias (fill lanes without tilting)
+    if (item._freezeGroupByPose || item._keepGroupByBundle || fmHasFrozenGroupByPose(item))
+      score += (1 - pose.x / Math.max(Lmax, 1)) * 40;
     return score;
   }
 
@@ -654,23 +677,25 @@ function layoutForemanPack(unitsIn, spec, opts) {
       const variants = [];
       const base = fmFoot(item);
       variants.push({ pl: base.pl, pw: base.pw, ph: base.ph, yaw: item._yaw || 0, tag: 'yaw0' });
-      // Frozen Group By cargo: yaw 0/90 only. Fillers: legacy yaw when allowed.
-      // Do NOT yaw-swap every item — breaks snug side-by-side (W.16b).
-      const allowYaw = !!(item._freezeGroupByPose || fmHasFrozenGroupByPose(item))
-        || (allowFillerRot && tier >= 3);
+      // Frozen Group By: yaw 0/90 ONLY (no 180/270 remorph). Fillers may use full set.
+      const frozenItem = !!(item._freezeGroupByPose || item._groupByQuat
+        || fmHasFrozenGroupByPose(item));
+      const allowYaw = frozenItem || (allowFillerRot && tier >= 3);
       if (allowYaw) {
         variants.push({
           pl: base.pw, pw: base.pl, ph: base.ph,
           yaw: (item._yaw || 0) + Math.PI / 2, tag: 'yaw90',
         });
-        variants.push({
-          pl: base.pl, pw: base.pw, ph: base.ph,
-          yaw: (item._yaw || 0) + Math.PI, tag: 'yaw180',
-        });
-        variants.push({
-          pl: base.pw, pw: base.pl, ph: base.ph,
-          yaw: (item._yaw || 0) + 3 * Math.PI / 2, tag: 'yaw270',
-        });
+        if (!frozenItem) {
+          variants.push({
+            pl: base.pl, pw: base.pw, ph: base.ph,
+            yaw: (item._yaw || 0) + Math.PI, tag: 'yaw180',
+          });
+          variants.push({
+            pl: base.pw, pw: base.pl, ph: base.ph,
+            yaw: (item._yaw || 0) + 3 * Math.PI / 2, tag: 'yaw270',
+          });
+        }
       }
       for (let vi = 0; vi < variants.length; vi++) {
         const v = variants[vi];
@@ -1085,19 +1110,23 @@ function layoutForemanPack(unitsIn, spec, opts) {
     // Opt-in only: baseGroundSearch:true. Default freeze = Group By footprint seat.
     const allowSearch = o.baseGroundSearch === true;
 
-    if (firstAsm && freezeGB && fmHasFrozenGroupByPose(firstAsm)) {
+    if (firstAsm && (firstAsm._shipPrepped || (freezeGB && fmHasFrozenGroupByPose(firstAsm)))) {
+      // Ship Prep / freeze: translate + yaw0 only — never searchBaseLayer remorph
       firstAsm._freezeGroupByPose = true;
       firstAsm._rot = { x: 0, y: 0, z: 0 };
       firstAsm._yaw = 0;
-      const seated = fmSeatBase1(firstAsm, 'groupby_freeze');
+      const sbSrc0 = String((firstAsm.stableBundleMm && firstAsm.stableBundleMm.source) || '');
+      const baseTag = firstAsm._shipPrepped || /ship_prep/i.test(sbSrc0)
+        ? 'ship_prep' : 'groupby_freeze';
+      const seated = fmSeatBase1(firstAsm, baseTag);
       try {
         console.info(
-          `[FM-BASE1] ${firstAsm.mark || '?'} FREEZE seated=${seated}`
+          `[FM-BASE1] ${firstAsm.mark || '?'} ${baseTag.toUpperCase()} seated=${seated}`
           + ` foot=${Math.round(firstAsm.packLengthMm)}×${Math.round(firstAsm.packWidthMm)}×${Math.round(firstAsm.packHeightMm)}`
           + ` src=${(firstAsm.stableBundleMm && firstAsm.stableBundleMm.source) || '?'}`
         );
       } catch (_) { /* */ }
-    } else if (firstAsm && allowSearch
+    } else if (firstAsm && allowSearch && !firstAsm._shipPrepped
         && typeof searchBaseLayerGroundPose === 'function') {
       const hit = searchBaseLayerGroundPose(firstAsm, Lmax, Wmax, Hceil);
       if (hit && hit.lying && hit.pl > hit.ph * 1.15
@@ -1165,10 +1194,13 @@ function layoutForemanPack(unitsIn, spec, opts) {
   }
   compactAll();
 
-  // Phase 1b — squeeze remaining full-length assemblies into leftover width lanes
+  // Phase 1b — squeeze remaining full-length assemblies into leftover width lanes.
+  // Frozen Group By footprints are immutable — never lane-shrink those.
   {
     const longs = state.remainingItems.filter(u =>
-      u.constraintTier <= 1 && u.packLengthMm >= Lmax * 0.85);
+      u.constraintTier <= 1 && u.packLengthMm >= Lmax * 0.85
+      && !u._shipPrepped && !u._freezeGroupByPose && !u._groupByQuat
+      && !fmHasFrozenGroupByPose(u));
     for (let li = 0; li < longs.length; li++) {
       const item = longs[li];
       if (!state.remainingItems.includes(item)) continue;
@@ -1343,7 +1375,8 @@ function layoutForemanPack(unitsIn, spec, opts) {
       qty: Math.max(1, +u.qty || (u.nestPieces && u.nestPieces.length) || 1),
       _keepGroupByBundle: nest || !!u._keepGroupByBundle,
       _freezeGroupByPose: frozen,
-      _yardStraighten: frozen && !nest,
+      _yardStraighten: frozen && !nest && !u._groupByQuat,
+      _groupByQuat: u._groupByQuat ? { ...u._groupByQuat } : null,
       _supportFrac: 1,
       mutates_geometry: false,
     });
@@ -1399,14 +1432,18 @@ function layoutForemanPack(unitsIn, spec, opts) {
         || /groupby_freeze/i.test(String(p.tag || ''))));
       if (!p0) return null;
       const b = p0.item._baseGroundSearch || null;
+      const sbSrc = String((p0.item.stableBundleMm && p0.item.stableBundleMm.source) || '');
+      const shipTag = p0.item._shipPrepped || /ship_prep/i.test(sbSrc)
+        ? 'ship_prep' : 'groupby_freeze';
       return {
         mark: p0.mark,
-        tag: (b && b.tag) || p0.tag || 'groupby_freeze',
+        tag: (b && b.tag) || p0.tag || shipTag,
         baseArea: Math.round((b && b.baseArea)
           || (p0.pl * p0.pw) || 0),
         ground: b ? !!b.ground : true,
         stable: b ? !!b.stable : true,
-        freeze: !!(p0.item._freezeGroupByPose || freezeGB),
+        freeze: !!(p0.item._freezeGroupByPose || p0.item._shipPrepped || freezeGB),
+        shipPrepped: !!p0.item._shipPrepped,
         pl: Math.round(p0.pl),
         pw: Math.round(p0.pw),
         ph: Math.round(p0.ph),
