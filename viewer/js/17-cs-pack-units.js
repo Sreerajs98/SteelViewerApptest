@@ -629,7 +629,8 @@ function cspuMakePackUnit(pieces, stageGroup, idx, method) {
     pathDiamMm: stageGroup.pathDiamMm,
   };
 
-  // Assemblies: measure real rest-pose AABB so staging/pack spacing matches mesh
+  // Assemblies: measure Group By yard rest-pose (face-down) for pack seat.
+  // Do NOT pitch_to_construct → thin upright (that destroyed Freeze Pose).
   if (pu.isAssembly && typeof measureStableBundleMm === 'function') {
     try {
       let sb = measureStableBundleMm({
@@ -647,19 +648,26 @@ function cspuMakePackUnit(pieces, stageGroup, idx, method) {
         groupKind: 'welded_assembly',
         category: pu.category,
         orientation_info: orient,
+        _yardStraighten: true,
+        assemblyShipPose: true,
       });
       if (sb && sb.l > 0) {
-        // Strip residual roof-pitch mid-edge before pack/staging stamps AABB
-        if (typeof cs8SanitizePitchedAssemblyEnvelope === 'function') {
-          sb = cs8SanitizePitchedAssemblyEnvelope(
+        const faceDown = sb.h <= sb.w * 1.08 + 1e-6;
+        const fits40 = sb.w <= 2438 + 1 && sb.h <= 2690 + 1 && sb.l <= 12192 + 1;
+        // Fitting face-down yard seat → freeze. Else legacy sanitize for packability.
+        if (faceDown && fits40) {
+          sb.source = 'yard_straighten';
+          pu._freezeGroupByPose = true;
+        } else if (typeof cs8SanitizePitchedAssemblyEnvelope === 'function') {
+          const scrubbed = cs8SanitizePitchedAssemblyEnvelope(
             sb, pu,
             pu.lengthMm || sb.l,
             first.widthMm || pu.widthMm,
             first.heightMm || pu.heightMm
-          ) || sb;
+          );
+          if (scrubbed) sb = scrubbed;
         }
         pu.stableBundleMm = sb;
-        // Keep construction dims; refresh envelope metadata only
         pu.bundle_bbox = {
           l: sb.l, w: sb.w, h: sb.h,
           skidMm: pu.skidMm,

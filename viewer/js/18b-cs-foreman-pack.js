@@ -91,6 +91,41 @@ function fmShipAxesFix(u, Lmax, Wmax, Hmax) {
   return null;
 }
 
+/**
+ * Group By already straightened this unit — Optimise must not re-PCA / re-ground-search.
+ * Source of truth = stableBundleMm (yard_straighten / measured rest pose / nest).
+ */
+function fmHasFrozenGroupByPose(u) {
+  if (!u) return false;
+  if (u._keepGroupByBundle) return true;
+  const gk = String(u.groupKind || '').toLowerCase();
+  if (gk.startsWith('nest_')) return true;
+  const src = String((u.stableBundleMm && u.stableBundleMm.source) || '');
+  // Upright construct / ground-search remorph — NOT a frozen Group By yard seat
+  if (/pitch_to_construct|pitched_unresolved|construct_span_guard|base_ground_search/i.test(src))
+    return false;
+  if (u._freezeGroupByPose || u._yardStraightened || u._yardStraighten) return true;
+  if (/yard_straighten|groupby/i.test(src)) {
+    const sb0 = u.stableBundleMm;
+    return !!(sb0 && sb0.w <= 2438 + 1 && sb0.h <= 2690 + 1
+      && sb0.h <= sb0.w * 1.08 + 1e-6);
+  }
+  if (/measured|rest_pose|assembly_pca|fm_sb_prefer/i.test(src)) {
+    const sb0 = u.stableBundleMm;
+    return !!(sb0 && sb0.w <= 2438 + 1 && sb0.h <= 2690 + 1
+      && sb0.h <= sb0.w * 1.08 + 1e-6);
+  }
+  const sb = u.stableBundleMm;
+  // Face-down + fits 40ft only
+  if (sb && sb.l > 0 && sb.w > 0 && sb.h > 0
+      && sb.w <= 2438 + 1 && sb.h <= 2690 + 1
+      && sb.h <= sb.w * 1.08 + 1e-6
+      && (u.isAssembly || u.groupKind === 'welded_assembly'
+        || u.groupKind === 'assembly_single'))
+    return true;
+  return false;
+}
+
 function fmFoot(u) {
   // Locked pack footprints win (lane-shrink / ship-axes). sb is only a fallback.
   if (u && u.packLengthMm > 0 && u.packWidthMm > 0 && u.packHeightMm > 0) {
@@ -214,6 +249,8 @@ function layoutForemanPack(unitsIn, spec, opts) {
   const gap = fmGap();
   const nx = Math.ceil(Lmax / FM_CELL);
   const nz = Math.ceil(Wmax / FM_CELL);
+  // North star: Group By pose is source of truth — Optimise translates + yaw only
+  const freezeGB = o.freezeGroupByPose !== false;
 
   const state = {
     placedItems: [],
@@ -245,43 +282,122 @@ function layoutForemanPack(unitsIn, spec, opts) {
     _id: 'floor0',
   });
 
-  // Units: fix IFC axis swaps, then lock pack footprints (no further morph)
+  // Units: lock Group By footprints (no PCA remorph / no lane-shrink to thin fin)
   const units = (unitsIn || []).filter(Boolean).map(u0 => {
     const u = { ...u0 };
-    const fix = fmShipAxesFix(u, Lmax, Wmax, Hmax);
-    if (fix) {
-      u.l = fix.l; u.w = fix.w; u.h = fix.h;
-      u.lengthMm = fix.l; u.widthMm = fix.w; u.heightMm = fix.h;
-      u.packFootprintL = fix.l;
-      u.packFootprintW = fix.w;
-      u.packFootprintH = fix.h;
-      u.stableBundleMm = {
-        ...(u.stableBundleMm || {}),
-        l: fix.l, w: fix.w, h: fix.h,
-        source: fix.source,
-      };
+    let frozen = freezeGB && fmHasFrozenGroupByPose(u);
+    // Fitting face-down seat only (w≤40ft). Oversized pitched AABB is not frozen.
+    if (frozen && u.stableBundleMm
+        && (+u.stableBundleMm.w > Wmax + 1 || +u.stableBundleMm.h > Hceil + 1)) {
+      frozen = false;
+    }
+    // Fitting face-down seat for real IFC assemblies.
+    // Skip warehouse stubs (W.16b/W.18d name-only parts + pinned envelopes).
+    const parts = u.parts || [];
+    const partsReal = parts.length >= 2 && parts.some(p => p && (
+      Number(p.lengthMm) > 500
+      || (p.geometry && p.geometry.attributes)
+      || (Array.isArray(p.positions) && p.positions.length > 6)
+      || (Array.isArray(p.transform) && p.transform.length >= 16)
+    ));
+    const stubOnly = parts.length >= 2 && parts.every(p => p && !Number(p.lengthMm)
+      && !p.geometry && !p.transform
+      && /^(web|flange|a|b|part)$/i.test(String(p.name || 'part')));
+    const sbPin = u.stableBundleMm;
+    const pinOk = !!(sbPin && sbPin.l > 500 && sbPin.w > 0 && sbPin.h > 0
+      && sbPin.w <= Wmax + 1 && sbPin.h <= Hceil + 1
+      && sbPin.h <= sbPin.w * 1.08 + 1e-6);
+    const allowRemeasure = !stubOnly && (partsReal
+      || (sbPin && sbPin.l > 5000
+        && (sbPin.w > Wmax + 1 || sbPin.h > sbPin.w * 1.08
+          || /pitch_to_construct|pitched/i.test(String(sbPin.source || '')))));
+    if (freezeGB && !frozen && allowRemeasure && !pinOk
+        && (u.isAssembly || u.groupKind === 'welded_assembly'
+          || u.groupKind === 'assembly_single')) {
+      try {
+        let sb = null;
+        if (typeof measureStableBundleMm === 'function') {
+          sb = measureStableBundleMm({
+            ...u,
+            qty: 1,
+            isAssembly: true,
+            groupKind: 'welded_assembly',
+            _yardStraighten: true,
+            assemblyShipPose: true,
+          });
+        }
+        if (!(sb && sb.l > 0 && sb.h <= sb.w * 1.08 + 1e-6
+            && sb.w <= Wmax + 1 && sb.h <= Hceil + 1)
+            && typeof searchBaseLayerGroundPose === 'function') {
+          const hit = searchBaseLayerGroundPose(u, Lmax, Wmax, Hceil);
+          if (hit && hit.lying && hit.pw <= Wmax + 1 && hit.ph <= Hceil + 1
+              && hit.ph <= hit.pw * 1.08 + 1e-6) {
+            sb = {
+              l: hit.pl, w: hit.pw, h: hit.ph,
+              source: 'yard_straighten',
+            };
+          }
+        }
+        if (sb && sb.l > 0 && sb.h <= sb.w * 1.08 + 1e-6
+            && sb.w <= Wmax + 1 && sb.h <= Hceil + 1) {
+          u.stableBundleMm = {
+            l: sb.l, w: sb.w, h: sb.h,
+            source: 'yard_straighten',
+          };
+          u.packFootprintL = sb.l;
+          u.packFootprintW = sb.w;
+          u.packFootprintH = sb.h;
+          frozen = true;
+        }
+      } catch (_) { /* */ }
+    }
+    // Freeze: keep stableBundleMm seat as-is. Else legacy IFC axis fix.
+    if (!frozen) {
+      const fix = fmShipAxesFix(u, Lmax, Wmax, Hmax);
+      if (fix) {
+        u.l = fix.l; u.w = fix.w; u.h = fix.h;
+        u.lengthMm = fix.l; u.widthMm = fix.w; u.heightMm = fix.h;
+        u.packFootprintL = fix.l;
+        u.packFootprintW = fix.w;
+        u.packFootprintH = fix.h;
+        u.stableBundleMm = {
+          ...(u.stableBundleMm || {}),
+          l: fix.l, w: fix.w, h: fix.h,
+          source: fix.source,
+        };
+      }
+    } else if (u.stableBundleMm && u.stableBundleMm.l > 0) {
+      const sb = u.stableBundleMm;
+      u.packFootprintL = +sb.l;
+      u.packFootprintW = +sb.w;
+      u.packFootprintH = +sb.h;
+      u.l = +sb.l; u.w = +sb.w; u.h = +sb.h;
     }
     let { pl, pw, ph } = fmFoot(u);
     // IFC construct H often 10–30mm over internal clear — seat to envelope
     if (ph > Hceil + FM_EPS && ph <= Hmax + 80) {
       ph = Hceil;
     }
-    // Classic IFC span-on-width with no usable sb (still)
-    if (pw > Wmax + 1 && pl < pw && Math.min(pl, ph) <= Wmax + 1) {
+    // Classic IFC span-on-width with no usable sb (still) — skip when frozen
+    if (!frozen && pw > Wmax + 1 && pl < pw && Math.min(pl, ph) <= Wmax + 1) {
       const dims = [pl, pw, ph].sort((a, b) => b - a);
       if (dims[0] <= Lmax + 1 && dims[2] <= Wmax + 1 && dims[1] <= Hceil + 1) {
         pl = dims[0]; pw = dims[2]; ph = Math.min(dims[1], Hceil);
       }
     }
-    // Assemblies: measured AABB width often includes haunch/plates. Lane pack uses
-    // construction width (+clear) so multiple full-length rafters share the floor.
-    const constructW = Math.max(+u.widthMm || 0, +u.unitWidth || 0, +u.sectW || 0, 0);
-    if ((u.isAssembly || u.groupKind === 'welded_assembly' || u.groupKind === 'assembly_single')
-        && constructW >= 80 && constructW <= Wmax
-        && pw > constructW * 2.2 && pl >= Lmax * 0.7) {
-      // ~10 lanes in a 40ft box when construct ≈200mm (haunch AABB often 800+)
-      pw = Math.min(pw, Math.max(constructW + 40, 220));
+    // NEVER shrink frozen Group By width to sectW — that forced thin-fin seats
+    if (!frozen) {
+      const constructW = Math.max(+u.widthMm || 0, +u.unitWidth || 0, +u.sectW || 0, 0);
+      if ((u.isAssembly || u.groupKind === 'welded_assembly' || u.groupKind === 'assembly_single')
+          && constructW >= 80 && constructW <= Wmax
+          && pw > constructW * 2.2 && pl >= Lmax * 0.7) {
+        pw = Math.min(pw, Math.max(constructW + 40, 220));
+      }
     }
+    const sk = String(u.shapeKey || '').toLowerCase();
+    const gk = String(u.groupKind || '').toLowerCase();
+    const isNest = gk.startsWith('nest_')
+      || sk === 'z_channel' || sk === 'c_channel' || sk === 'l_angle';
     return {
       ...u,
       packLengthMm: pl,
@@ -293,17 +409,11 @@ function layoutForemanPack(unitsIn, spec, opts) {
       l: pl, w: pw, h: ph,
       weightKg: fmWeight(u),
       constraintTier: fmTier(u, Lmax),
-      _yaw: (u.userRot && u.userRot.y) || 0,
-      // Nest rest-pose is already baked in makeShape (Group-By). Packer adds YAW only.
-      // Do NOT copy stabilityInfo.applied_rotation X/Z — that double-tilted Z purlins.
-      _rot: (() => {
-        const sk = String(u.shapeKey || '').toLowerCase();
-        const gk = String(u.groupKind || '').toLowerCase();
-        const isNest = gk.startsWith('nest_')
-          || sk === 'z_channel' || sk === 'c_channel' || sk === 'l_angle';
-        if (isNest) return { x: 0, y: 0, z: 0 };
-        return u.userRot || { x: 0, y: 0, z: 0 };
-      })(),
+      _yaw: 0,
+      // Rigid body: yaw only at Optimise — never replay Rx/Rz from Group By
+      _rot: { x: 0, y: 0, z: 0 },
+      _freezeGroupByPose: !!(frozen || isNest),
+      _keepGroupByBundle: isNest || !!u._keepGroupByBundle,
     };
   });
   state.remainingItems = fmSortTier(units, Lmax);
@@ -544,8 +654,11 @@ function layoutForemanPack(unitsIn, spec, opts) {
       const variants = [];
       const base = fmFoot(item);
       variants.push({ pl: base.pl, pw: base.pw, ph: base.ph, yaw: item._yaw || 0, tag: 'yaw0' });
-      // Tier 3 fillers: try 90° swap L↔W
-      if (allowFillerRot && tier >= 3) {
+      // Frozen Group By cargo: yaw 0/90 only. Fillers: legacy yaw when allowed.
+      // Do NOT yaw-swap every item — breaks snug side-by-side (W.16b).
+      const allowYaw = !!(item._freezeGroupByPose || fmHasFrozenGroupByPose(item))
+        || (allowFillerRot && tier >= 3);
+      if (allowYaw) {
         variants.push({
           pl: base.pw, pw: base.pl, ph: base.ph,
           yaw: (item._yaw || 0) + Math.PI / 2, tag: 'yaw90',
@@ -910,10 +1023,9 @@ function layoutForemanPack(unitsIn, spec, opts) {
     return floorRects.concat([full]);
   }
 
-  // ── PHASE 0: First base-layer assembly — ground-stability rotate search ─
-  // Rafter/column #1: try X/Y/Z at 1/5/15/45/90° → pick max ground support,
-  // lock footprints, seat on floor at rear-home BEFORE other floor cargo.
-  // Only real IFC assemblies (skip warehouse stub parts like {name:'web'}).
+  // ── PHASE 0: Heaviest base assembly — seat FIRST (floor / rear-home)
+  // Freeze mode: use Group By footprint as-is (NO searchBaseLayerGroundPose).
+  // Legacy (freezeGroupByPose:false): optional ground-search re-orient.
   {
     function fmPartsLookReal(parts) {
       if (!parts || parts.length < 2) return false;
@@ -929,10 +1041,7 @@ function layoutForemanPack(unitsIn, spec, opts) {
         || (p.children && p.children.length)
       ));
     }
-    const allowSearch = o.baseGroundSearch !== false;
-    // Heaviest real assembly first — user: weight max item on base, LYING only
-    let firstAsm = null;
-    if (allowSearch) {
+    function fmPickFirstAsm() {
       const cands = state.remainingItems.filter(u => {
         if (!u || u._skipBaseGroundSearch) return false;
         const asm = !!(u.isAssembly || u.groupKind === 'welded_assembly'
@@ -941,16 +1050,56 @@ function layoutForemanPack(unitsIn, spec, opts) {
         const pl = +u.packLengthMm || +u.l || 0;
         if (pl < Lmax * 0.55) return false;
         const sbSrc = String((u.stableBundleMm && u.stableBundleMm.source) || '');
-        const measured = /measured|assembly|rest_pose|base_ground|pitched/i.test(sbSrc);
-        return fmPartsLookReal(u.parts) || measured;
+        const measured = /measured|assembly|rest_pose|base_ground|pitched|yard_straighten|fm_sb/i
+          .test(sbSrc);
+        return fmPartsLookReal(u.parts) || measured || fmHasFrozenGroupByPose(u);
       });
       cands.sort((a, b) => fmWeight(b) - fmWeight(a)
         || (+b.packLengthMm || 0) - (+a.packLengthMm || 0));
-      firstAsm = cands[0] || null;
+      return cands[0] || null;
     }
-    if (firstAsm && typeof searchBaseLayerGroundPose === 'function') {
+    function fmSeatBase1(firstAsm, tag) {
+      const floorRects = ensureFloorRect();
+      let seated = false;
+      for (let ri = 0; ri < floorRects.length && !seated; ri++) {
+        const rect = floorRects[ri];
+        if (rect.y > FM_EPS) continue;
+        const pose = inchPlace(
+          firstAsm, rect,
+          firstAsm.packLengthMm, firstAsm.packWidthMm, firstAsm.packHeightMm,
+          true);
+        if (!pose) continue;
+        seated = commit({
+          item: firstAsm,
+          rect,
+          pose,
+          yaw: firstAsm._yaw || 0,
+          tag: tag || 'groupby_freeze',
+          score: 1e6,
+        });
+      }
+      return seated;
+    }
+
+    const firstAsm = fmPickFirstAsm();
+    // Opt-in only: baseGroundSearch:true. Default freeze = Group By footprint seat.
+    const allowSearch = o.baseGroundSearch === true;
+
+    if (firstAsm && freezeGB && fmHasFrozenGroupByPose(firstAsm)) {
+      firstAsm._freezeGroupByPose = true;
+      firstAsm._rot = { x: 0, y: 0, z: 0 };
+      firstAsm._yaw = 0;
+      const seated = fmSeatBase1(firstAsm, 'groupby_freeze');
+      try {
+        console.info(
+          `[FM-BASE1] ${firstAsm.mark || '?'} FREEZE seated=${seated}`
+          + ` foot=${Math.round(firstAsm.packLengthMm)}×${Math.round(firstAsm.packWidthMm)}×${Math.round(firstAsm.packHeightMm)}`
+          + ` src=${(firstAsm.stableBundleMm && firstAsm.stableBundleMm.source) || '?'}`
+        );
+      } catch (_) { /* */ }
+    } else if (firstAsm && allowSearch
+        && typeof searchBaseLayerGroundPose === 'function') {
       const hit = searchBaseLayerGroundPose(firstAsm, Lmax, Wmax, Hceil);
-      // Only commit LYING poses (longest axis on container X)
       if (hit && hit.lying && hit.pl > hit.ph * 1.15
           && hit.pl > 0 && hit.pw > 0 && hit.ph > 0) {
         firstAsm.packLengthMm = hit.pl;
@@ -981,28 +1130,7 @@ function layoutForemanPack(unitsIn, spec, opts) {
           l: hit.pl, w: hit.pw, h: hit.ph,
           source: 'base_ground_search',
         };
-        // Do NOT shrink seat to sectW (~240): that forced a thin-fin pack
-        // footprint while the mesh still sat tall — kills ground support.
-        // Keep searchBaseLayerGroundPose width (face-down / max base).
-        const floorRects = ensureFloorRect();
-        let seated = false;
-        for (let ri = 0; ri < floorRects.length && !seated; ri++) {
-          const rect = floorRects[ri];
-          if (rect.y > FM_EPS) continue;
-          const pose = inchPlace(
-            firstAsm, rect,
-            firstAsm.packLengthMm, firstAsm.packWidthMm, firstAsm.packHeightMm,
-            true);
-          if (!pose) continue;
-          seated = commit({
-            item: firstAsm,
-            rect,
-            pose,
-            yaw: firstAsm._yaw || 0,
-            tag: hit.tag || 'base_ground',
-            score: 1e6,
-          });
-        }
+        const seated = fmSeatBase1(firstAsm, hit.tag || 'base_ground');
         try {
           console.info(
             `[FM-BASE1] ${firstAsm.mark || '?'} LYING seated=${seated}`
@@ -1166,6 +1294,7 @@ function layoutForemanPack(unitsIn, spec, opts) {
     const shapeH = nest
       ? Math.max(+u.sectH || +u.unitHeight || +u.heightMm || +u.h || p.ph, 1)
       : p.ph;
+    const frozen = !!(nest || u._freezeGroupByPose || fmHasFrozenGroupByPose(u));
     c.items.push({
       ...u,
       // Shape dims = Group-By construction (sect/nest). Footprint = seat only.
@@ -1190,16 +1319,14 @@ function layoutForemanPack(unitsIn, spec, opts) {
       isAssembly: !!(u.isAssembly || u.groupKind === 'welded_assembly'
         || u.groupKind === 'assembly_single'),
       userRot: {
-        x: nest ? 0 : ((u._rot && u._rot.x) || 0),
-        y: (p.yaw || 0) + ((u._rot && u._rot.y) || 0),
-        z: nest ? 0 : ((u._rot && u._rot.z) || 0),
+        x: frozen ? 0 : ((u._rot && u._rot.x) || 0),
+        y: (p.yaw || 0),
+        z: frozen ? 0 : ((u._rot && u._rot.z) || 0),
       },
-      // Base-ground search used full Euler — compose for that first assembly only
-      packYawOnly: nest ? true
-        : !(u._baseGroundSearch || (u._rot
-          && (Math.abs(u._rot.x || 0) > 1e-9 || Math.abs(u._rot.z || 0) > 1e-9))),
-      packComposeRot: !!(!nest && u._baseGroundSearch),
-      baseGroundSearch: u._baseGroundSearch || null,
+      // Nests + frozen Group By: yaw only. Others may face-roll to fit (W.18d).
+      packYawOnly: frozen || nest,
+      packComposeRot: !!(!frozen && !nest && u._baseGroundSearch),
+      baseGroundSearch: (!frozen && u._baseGroundSearch) || null,
       packPoseLock: true,
       packOrientTag: p.tag || 'yaw0',
       baseLayerLock: p.tier <= 1,
@@ -1208,14 +1335,15 @@ function layoutForemanPack(unitsIn, spec, opts) {
       unitWeightKg: p.weightKg,
       weight: p.weightKg,
       groupKind: u.groupKind || u.category || null,
-      // Keep Group-By nest roll / nestPieces / nestingInfo EXACTLY (do not zero)
       orientation_info: u.orientation_info || null,
       nestingInfo: u.nestingInfo || null,
       nestPieces: u.nestPieces || null,
       nestMethod: u.nestMethod || null,
       nestingOffsetMm: u.nestingOffsetMm || u.nesting_offset || null,
       qty: Math.max(1, +u.qty || (u.nestPieces && u.nestPieces.length) || 1),
-      _keepGroupByBundle: nest,
+      _keepGroupByBundle: nest || !!u._keepGroupByBundle,
+      _freezeGroupByPose: frozen,
+      _yardStraighten: frozen && !nest,
       _supportFrac: 1,
       mutates_geometry: false,
     });
@@ -1266,15 +1394,19 @@ function layoutForemanPack(unitsIn, spec, opts) {
     longPlaced: state.placedItems.filter(p => p.pl >= Lmax * 0.7).length,
     floorFreeRects: state.freeRects.filter(r => r.y <= FM_EPS).length,
     base1: (() => {
-      const p0 = state.placedItems.find(p => p.item && p.item._baseGroundSearch);
+      const p0 = state.placedItems.find(p => p.item && (
+        p.item._baseGroundSearch || p.item._freezeGroupByPose
+        || /groupby_freeze/i.test(String(p.tag || ''))));
       if (!p0) return null;
-      const b = p0.item._baseGroundSearch;
+      const b = p0.item._baseGroundSearch || null;
       return {
         mark: p0.mark,
-        tag: b.tag,
-        baseArea: Math.round(b.baseArea || 0),
-        ground: !!b.ground,
-        stable: !!b.stable,
+        tag: (b && b.tag) || p0.tag || 'groupby_freeze',
+        baseArea: Math.round((b && b.baseArea)
+          || (p0.pl * p0.pw) || 0),
+        ground: b ? !!b.ground : true,
+        stable: b ? !!b.stable : true,
+        freeze: !!(p0.item._freezeGroupByPose || freezeGB),
         pl: Math.round(p0.pl),
         pw: Math.round(p0.pw),
         ph: Math.round(p0.ph),

@@ -1107,6 +1107,14 @@ function cs8UnitFromPackUnit(pu) {
 
   // Pack footprint: prefer measured post-rest-pose AABB (matches render)
   let sb = pu.stableBundleMm;
+  const sbSrc0 = String((sb && sb.source) || '');
+  // Freeze only when Group By stamped a fitting face-down seat
+  const frozenFit = !!(pu._freezeGroupByPose
+    && sb && sb.l > 0 && sb.w <= 2438 + 1 && sb.h <= 2690 + 1
+    && sb.h <= sb.w * 1.08 + 1e-6)
+    || (/yard_straighten|groupby/i.test(sbSrc0)
+      && sb && sb.w <= 2438 + 1 && sb.h <= 2690 + 1
+      && sb.h <= sb.w * 1.08 + 1e-6);
   if ((!sb || !(sb.l > 0)) && typeof measureStableBundleMm === 'function') {
     try {
       sb = measureStableBundleMm({
@@ -1136,28 +1144,29 @@ function cs8UnitFromPackUnit(pu) {
     } catch (_) { /* */ }
   }
 
-  // Strip residual roof-pitch AABB (e.g. RF012 11864×4341×869) → shippable L×sect
-  sb = cs8SanitizePitchedAssemblyEnvelope(sb, pu, memberL, constructW, constructH);
-  // Guard: collapsed plate measure only — never invent over pitched_unresolved
-  const lostSpan = sb && memberL > 1000 && sb.l < memberL * 0.85
-    && sb.source !== 'pitched_unresolved';
-  const lostWeb = sb && constructH > 1000 && constructH <= 2690
-    && sb.h < constructH * 0.55
-    && sb.source !== 'pitched_unresolved'
-    && !(sb.pitchedFrom && sb.pitchedFrom.h > 2690);
-  if (sb && (lostSpan || lostWeb)) {
-    try {
-      console.warn(
-        `[span-guard] ${(pu && pu.mark) || '?'} measured ${Math.round(sb.l)}×${Math.round(sb.w)}×${Math.round(sb.h)}`
-        + ` vs construct ${Math.round(memberL)}×${Math.round(constructW)}×${Math.round(constructH)}`
-        + ` — using ship axes`
-      );
-    } catch (_) { /* */ }
-    sb = {
-      l: memberL, w: constructW, h: constructH,
-      source: 'construct_span_guard',
-      pitchedFrom: { l: sb.l, w: sb.w, h: sb.h },
-    };
+  if (!frozenFit) {
+    // Legacy: strip residual roof-pitch AABB → shippable L×sect (warehouse tests)
+    sb = cs8SanitizePitchedAssemblyEnvelope(sb, pu, memberL, constructW, constructH);
+    const lostSpan = sb && memberL > 1000 && sb.l < memberL * 0.85
+      && sb.source !== 'pitched_unresolved';
+    const lostWeb = sb && constructH > 1000 && constructH <= 2690
+      && sb.h < constructH * 0.55
+      && sb.source !== 'pitched_unresolved'
+      && !(sb.pitchedFrom && sb.pitchedFrom.h > 2690);
+    if (sb && (lostSpan || lostWeb)) {
+      try {
+        console.warn(
+          `[span-guard] ${(pu && pu.mark) || '?'} measured ${Math.round(sb.l)}×${Math.round(sb.w)}×${Math.round(sb.h)}`
+          + ` vs construct ${Math.round(memberL)}×${Math.round(constructW)}×${Math.round(constructH)}`
+          + ` — using ship axes`
+        );
+      } catch (_) { /* */ }
+      sb = {
+        l: memberL, w: constructW, h: constructH,
+        source: 'construct_span_guard',
+        pitchedFrom: { l: sb.l, w: sb.w, h: sb.h },
+      };
+    }
   }
   if (sb && pu) pu.stableBundleMm = sb;
 

@@ -194,6 +194,8 @@ function renderContainer(idx) {
     // Do NOT zero nesting_angle — that is what makes the nested Z bundle look.
     let shapeIt = it;
     if (typeof packItemKeepGroupByPose === 'function' && packItemKeepGroupByPose(it)) {
+      const isNest = !!(it.nestPieces && it.nestPieces.length)
+        || /^nest_/i.test(String(it.groupKind || ''));
       const sectH = Math.max(+it.sectH || +it.unitHeight || 0, 0);
       const sectW = Math.max(+it.sectW || +it.unitWidth || 0, 0);
       let memberL = Math.max(+it.lengthMm || +it.l || 0, 0);
@@ -203,18 +205,22 @@ function renderContainer(idx) {
       shapeIt = {
         ...it,
         lengthMm: memberL || it.lengthMm,
-        widthMm: sectW || it.widthMm,
-        heightMm: sectH || it.heightMm,
-        unitHeight: sectH || it.unitHeight,
-        unitWidth: sectW || it.unitWidth,
+        widthMm: (isNest ? sectW : null) || it.widthMm,
+        heightMm: (isNest ? sectH : null) || it.heightMm,
+        unitHeight: (isNest ? sectH : null) || it.unitHeight,
+        unitWidth: (isNest ? sectW : null) || it.unitWidth,
         qty: Math.max(1, +it.qty || (it.nestPieces && it.nestPieces.length) || 1),
         nestPieces: it.nestPieces ? it.nestPieces.map(np => ({ ...np })) : null,
         nestingInfo: it.nestingInfo ? { ...it.nestingInfo } : null,
         nestMethod: it.nestMethod || null,
         nestingOffsetMm: it.nestingOffsetMm || it.nesting_offset || null,
         orientation_info: it.orientation_info ? { ...it.orientation_info } : null,
-        _keepGroupByBundle: true,
+        // Nests: skip re-ground (bundle already correct). Assemblies: yard flatten.
+        _keepGroupByBundle: isNest,
+        _yardStraighten: !isNest && !!(it._freezeGroupByPose || it.packYawOnly || it._yardStraighten),
+        _freezeGroupByPose: !!it._freezeGroupByPose,
         packPoseLock: true,
+        packYawOnly: true,
       };
     }
     const box = makeShape(shapeIt, color);
@@ -2273,14 +2279,15 @@ function yardSettlePackedMeshes(entries, cont) {
     // Re-seat XZ to packer lane; Y settled by gravity on real mesh AABB.
     c.mesh.position.x = (it.x || 0) * sc;
     c.mesh.position.z = (it.z || 0) * sc;
-    const asm = !!(it.isAssembly || it.groupKind === 'welded_assembly'
-      || (it.parts && it.parts.length > 1));
-    const keepNest = typeof packItemKeepGroupByPose === 'function'
+    const keepPose = typeof packItemKeepGroupByPose === 'function'
       ? packItemKeepGroupByPose(it)
       : (typeof packItemNeedsFlatAlign === 'function' && packItemNeedsFlatAlign(it));
-    // Assemblies only: cancel residual IFC pitch via footprint align.
-    // Nests: NEVER realign — Group-By nest pose must survive Optimise.
-    if (asm && !keepNest && typeof alignMeshToPackFootprint === 'function') {
+    const asm = !!(it.isAssembly || it.groupKind === 'welded_assembly'
+      || (it.parts && it.parts.length > 1));
+    // Freeze / nest / yaw-only: NEVER footprint-realign — that re-engineered Group By.
+    // Legacy only: unlocked assemblies may still align to pack seat.
+    if (asm && !keepPose && !it._freezeGroupByPose && !it.packYawOnly
+        && typeof alignMeshToPackFootprint === 'function') {
       alignMeshToPackFootprint(c.mesh, it);
       it._orientLocked = true;
       if (typeof THREE !== 'undefined')
@@ -2705,12 +2712,14 @@ function packOrientTagToRot(it) {
 }
 
 /**
- * Z / C / L nest + flange-brace packs.
- * Group-By already builds the correct nested rest-pose via makeShape/ensureStableShape.
- * Optimise must KEEP that pose — only packer YAW may change.
+ * Group By is source of truth at Optimise:
+ *  • Z/C/L nests + flange braces — keep nest bundle / nest roll
+ *  • Frozen assemblies — yaw only (face rebuilt via _yardStraighten in makeShape)
+ * Optimise must NOT Rx/Rz / footprint-realign these.
  */
 function packItemKeepGroupByPose(it) {
   if (!it) return false;
+  if (it._keepGroupByBundle || it._freezeGroupByPose) return true;
   const gk = String(it.groupKind || '').toLowerCase();
   const sk = String(it.shapeKey || it.profileShape || '').toLowerCase();
   if (/^nest_[zcl]$/.test(gk)) return true;
@@ -3000,17 +3009,24 @@ async function layoutPlaceSelected() {
   // STEP 8: pack units in #1→#n order (already weight-ranked)
   const packUnits = [];
   checkedGroups.forEach(g => {
-    // Nest Z/C/L: KEEP Group-By packUnits (exact nest bundle). Rebuilding at
-    // Optimise was dropping nest offsets / angle and redrawing upright stacks.
+    // KEEP Group-By packUnits (nests AND assemblies). Rebuilding at Optimise
+    // re-ran pitch_to_construct and destroyed the frozen yard seat.
     const nestGk = String(g.groupKind || '').toLowerCase();
     const nestSk = String(g.shapeKey || g.profileShape || '').toLowerCase();
     const isNestGroup = /^nest_[zcl]$/.test(nestGk)
       || nestSk === 'z_channel' || nestSk === 'c_channel' || nestSk === 'l_angle';
+    const isAsmGroup = nestGk === 'welded_assembly' || !!g.isAssembly
+      || !!(g.parts && g.parts.length >= 2);
+    const hasFrozenSb = !!(g.packUnits && g.packUnits.some(pu =>
+      pu && pu.stableBundleMm && pu.stableBundleMm.l > 0
+      && (pu._freezeGroupByPose
+        || /yard_straighten|measured|rest_pose|fm_sb/i.test(
+          String(pu.stableBundleMm.source || '')))));
     let pus;
-    if (isNestGroup && g.packUnits && g.packUnits.length) {
+    if ((isNestGroup || isAsmGroup || hasFrozenSb)
+        && g.packUnits && g.packUnits.length) {
       pus = g.packUnits;
     } else {
-      // Assemblies: rebuild so axis/span fixes apply
       pus = (typeof createPackUnits === 'function')
         ? createPackUnits(g)
         : (g.packUnits || []);
