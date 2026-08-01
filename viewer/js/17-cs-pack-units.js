@@ -49,12 +49,17 @@ function buildPackUnitsStep7(stageGroup) {
   if (!stageGroup) return [];
 
   const family = stageGroup.groupKind || 'loose_small';
-  const pieces = (stageGroup.memberPieces && stageGroup.memberPieces.length)
-    ? stageGroup.memberPieces.map(p => ({ ...p, qty: 1 }))
-    : (typeof expandToPieces === 'function'
-      ? expandToPieces(stageGroup.memberItems || (typeof itemsForStagingGroup === 'function'
-        ? itemsForStagingGroup(stageGroup, []) : []))
-      : []);
+  // Always expand qty (e.g. RF-1 qty=5 → 5 pieces) before pack-unit chunking
+  const rawPieces = (stageGroup.memberPieces && stageGroup.memberPieces.length)
+    ? stageGroup.memberPieces
+    : (stageGroup.memberItems || (typeof itemsForStagingGroup === 'function'
+      ? itemsForStagingGroup(stageGroup, []) : []));
+  const pieces = (typeof expandToPieces === 'function')
+    ? expandToPieces(rawPieces)
+    : rawPieces.flatMap(p => {
+      const n = Math.max(1, Number(p.qty) || 1);
+      return Array.from({ length: n }, (_, i) => ({ ...p, qty: 1, _pieceIdx: i }));
+    });
 
   if (!pieces.length) return [];
 
@@ -67,8 +72,30 @@ function buildPackUnitsStep7(stageGroup) {
 
   const method = cspuResolveMethod(stageGroup, pieces);
 
-  // Welded / per-mark: weight-split only (no cross-mark nest sets)
-  if (family === 'welded_assembly' || method === 'PER_MARK_STACK') {
+  /**
+   * Welded assemblies = ONE pack unit PER piece (shipping yard rule).
+   * Never pre-stack 5 rafters into one tall unit that exceeds container H —
+   * place #1, #2, … until floor/weight full; leftovers → next container.
+   */
+  if (family === 'welded_assembly') {
+    const units = pieces.map((p, i) =>
+      cspuMakePackUnit([p], stageGroup, i + 1, method || 'PER_MARK_STACK'));
+    try {
+      console.info(
+        `[Step7 pack-units] ${stageGroup.id || '?'} welded_assembly`
+        + ` → ${units.length} unit(s) (1 assembly each, shapes unchanged)`
+      );
+    } catch (_) { /* */ }
+    return units;
+  }
+
+  // Per-mark: assemblies still 1-each; loose plates/etc. weight-split
+  if (method === 'PER_MARK_STACK') {
+    const allAsm = pieces.every(p =>
+      !!(p.isAssembly || (p.parts && p.parts.length >= 2)));
+    if (allAsm) {
+      return pieces.map((p, i) => cspuMakePackUnit([p], stageGroup, i + 1, method));
+    }
     const chunks = cspuSplitByWeight(pieces, family, method);
     return chunks.map((c, i) => cspuMakePackUnit(c, stageGroup, i + 1, method));
   }
@@ -327,6 +354,23 @@ function cspuBundleBBox(pieces, nestInfo, method, stageGroup) {
     } catch (_) { /* fall through */ }
   }
 
+  // Welded / assembly: envelope of ONE piece (pack units are 1-each)
+  if (stageGroup.groupKind === 'welded_assembly' || pieces[0]?.isAssembly) {
+    const p0 = pieces[0] || {};
+    const aL = Math.max(L, p0.lengthMm || 0, 1);
+    const aW = Math.max(
+      Number(p0.widthMm) || 0,
+      Number(p0.sectW) || 0,
+      Number(stageGroup.virtualWmm) || 0,
+      W, 1);
+    const aH = Math.max(
+      Number(p0.heightMm) || 0,
+      Number(p0.sectH) || 0,
+      Number(stageGroup.virtualHmm) || 0,
+      H, 1);
+    return cspuWithSkid({ l: aL, w: aW, h: aH, source: 'assembly_single' });
+  }
+
   if (typeof computeNestBundleBounds === 'function' && nestInfo) {
     try {
       const b = computeNestBundleBounds(n, nestInfo, {
@@ -402,6 +446,11 @@ function cspuMakePackUnit(pieces, stageGroup, idx, method) {
   const stability_score = (stability && stability.score != null)
     ? stability.score
     : (orient && orient.score != null ? orient.score : null);
+  // Rule1 Stage A/B → packer Stage C (orientation continuity)
+  const rule1_orientation = stageGroup.rule1_orientation
+    || first.rule1_orientation
+    || (stability && stability.rule1_orientation)
+    || null;
 
   const flip_pattern = cspuFlipPattern(ordered.length, alternate);
   const nesting_offset = nestingInfo?.nesting_offset > 0
@@ -477,6 +526,9 @@ function cspuMakePackUnit(pieces, stageGroup, idx, method) {
     orientation_info: orient,
     stability_score,
     stabilityInfo: stability || undefined,
+    rule1_orientation: rule1_orientation || undefined,
+    two_point_base: !!(rule1_orientation && rule1_orientation.two_point_base)
+      || (typeof needsZStyleGroundFix === 'function' && needsZStyleGroundFix(first)),
     // Taper stations (metadata) for Step8 heightmap — never morphs geometry
     taperProfile: stageGroup.taperProfile || first.taperProfile || null,
     // Mixed-length placement policy (POSITION later — shapes unchanged)

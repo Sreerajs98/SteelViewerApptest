@@ -10,7 +10,10 @@
  * Shipping policy (Pass 1 + Pass 2):
  *   RULE #1 FLOOR ANCHOR (Pass1 foundation — CoG down):
  *     Hierarchical Weight-Down: assemblies/portal → heavy beams → loose
- *     Bearing ≥80% · Yaw 0°/180° only · MinY = floor or skid · no tip
+ *     Pre-orient from Stage A/B (15a/11b) is PRIMARY — packer does NOT
+ *     re-roll faces when Rule1 already found a gravity-stable pose.
+ *     Planar bearing ≥80% · OR two-point rails for OPEN+concave (Z)
+ *     MinY = floor or skid · no tip
  *   Pass2 COMPACT+FILL: lock yaw, slide toward back/gaps, residual fill
  *
  * Heightmap 100mm; AABB; CoG soft 10% / hard 15%
@@ -18,15 +21,19 @@
 
 const CS8_CELL_MM = 100;
 const CS8_SUPPORT_MIN = 0.40;           // Pass2 / upper loose
-const CS8_FLOOR_ANCHOR_SUPPORT = 0.80;  // Rule #1 bearing
+const CS8_FLOOR_ANCHOR_SUPPORT = 0.80;  // Rule #1 planar bearing
+/** Two contact rails (tip+joint) — each edge strip must be ≥ this. */
+const CS8_TWO_POINT_EDGE_MIN = 0.70;
 const CS8_OVERHANG_MAX = 0.30;
 const CS8_EPS = 0.5;
 /** Soft target: keep CoG within 10% of geometric centre (matches UI). */
 const CS8_COG_SOFT = 0.10;
 /** Hard reject when a same-shelf candidate stays inside soft band. */
 const CS8_COG_HARD = 0.15;
-/** Max air gap under true base (mm) before counting as hanging. */
+/** Max air gap under planar base (mm). */
 const CS8_MAX_BASE_GAP_MM = 80;
+/** Tighter air gap for two-point OPEN bases (mm) — no floating on air. */
+const CS8_MAX_BASE_GAP_TWOPT_MM = 35;
 
 function cs8SupportMin() {
   return (typeof cfgSupport === 'function') ? cfgSupport('min_frac', CS8_SUPPORT_MIN) : CS8_SUPPORT_MIN;
@@ -116,6 +123,73 @@ function cs8BundleGap() {
 }
 function cs8Dunnage() {
   return (typeof cfgClearance === 'function') ? cfgClearance('dunnage_mm', 75) : 75;
+}
+
+/**
+ * Build X/Z scan axes for a footprint.
+ * - Narrow items (foot < 30% of container axis) → 100mm step (not 200)
+ * - Seed exact adjacent slots beside/after every placed box (yard snug-fit)
+ */
+function cs8BuildScanAxes(c, fl, fw, Lmax, Wmax, gL, gW, bundleGap) {
+  const xMax0 = Lmax - gL - fl;
+  const zMax0 = Wmax - gW - fw;
+  const gap = bundleGap != null ? bundleGap : cs8BundleGap();
+
+  // Narrow / short footprints need finer grid so 300mm rafters don't miss Z=350
+  const stepXm = (fl < Lmax * 0.3)
+    ? CS8_CELL_MM
+    : Math.max(CS8_CELL_MM, Math.min(fl, CS8_CELL_MM * 2));
+  const stepZm = (fw < Wmax * 0.3)
+    ? CS8_CELL_MM
+    : Math.max(CS8_CELL_MM, Math.min(fw, CS8_CELL_MM * 2));
+
+  const xs = [];
+  const zs = [];
+  if (xMax0 >= gL - CS8_EPS) {
+    for (let x = gL; x <= xMax0 + CS8_EPS; x += stepXm) xs.push(x);
+    if (!xs.length || Math.abs(xs[xs.length - 1] - xMax0) > CS8_EPS) xs.push(xMax0);
+  }
+  if (zMax0 >= gW - CS8_EPS) {
+    for (let z = gW; z <= zMax0 + CS8_EPS; z += stepZm) zs.push(z);
+    if (!zs.length || Math.abs(zs[zs.length - 1] - zMax0) > CS8_EPS) zs.push(zMax0);
+  }
+
+  // Exact adjacent seeds from already-placed cargo (worker: "next to #1")
+  const boxes = (c && c.boxes) || [];
+  for (let i = 0; i < boxes.length; i++) {
+    const b = boxes[i];
+    if (!b) continue;
+    const xAfter = b.maxX + gap;
+    const xBefore = b.minX - fl - gap;
+    const zAfter = b.maxZ + gap;
+    const zBefore = b.minZ - fw - gap;
+    if (xAfter >= gL - CS8_EPS && xAfter <= xMax0 + CS8_EPS) xs.push(xAfter);
+    if (xBefore >= gL - CS8_EPS && xBefore <= xMax0 + CS8_EPS) xs.push(xBefore);
+    if (zAfter >= gW - CS8_EPS && zAfter <= zMax0 + CS8_EPS) zs.push(zAfter);
+    if (zBefore >= gW - CS8_EPS && zBefore <= zMax0 + CS8_EPS) zs.push(zBefore);
+  }
+
+  const uniqSort = (arr) => {
+    const seen = new Set();
+    const out = [];
+    for (let i = 0; i < arr.length; i++) {
+      const v = Math.round(arr[i]);
+      if (seen.has(v)) continue;
+      seen.add(v);
+      out.push(v);
+    }
+    out.sort((a, b) => a - b);
+    return out;
+  };
+
+  return {
+    xs: uniqSort(xs),
+    zs: uniqSort(zs),
+    stepXm,
+    stepZm,
+    xMax0,
+    zMax0,
+  };
 }
 
 /** Welded / multi-part assembly = container BASE cargo. */
@@ -544,6 +618,10 @@ function cs8UnitFromPackUnit(pu) {
     nestMethod: pu.nestMethod || { method: pu.nest_method },
     orientation_info: pu.orientation_info || pu.orientation,
     stabilityInfo: pu.stabilityInfo,
+    rule1_orientation: pu.rule1_orientation || (pu.stabilityInfo && pu.stabilityInfo.rule1_orientation) || null,
+    two_point_base: !!(pu.two_point_base
+      || (pu.rule1_orientation && pu.rule1_orientation.two_point_base)
+      || (pu.stabilityInfo && pu.stabilityInfo.two_point_base)),
     taperProfile: pu.taperProfile || null,
     groupKind: pu.groupKind || null,
     isAssembly: !!pu.isAssembly,
@@ -800,6 +878,70 @@ function cs8StableBaseOrients(u, Lmax, Wmax, Hmax) {
   return list;
 }
 
+/** OPEN+concave (Z-style): two contact rails, not planar 80% bearing. */
+function cs8NeedsTwoPointBase(u) {
+  if (!u) return false;
+  if (u.two_point_base || (u.rule1_orientation && u.rule1_orientation.two_point_base))
+    return true;
+  if (u.stabilityInfo && u.stabilityInfo.two_point_base) return true;
+  if (typeof needsZStyleGroundFix === 'function') {
+    try { return !!needsZStyleGroundFix(u); } catch (_) { /* */ }
+  }
+  return false;
+}
+
+/**
+ * Rule1 Stage A/B → packer primary orients.
+ * Rest-pose already baked in makeShape; only Y-yaw 0°/180° for door facing.
+ * Does NOT re-roll Rx/Rz (that would undo N-position / warehouse face).
+ */
+function cs8Rule1PrimaryOrients(u, Lmax, Wmax, Hmax) {
+  const r1 = u && (u.rule1_orientation
+    || (u.stabilityInfo && u.stabilityInfo.rule1_orientation));
+  if (!r1 || r1.ground_stable === false) return [];
+  const L = Math.max(+u.l || 1, 1);
+  const W = Math.max(+u.w || 1, 1);
+  const H = Math.max(+u.h || 1, 1);
+  if (L > Lmax + CS8_EPS || W > Wmax + CS8_EPS || H > Hmax + CS8_EPS) return [];
+  const twoPt = !!(r1.two_point_base || cs8NeedsTwoPointBase(u));
+  const base = L * W;
+  const mk = (yaw, tag) => ({
+    l: L, w: W, h: H,
+    rot: { x: 0, y: yaw, z: 0 },
+    tag,
+    shipPreferred: true,
+    floorAnchor: true,
+    packYawOnly: true,
+    packComposeRot: false,
+    baseArea: base,
+    tipRatio: H / Math.max(Math.min(L, W), 1),
+    // Huge boost so Rule1 beats any fallback face-roll
+    stabilityScore: base * 1e6 - (tag === 'rule1_yaw180' ? 1 : 0),
+    rule1Primary: true,
+    two_point_base: twoPt,
+  });
+  return [mk(0, 'rule1_yaw0'), mk(Math.PI, 'rule1_yaw180')];
+}
+
+/**
+ * Orient list for placement:
+ *   1) Rule1 primary (gravity pose) if present + fits
+ *   2) Else / fallback: cs8StableBaseOrients or yaw orients
+ * When `preferRule1Only`, return primary alone (caller retries fallback if empty).
+ */
+function cs8ResolveTryOrients(u, Lmax, Wmax, Hmax, floorAnchor, preferRule1Only) {
+  const primary = cs8Rule1PrimaryOrients(u, Lmax, Wmax, Hmax);
+  if (primary.length && preferRule1Only !== false) {
+    return { primary, fallback: floorAnchor
+      ? cs8StableBaseOrients(u, Lmax, Wmax, Hmax)
+      : cs8YawOrients(u, Lmax, Wmax, Hmax) };
+  }
+  const fallback = floorAnchor
+    ? cs8StableBaseOrients(u, Lmax, Wmax, Hmax)
+    : cs8YawOrients(u, Lmax, Wmax, Hmax);
+  return { primary: [], fallback };
+}
+
 /**
  * Pass2 / non-anchor fill: prefer longitudinal; 90° for short loose pieces.
  * Floor-anchor callers use cs8StableBaseOrients instead.
@@ -1009,7 +1151,7 @@ function cs8AabbCollide(a, b) {
 
 /**
  * Support under TRUE contact mask (station width for tapers).
- * Rejects hanging: air gap under base > CS8_MAX_BASE_GAP_MM on too much of mask.
+ * Also measures left/right Z-edge strips for two-point (tip+joint) OPEN bases.
  */
 function cs8EvalFootprint(c, x, z, fl, fw, u, o) {
   const info = cs8BuildStations(u, o || { l: fl, w: fw, h: u.h, rot: { y: 0 } });
@@ -1019,10 +1161,14 @@ function cs8EvalFootprint(c, x, z, fl, fw, u, o) {
   const iz1 = Math.min(c.nz - 1, Math.ceil((z + fw) / CS8_CELL_MM) - 1);
   if (ix1 < ix0 || iz1 < iz0) return null;
 
+  const twoPt = !!(o && o.two_point_base) || cs8NeedsTwoPointBase(u);
+  const gapLim = Math.max(twoPt ? CS8_MAX_BASE_GAP_TWOPT_MM : CS8_MAX_BASE_GAP_MM, CS8_EPS);
+
   let supportY = 0;
   let cells = 0;
   let minY = Infinity;
   const samples = [];
+  let leftCells = 0, leftSupp = 0, rightCells = 0, rightSupp = 0;
 
   for (let iz = iz0; iz <= iz1; iz++) {
     for (let ix = ix0; ix <= ix1; ix++) {
@@ -1031,7 +1177,7 @@ function cs8EvalFootprint(c, x, z, fl, fw, u, o) {
       const hit = cs8CellInStationMask(info, x, z, fl, fw, cellCx, cellCz);
       if (!hit.ok) continue;
       const y = c.hm[iz * c.nx + ix];
-      samples.push(y);
+      samples.push({ y, cellCz });
       if (y > supportY) supportY = y;
       if (y < minY) minY = y;
       cells++;
@@ -1042,22 +1188,51 @@ function cs8EvalFootprint(c, x, z, fl, fw, u, o) {
   let supportCells = 0;
   let lowCells = 0;
   let hangCells = 0;
-  const gapLim = Math.max(CS8_MAX_BASE_GAP_MM, CS8_EPS);
   for (let i = 0; i < samples.length; i++) {
-    const y = samples[i];
-    if (Math.abs(y - supportY) <= CS8_EPS) supportCells++;
+    const y = samples[i].y;
+    const t = fw > 1e-6 ? (samples[i].cellCz - z) / fw : 0.5;
+    const onSupport = Math.abs(y - supportY) <= CS8_EPS;
+    if (onSupport) supportCells++;
     if (y < supportY - CS8_EPS) lowCells++;
     if (supportY - y > gapLim) hangCells++;
+    // Edge rails ≈ tip / joint contact lines along length
+    if (t <= 0.22) {
+      leftCells++;
+      if (onSupport || (supportY - y) <= gapLim) leftSupp++;
+    }
+    if (t >= 0.78) {
+      rightCells++;
+      if (onSupport || (supportY - y) <= gapLim) rightSupp++;
+    }
   }
   const supportFrac = supportCells / cells;
   const overhangFrac = lowCells / cells;
   const hangFrac = hangCells / cells;
-  // Flat base on sloped roof: >30% hanging air → reject (taper / uneven stack)
+  const leftFrac = leftCells > 0 ? leftSupp / leftCells : 0;
+  const rightFrac = rightCells > 0 ? rightSupp / rightCells : 0;
+  const edgeSupportMin = Math.min(leftFrac, rightFrac);
+  const twoPointOk = leftCells > 0 && rightCells > 0
+    && edgeSupportMin + 1e-9 >= CS8_TWO_POINT_EDGE_MIN
+    && hangFrac <= cs8OverhangMax() + 1e-9;
+
+  // Flat base on sloped roof: >30% hanging air → reject
   if (hangFrac > cs8OverhangMax() + 1e-9) {
     return null;
   }
 
-  return { supportY, supportFrac, overhangFrac, hangFrac, ix0, ix1, iz0, iz1, tapered: info.tapered };
+  return {
+    supportY, supportFrac, overhangFrac, hangFrac,
+    leftFrac, rightFrac, edgeSupportMin, twoPointOk,
+    ix0, ix1, iz0, iz1, tapered: info.tapered,
+  };
+}
+
+/** Support gate: planar 80% OR two-point rails for OPEN+concave. */
+function cs8SupportAccepted(ev, u, o, supportMin, floorAnchor) {
+  if (!ev) return false;
+  const twoPt = !!(o && o.two_point_base) || (floorAnchor && cs8NeedsTwoPointBase(u));
+  if (twoPt) return !!ev.twoPointOk;
+  return ev.supportFrac + 1e-9 >= supportMin;
 }
 
 function cs8YawTagFromRad(y) {
@@ -1074,10 +1249,16 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
   const floorAnchor = !!po.floorAnchor;
   const log = Array.isArray(po.trialLog) ? po.trialLog : null;
   const mark = u.mark || (u.marks && u.marks[0]) || '?';
-  // Floor Anchor: try ALL stable-base directions (yaw + face rolls), best base first
-  let tryOrients = floorAnchor
-    ? cs8StableBaseOrients(u, Lmax, Wmax, Hmax)
-    : cs8YawOrients(u, Lmax, Wmax, Hmax);
+
+  // Rule1 continuity: Stage A/B gravity pose PRIMARY; face-roll only as fallback
+  const resolved = cs8ResolveTryOrients(u, Lmax, Wmax, Hmax, floorAnchor, true);
+  let tryOrients;
+  if (resolved.primary.length) {
+    const fb = (resolved.fallback || []).filter(o => !o.rule1Primary);
+    tryOrients = resolved.primary.concat(fb);
+  } else {
+    tryOrients = (resolved.fallback || []).slice();
+  }
 
   // Pass2 / base lock: keep Pass1 footprint + rotation (no re-roll)
   if (po.lockedOrient && po.lockedOrient.l > 0) {
@@ -1137,20 +1318,21 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
     const gaps = cs8EffectiveWallGaps(fl, fw, Lmax, Wmax);
     const gL = gaps.gL;
     const gW = gaps.gW;
-    const stepXm = Math.max(CS8_CELL_MM, Math.min(fl, CS8_CELL_MM * 2));
-    const stepZm = Math.max(CS8_CELL_MM, Math.min(fw, CS8_CELL_MM * 2));
-    const xMax0 = Lmax - gL - fl;
-    const zMax0 = Wmax - gW - fw;
+    const gap = bundleGap != null ? bundleGap : cs8BundleGap();
+    const scan = cs8BuildScanAxes(c, fl, fw, Lmax, Wmax, gL, gW, gap);
+    const xMax0 = scan.xMax0;
+    const zMax0 = scan.zMax0;
     if (xMax0 < gL - CS8_EPS || zMax0 < gW - CS8_EPS) {
       if (log) log.push({ type: 'orient_fail', mark, tag: o.tag, reason: 'envelope' });
       continue;
     }
 
-    const xs = [], zs = [];
-    for (let x = gL; x <= xMax0 + CS8_EPS; x += stepXm) xs.push(x);
-    for (let z = gW; z <= zMax0 + CS8_EPS; z += stepZm) zs.push(z);
-    if (!xs.length || Math.abs(xs[xs.length - 1] - xMax0) > CS8_EPS) xs.push(xMax0);
-    if (!zs.length || Math.abs(zs[zs.length - 1] - zMax0) > CS8_EPS) zs.push(zMax0);
+    const xs = scan.xs;
+    const zs = scan.zs;
+    if (!xs.length || !zs.length) {
+      if (log) log.push({ type: 'orient_fail', mark, tag: o.tag, reason: 'no_scan_axis' });
+      continue;
+    }
 
     // Sample corners + mid for live anim (full search still runs)
     const sampleXs = [xs[0], xs[Math.floor(xs.length / 2)], xs[xs.length - 1]]
@@ -1178,12 +1360,16 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
           }
           continue;
         }
-        if (ev.supportFrac + 1e-9 < supportMin) {
+        if (!cs8SupportAccepted(ev, u, o, supportMin, floorAnchor)) {
           if (log && isSample && slotsLogged < 5) {
+            const twoPt = !!(o.two_point_base) || cs8NeedsTwoPointBase(u);
             log.push({
               type: 'slot', mark, tag: o.tag, x, z, ok: false,
-              reason: `bearing ${Math.round(ev.supportFrac * 100)}%`,
+              reason: twoPt
+                ? `two-point edge ${Math.round((ev.edgeSupportMin || 0) * 100)}%`
+                : `bearing ${Math.round(ev.supportFrac * 100)}%`,
               supportFrac: ev.supportFrac,
+              edgeSupportMin: ev.edgeSupportMin,
               rot: o.rot, l: fl, w: fw, h: fh,
               packYawOnly: !!o.packYawOnly, packComposeRot: !!o.packComposeRot,
             });
@@ -1290,12 +1476,16 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
     }
   }
 
-  // Select: lowest Y → most stable base → ship-preferred → CoG → X/Z
+  // If Rule1 gravity pose found ANY valid seat — never override with face-roll
+  const rule1Pool = pool.filter(p => p.o && p.o.rule1Primary);
+  if (rule1Pool.length) pool = rule1Pool;
+
+  // Select: lowest Y → Rule1 → most stable base → ship-preferred → CoG → X/Z
   let best = null;
   for (const p of pool) {
     const stabCost = -((p.o && p.o.stabilityScore) || (p.fl * p.fw) || 0);
     const yawCost = (p.o && p.o.shipPreferred === false) ? 1e8 : 0;
-    const yaw180Cost = (p.o && p.o.tag === 'yaw180') ? 1e5 : 0;
+    const yaw180Cost = (p.o && (p.o.tag === 'yaw180' || p.o.tag === 'rule1_yaw180')) ? 1e5 : 0;
     const score = p.y0 * 1e12 + stabCost * 1e0 + yawCost + yaw180Cost
       + p.cog.penalty * 1e9 + p.x * 1e3 + p.z;
     if (!best || score < best.score) best = { score, ...p };

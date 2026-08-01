@@ -531,6 +531,223 @@
     geo.dispose();
   });
 
+  t('W.14a', 'Rule1 primary orients beat face-roll when ground_stable', () => {
+    if (typeof cs8Rule1PrimaryOrients !== 'function'
+        || typeof cs8ResolveTryOrients !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const u = {
+      l: 8000, w: 200, h: 75, weight: 40,
+      rule1_orientation: {
+        ground_stable: true,
+        packYawOnly: true,
+        two_point_base: true,
+        rot: { x: 0.4, y: 0, z: 0 },
+      },
+      two_point_base: true,
+    };
+    const prim = cs8Rule1PrimaryOrients(u, 12000, 2350, 2690);
+    assert(prim.length === 2, `n=${prim.length}`);
+    assert(prim.every(o => o.rule1Primary && o.packYawOnly), 'yaw-only primary');
+    assert(!prim.some(o => /Rx|Rz/i.test(o.tag)), 'no face-roll in primary');
+    const res = cs8ResolveTryOrients(u, 12000, 2350, 2690, true, true);
+    assert(res.primary.length === 2, 'resolve primary');
+    assert(res.fallback.length > 0, 'fallback available');
+  });
+
+  t('W.14b', 'Two-point support gate for OPEN bases', () => {
+    if (typeof cs8NeedsTwoPointBase !== 'function'
+        || typeof cs8SupportAccepted !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const u = { two_point_base: true, rule1_orientation: { two_point_base: true } };
+    assert(cs8NeedsTwoPointBase(u), 'needs two-pt');
+    const ok = {
+      supportFrac: 0.1, twoPointOk: true, edgeSupportMin: 0.8, hangFrac: 0.1,
+    };
+    const bad = {
+      supportFrac: 0.9, twoPointOk: false, edgeSupportMin: 0.2, hangFrac: 0.1,
+    };
+    assert(cs8SupportAccepted(ok, u, { two_point_base: true }, 0.8, true), 'two-pt ok');
+    assert(!cs8SupportAccepted(bad, u, { two_point_base: true }, 0.8, true), 'two-pt reject');
+    // Planar beam: uses 80% even if twoPointOk false
+    const beam = { two_point_base: false };
+    assert(cs8SupportAccepted(
+      { supportFrac: 0.85, twoPointOk: false }, beam, {}, 0.8, true), 'planar ok');
+  });
+
+  t('W.15', 'Welded assemblies → 1 pack unit each (not pre-stacked tall)', () => {
+    if (typeof createPackUnits !== 'function' && typeof buildPackUnitsStep7 !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const mk = () => ({
+      mark: 'RF001',
+      qty: 1,
+      unitWeightKg: 2800,
+      lengthMm: 11000,
+      widthMm: 350,
+      heightMm: 800,
+      isAssembly: true,
+      parts: [{ name: 'web' }, { name: 'flange' }],
+      sectH: 800, sectW: 350, sectT: 12,
+    });
+    const fn = typeof buildPackUnitsStep7 === 'function' ? buildPackUnitsStep7 : createPackUnits;
+    const g5 = {
+      id: 'G-RF',
+      groupKind: 'welded_assembly',
+      mark: 'RF001',
+      nestMethod: { method: 'PER_MARK_STACK' },
+      memberPieces: [mk(), mk(), mk(), mk(), mk()],
+      sectH: 800, sectW: 350, sectT: 12,
+      lengthMm: 11000,
+    };
+    const units = fn(g5);
+    assert(units.length === 5, `units=${units.length} (want 5, one per rafter)`);
+    units.forEach((pu, i) => {
+      assert((pu.qty || 1) === 1, `unit[${i}].qty=${pu.qty}`);
+      const h = (pu.bundle_bbox && pu.bundle_bbox.h) || pu.heightMm || 0;
+      // Single rafter + skid — must fit typical 40ft H (~2690), not 5× stack
+      assert(h < 2000, `unit[${i}] h=${h} (must not be 5-high stack)`);
+    });
+    // qty=5 on one row must also expand to 5 units
+    const gQty = {
+      id: 'G-RF-Q',
+      groupKind: 'welded_assembly',
+      nestMethod: { method: 'PER_MARK_STACK' },
+      memberPieces: [{ ...mk(), qty: 5 }],
+      sectH: 800, sectW: 350, lengthMm: 11000,
+    };
+    assert(fn(gQty).length === 5, `qty-expand units=${fn(gQty).length}`);
+  });
+
+  t('W.15b', 'Pack smoke: 3 identical assemblies → place more than one', () => {
+    if (typeof layoutContainerPackStep8 !== 'function'
+        || typeof buildPackUnitsStep7 !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const mk = () => ({
+      mark: 'CL1', qty: 1, unitWeightKg: 900,
+      lengthMm: 9000, widthMm: 280, heightMm: 450,
+      isAssembly: true, parts: [{}, {}],
+      sectH: 450, sectW: 280, sectT: 10,
+      groupKind: 'welded_assembly',
+    });
+    const g = {
+      id: 'G-CL', groupKind: 'welded_assembly',
+      nestMethod: { method: 'PER_MARK_STACK' },
+      memberPieces: [mk(), mk(), mk()],
+      sectH: 450, sectW: 280, lengthMm: 9000,
+    };
+    const packUnits = buildPackUnitsStep7(g);
+    assert(packUnits.length === 3, `pu=${packUnits.length}`);
+    const spec = { lengthMm: 12000, widthMm: 2350, heightMm: 2690, maxWeightKg: 26000 };
+    const res = layoutContainerPackStep8([], spec, null, {
+      packUnits, maxContainers: 1, pass2: true, markOrder: null,
+    });
+    const placed = (res.containers[0] && res.containers[0].items) || [];
+    assert(placed.length >= 2, `placed=${placed.length} (want ≥2 of 3)`);
+  });
+
+  t('W.17', 'Pack numbers: selected groups → #1 heaviest (not click order)', () => {
+    if (typeof renumberCheckOrderByWeight !== 'function'
+        || typeof groupSortWeightKg !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const fake = [
+      { id: 'A', checked: true, checkOrder: 1, weightKg: 100, groupKind: 'loose_small' },
+      { id: 'B', checked: true, checkOrder: 2, weightKg: 5000, groupKind: 'welded_assembly', isAssembly: true },
+      { id: 'C', checked: true, checkOrder: 3, weightKg: 800, groupKind: 'bundle_beam' },
+      { id: 'D', checked: false, checkOrder: 99, weightKg: 9000, groupKind: 'welded_assembly' },
+    ];
+    renumberCheckOrderByWeight(fake);
+    assert(fake.find(x => x.id === 'B').checkOrder === 1, 'B heaviest → #1');
+    assert(fake.find(x => x.id === 'C').checkOrder === 2, 'C → #2');
+    assert(fake.find(x => x.id === 'A').checkOrder === 3, 'A lightest → #3');
+    assert(fake.find(x => x.id === 'D').checkOrder === 0, 'unchecked → 0');
+  });
+
+  t('W.16', 'Scan axes: fine step + adjacent seeds beside placed box', () => {
+    if (typeof cs8BuildScanAxes !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const Lmax = 12192, Wmax = 2438;
+    const fl = 12000, fw = 300;
+    const gL = 50, gW = 50;
+    const gap = 50;
+    // Empty: narrow Z → 100mm step (not 200)
+    const empty = cs8BuildScanAxes({ boxes: [] }, fl, fw, Lmax, Wmax, gL, gW, gap);
+    assert(empty.stepZm === 100, `stepZm=${empty.stepZm} (narrow → 100)`);
+    // One rafter at Z=50 → next seed exactly at maxZ+gap
+    const placed = {
+      boxes: [{
+        minX: 100, maxX: 100 + fl,
+        minY: 0, maxY: 800,
+        minZ: 50, maxZ: 50 + fw,
+      }],
+    };
+    const next = cs8BuildScanAxes(placed, fl, fw, Lmax, Wmax, gL, gW, gap);
+    const zAdj = 50 + fw + gap; // 400
+    assert(next.zs.indexOf(Math.round(zAdj)) >= 0,
+      `zs missing adjacent ${zAdj}; have ${next.zs.slice(0, 8).join(',')}`);
+  });
+
+  t('W.16b', 'Pack: 3 narrow assemblies snug side-by-side (adjacent Z)', () => {
+    if (typeof layoutContainerPackStep8 !== 'function'
+        || typeof buildPackUnitsStep7 !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const mk = () => ({
+      mark: 'RF-S', qty: 1, unitWeightKg: 800,
+      lengthMm: 11000, widthMm: 300, heightMm: 700,
+      isAssembly: true, parts: [{ name: 'a' }, { name: 'b' }],
+      sectH: 700, sectW: 300, sectT: 12,
+      groupKind: 'welded_assembly',
+      // Pin pack envelope — skip bogus measureStableBundleMm on stub parts
+      stableBundleMm: { l: 11000, w: 300, h: 700 },
+    });
+    const g = {
+      id: 'G-RF-S', groupKind: 'welded_assembly',
+      nestMethod: { method: 'PER_MARK_STACK' },
+      memberPieces: [mk(), mk(), mk()],
+      sectH: 700, sectW: 300, lengthMm: 11000,
+    };
+    const packUnits = buildPackUnitsStep7(g);
+    assert(packUnits.length === 3, `pu=${packUnits.length}`);
+    packUnits.forEach(pu => {
+      pu.stableBundleMm = { l: 11000, w: 300, h: 700 };
+      pu.bundle_bbox = {
+        l: 11000, w: 300, h: 800, hSteel: 700, skidMm: 100, source: 'test',
+      };
+      pu.widthMm = 300;
+      pu.heightMm = 800;
+    });
+    const spec = { lengthMm: 12192, widthMm: 2438, heightMm: 2591, maxWeightKg: 26000 };
+    const res = layoutContainerPackStep8([], spec, null, {
+      packUnits, maxContainers: 1, pass2: false, markOrder: null,
+    });
+    const placed = (res.containers[0] && res.containers[0].items) || [];
+    assert(placed.length === 3, `placed=${placed.length} (want all 3 side-by-side)`);
+    placed.forEach((it, i) => {
+      assert(cs8IsFloorOrSkidY(Number(it.y) - Number(it.packFootprintH || it.h || 0) / 2)
+        || (Number(it.y) || 0) < 500,
+        `item[${i}] not floor-ish y=${it.y}`);
+    });
+    // Packer Z from footprint centres (render z is container-centred)
+    const zC = placed.map(it => Number(it.z) || 0).sort((a, b) => a - b);
+    const minGap = 200; // ~300mm wide + bundle gap → centres ≥ ~320 apart
+    assert(zC[1] - zC[0] >= minGap,
+      `Z12 gap=${(zC[1] - zC[0]).toFixed(0)} z=${zC.map(v => v.toFixed(0)).join(',')}`);
+    assert(zC[2] - zC[1] >= minGap,
+      `Z23 gap=${(zC[2] - zC[1]).toFixed(0)} z=${zC.map(v => v.toFixed(0)).join(',')}`);
+  });
+
   t('W.12b', 'cstabIsWeldedAssembly detects multi-part', () => {
     if (typeof cstabIsWeldedAssembly !== 'function') {
       assert(true, 'skip');

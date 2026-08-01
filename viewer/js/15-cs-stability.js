@@ -727,6 +727,30 @@ function stabilizeNestBundle(group, it) {
       && Math.abs(ev.floor_y || 0) < 1e-3)
   );
 
+  const live = ev.z_nesting || ev.rule1?.live || null;
+  const twoPt = (typeof needsZStyleGroundFix === 'function')
+    ? !!needsZStyleGroundFix(it)
+    : false;
+  const applied = ev.applied_rotation || { x: 0, y: 0, z: 0 };
+  /** Packer-facing Rule1 payload — Stage A/B → Stage C (18-cs-container-pack). */
+  const rule1_orientation = {
+    ground_stable,
+    method: (ev.rule1 && ev.rule1.method) || (live ? 'live_rotate' : 'warehouse'),
+    rot: {
+      x: Number(applied.x) || Number(live?.applied_rad) || 0,
+      y: Number(applied.y) || 0,
+      z: Number(applied.z) || 0,
+    },
+    // Rest-pose already baked in makeShape; packer adds Y-yaw only
+    packYawOnly: true,
+    packComposeRot: false,
+    nesting_angle_rad: Number(ev.nesting_angle_rad) || Number(live?.applied_rad) || 0,
+    contact_a: live?.contact_a || null,
+    contact_b: live?.contact_b || null,
+    two_point_base: twoPt,
+    tip_ratio: ev.tip_ratio,
+  };
+
   const info = {
     stable: !!ev.stable,
     ground_stable,
@@ -741,11 +765,18 @@ function stabilizeNestBundle(group, it) {
     standing_on_end: !!ev.standing_on_end,
     thin_edge_sit: !!ev.thin_edge_sit,
     size: ev.size || null,
+    rule1: ev.rule1 || null,
+    rule1_orientation,
+    nesting_angle_rad: rule1_orientation.nesting_angle_rad,
+    z_nesting: live,
+    two_point_base: twoPt,
     auto: true,
     mutates_geometry: false,
   };
   if (it) {
     it.stabilityInfo = info;
+    it.rule1_orientation = rule1_orientation;
+    it._rule1GroundResult = ev.rule1 || it._rule1GroundResult || null;
     it.warehouseGround = ev.warehouse || null;
     if (ev.size && typeof SCALE === 'number' && SCALE > 0) {
       it.stableBundleMm = {
@@ -762,7 +793,11 @@ function stabilizeNestBundle(group, it) {
     try {
       if (it.stagingGroupId && typeof assemblyGroups !== 'undefined' && assemblyGroups) {
         const g = assemblyGroups.find(x => x.id === it.stagingGroupId);
-        if (g) g.stabilityInfo = info;
+        if (g) {
+          g.stabilityInfo = info;
+          g.rule1_orientation = rule1_orientation;
+          if (ev.rule1) g._rule1GroundResult = ev.rule1;
+        }
         if (!window._stabStagingDirty) {
           window._stabStagingDirty = true;
           requestAnimationFrame(() => {

@@ -2365,37 +2365,41 @@ async function layoutPlaceSelected() {
   // Capture any rotations the user applied while items were outside
   captureVisibleRotations();
 
-  // HEAVIEST assemblies first (not click Order) — try insert, skip → next
+  // FIRST: fix pack numbers — #1 heaviest, #2 next… then Optimise in that order
+  if (typeof renumberCheckOrderByWeight === 'function')
+    renumberCheckOrderByWeight();
+  else if (typeof renumberCheckOrder === 'function')
+    renumberCheckOrder();
+
   const checkedGroups = assemblyGroups
     .filter(g => g.checked && g.state !== 'oversized')
-    .slice();
-  if (typeof sortStagingGroupsByWeight === 'function')
+    .slice()
+    .sort((a, b) => (a.checkOrder || 9999) - (b.checkOrder || 9999));
+  // Safety: if numbers missing, fall back to weight sort
+  if (checkedGroups.some(g => !(g.checkOrder > 0))
+      && typeof sortStagingGroupsByWeight === 'function')
     sortStagingGroupsByWeight(checkedGroups);
-  else {
-    checkedGroups.sort((a, b) => {
-      const aA = a.groupKind === 'welded_assembly' ? 0 : 1;
-      const bA = b.groupKind === 'welded_assembly' ? 0 : 1;
-      if (aA !== bA) return aA - bA;
-      return (b.weightKg || 0) - (a.weightKg || 0);
-    });
-  }
 
-  const markOrder = new Map(); // unused by packer; kept for toast/debug only
+  const markOrder = new Map();
   checkedGroups.forEach((g, i) => {
     const marks = g.marks && g.marks.length ? g.marks : [g.mark];
     marks.forEach(m => {
       if (!m) return;
-      if (!markOrder.has(m)) markOrder.set(m, i + 1);
+      if (!markOrder.has(m)) markOrder.set(m, g.checkOrder || (i + 1));
     });
   });
   const checkedMarks = new Set(markOrder.keys());
 
   if (checkedMarks.size === 0) {
-    showToast('Select items first — click to number them 1, 2, 3… then Move to Container', 3200);
+    showToast('Select items first — numbered heaviest=#1, then Optimise', 3200);
     return;
   }
 
-  // Preserve click order in the item list fed to the packer
+  // Refresh list so UI shows #1… before pack runs
+  if (typeof renderStagingList === 'function') renderStagingList();
+  if (typeof updateSelectAllBox === 'function') updateSelectAllBox();
+
+  // Items / pack units follow weight numbers (#1 first)
   const selectedItems = [];
   const seenItem = new Set();
   checkedGroups.forEach(g => {
@@ -2424,28 +2428,47 @@ async function layoutPlaceSelected() {
     seededMarks.add(m);
   });
 
-  // STEP 8: pack units in group weight order (assy heaviest first)
+  // STEP 8: pack units in #1→#n order (already weight-ranked)
   const packUnits = [];
   checkedGroups.forEach(g => {
     const pus = g.packUnits || (typeof createPackUnits === 'function' ? createPackUnits(g) : []);
-    const gw = Math.max(0, Number(g.weightKg) || 0);
-    (pus || []).forEach(pu => {
+    const gw = Math.max(0, Number(g.sortWeightKg || g.weightKg) || 0);
+    const r1 = g.rule1_orientation
+      || (g.stabilityInfo && g.stabilityInfo.rule1_orientation)
+      || null;
+    // Within a group: heavier pack units first (single assemblies already 1-each)
+    const orderedPu = (pus || []).slice().sort((a, b) =>
+      (b.total_weight || b.weightKg || 0) - (a.total_weight || a.weightKg || 0));
+    orderedPu.forEach(pu => {
       if (!(pu.total_weight > 0) && !(pu.weightKg > 0) && gw > 0) {
         pu.total_weight = gw;
         pu.weightKg = gw;
       }
+      // Stage A/B → Stage C: carry Rule1 gravity pose into packer
+      if (r1 && !pu.rule1_orientation) pu.rule1_orientation = r1;
+      if (g.stabilityInfo && !pu.stabilityInfo) pu.stabilityInfo = g.stabilityInfo;
+      if (r1 && r1.two_point_base) pu.two_point_base = true;
       pu._groupWeightKg = gw;
       pu._groupKind = g.groupKind;
+      pu._checkOrder = g.checkOrder || 0;
       packUnits.push(pu);
     });
   });
+  // Keep UI number order; only break ties with packer tier/weight
   if (typeof cs8SortHeavyAnchor === 'function')
     cs8SortHeavyAnchor(packUnits, spec.lengthMm);
+  // Re-assert: among same tier, honour checkOrder (#1 before #2)
+  packUnits.sort((a, b) => {
+    const oa = a._checkOrder || 0;
+    const ob = b._checkOrder || 0;
+    if (oa > 0 && ob > 0 && oa !== ob) return oa - ob;
+    return 0; // leave cs8SortHeavyAnchor relative order
+  });
 
   try {
     const top = packUnits.slice(0, 5).map(pu =>
-      `${pu.mark || '?'}:${Math.round(pu.total_weight || pu.weightKg || 0)}kg`);
-    console.info('[Optimise try-order]', top.join(' → '), '… (skip if no fit)');
+      `#${pu._checkOrder || '?'}:${pu.mark || '?'}:${Math.round(pu.total_weight || pu.weightKg || 0)}kg`);
+    console.info('[Optimise try-order]', top.join(' → '), '… (#1=heaviest)');
   } catch (_) { /* */ }
 
   if (btn) {

@@ -115,13 +115,31 @@ function nextCheckOrder() {
   return max + 1;
 }
 
-/** Keep pack-order numbers contiguous after uncheck (1,2,3…). */
+/**
+ * Pack-order numbers = weight rank among SELECTED groups.
+ * #1 = heaviest, #2 = next, … (not click order).
+ * Optimise tries insert in this same order.
+ * @param {object[]} [groups] — defaults to staging assemblyGroups
+ */
+function renumberCheckOrderByWeight(groups) {
+  const list = groups || assemblyGroups;
+  const checked = list.filter(g => g.checked && g.state !== 'oversized');
+  checked.sort((a, b) => {
+    const dw = groupSortWeightKg(b) - groupSortWeightKg(a);
+    if (Math.abs(dw) > 1e-6) return dw;
+    const aA = (a.groupKind === 'welded_assembly' || a.isAssembly) ? 0 : 1;
+    const bA = (b.groupKind === 'welded_assembly' || b.isAssembly) ? 0 : 1;
+    if (aA !== bA) return aA - bA;
+    return (b.lengthMaxMm || 0) - (a.lengthMaxMm || 0);
+  });
+  checked.forEach((g, i) => { g.checkOrder = i + 1; });
+  list.forEach(g => { if (!g.checked) g.checkOrder = 0; });
+  return checked;
+}
+
+/** Alias — always weight-based contiguous 1…n */
 function renumberCheckOrder() {
-  const ordered = assemblyGroups
-    .filter(g => g.checked)
-    .sort((a, b) => (a.checkOrder || 0) - (b.checkOrder || 0));
-  ordered.forEach((g, i) => { g.checkOrder = i + 1; });
-  assemblyGroups.forEach(g => { if (!g.checked) g.checkOrder = 0; });
+  return renumberCheckOrderByWeight();
 }
 
 function toggleSelectAll(checked) {
@@ -140,12 +158,9 @@ function toggleSelectAll(checked) {
       showToast('Select all cleared — restored items before Group by Shape', 2800);
     }
   } else {
-    // Visible list order becomes pack order 1, 2, 3…
-    let n = 0;
-    filtered.forEach(g => {
-      g.checked = true;
-      g.checkOrder = ++n;
-    });
+    // Select all → number by weight (#1 heaviest)
+    filtered.forEach(g => { g.checked = true; });
+    renumberCheckOrderByWeight();
   }
   renderStagingList();
   updateStagingFooter();
@@ -295,8 +310,8 @@ function updateSelectAllBox() {
       hint.textContent = 'Group by Shape first';
     } else {
       hint.textContent = nChecked
-        ? `${nChecked} selected · pack order 1→${nChecked}`
-        : 'Click items to set pack order 1, 2, 3…';
+        ? `${nChecked} selected · #1=heaviest → #${nChecked}`
+        : 'Select items — numbered heaviest=#1, then #2…';
     }
   }
 }
@@ -357,7 +372,9 @@ function renderStagingList() {
         <span class="ag-order ${g.checked ? 'on' : ''}"
               style="opacity:${canPick ? '1' : '0.4'}"
               title="${canPick
-                ? (g.checked ? 'Pack order #' + orderNum + ' — click to deselect' : 'Click to select (next pack order)')
+                ? (g.checked
+                  ? 'Pack #' + orderNum + ' (weight rank) — click to deselect'
+                  : 'Click to select — numbers follow weight (#1 heaviest)')
                 : 'Step 4 first: Group by Shape (signature)'}"
               onclick="event.stopPropagation();toggleCheck('${g.id}')">${canPick ? (orderLabel || '☐') : '—'}</span>
         <div class="ag-cs-thumb">${iconHtml}</div>
@@ -755,17 +772,12 @@ function syncSidebarContainersFromLayout() {
 }
 
 function toggleCheck(id) {
-  if (!requireGrouped('pick items (1, 2, 3…)')) return;
+  if (!requireGrouped('pick items (heaviest=#1)')) return;
   const g = assemblyGroups.find(x => x.id === id);
   if (!g || g.state === 'oversized') return;
-  if (g.checked) {
-    g.checked = false;
-    g.checkOrder = 0;
-    renumberCheckOrder();
-  } else {
-    g.checked = true;
-    g.checkOrder = nextCheckOrder();
-  }
+  g.checked = !g.checked;
+  // Always re-rank selected by weight — #1 heaviest, not click order
+  renumberCheckOrderByWeight();
   renderStagingList();
   updateStagingFooter();
   const n = assemblyGroups.filter(x => x.checked).length;
