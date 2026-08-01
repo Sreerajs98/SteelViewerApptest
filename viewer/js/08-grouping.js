@@ -55,8 +55,14 @@ function resolveItemSection(it) {
     }
   }
   if (!shapeKey && typeof detectProfileShape === 'function') {
-    const det = detectProfileShape(it.profileDesc, it.assemblyName);
+    const det = detectProfileShape(it.profileDesc, it.assemblyName || it.mark);
     if (det && det.shape) shapeKey = det.shape;
+  }
+  // Flange/angle brace name → L even when profile text missing
+  if ((!shapeKey || shapeKey === 'plate' || shapeKey === 'rod' || shapeKey === 'unknown')
+      && typeof detectFromName === 'function') {
+    const detN = detectFromName(`${it.assemblyName || ''} ${it.mark || ''} ${it.profileDesc || ''}`);
+    if (detN && detN.shape === 'l_angle') shapeKey = 'l_angle';
   }
   if ((it.pathPointsMm && it.pathPointsMm.length >= 3)
       || (typeof isBentSagRodItem === 'function' && isBentSagRodItem(it))

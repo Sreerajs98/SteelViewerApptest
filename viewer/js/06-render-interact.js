@@ -203,30 +203,29 @@ function renderContainer(idx) {
     pieceCount += it.qty;
   });
 
-  // Gravity / clamp ONLY for unlocked items (user-dragged / legacy).
-  // Step8 packPoseLock + restore exactPoseLock keep the pose the packer/user set.
+  // Yard settle: ALL inside cargo (incl. packPoseLock) — heavy→floor, no float,
+  // no mesh AABB dig-in. Packer seats are a hint; real steel must sit & clear.
   const inside = clickable.filter(c => !c.outsideContainer);
-  const unlocked = inside.filter(c =>
-    !c.item?.packPoseLock && !c.item?.exactPoseLock);
-  if (unlocked.length) {
-    restackWithGravity(unlocked);
-    resolveAabbOverlaps(unlocked);
-    restackWithGravity(unlocked);
-    resolveAabbOverlaps(unlocked);
-    restackWithGravity(unlocked);
-    clampMeshesInsideContainer(unlocked.map(c => c.mesh), cont);
-    clampMeshesInsideContainer(unlocked.map(c => c.mesh), cont);
+  if (inside.length && typeof yardSettlePackedMeshes === 'function') {
+    yardSettlePackedMeshes(inside, cont);
+  } else if (inside.length) {
+    const unlocked = inside.filter(c =>
+      !c.item?.packPoseLock && !c.item?.exactPoseLock);
+    if (unlocked.length) {
+      restackWithGravity(unlocked);
+      resolveAabbOverlaps(unlocked);
+      restackWithGravity(unlocked);
+    }
+    inside.forEach(c => {
+      if (!c.item?.packPoseLock || !c.mesh) return;
+      c.mesh.position.set(
+        (c.item.x || 0) * SCALE,
+        (c.item.y || 0) * SCALE,
+        (c.item.z || 0) * SCALE
+      );
+      snapMeshToPackerFootY(c.mesh, c.item);
+    });
   }
-  // Locked packed items: keep packer X/Z + existing rot; foot-snap Y (no float)
-  inside.forEach(c => {
-    if (!c.item?.packPoseLock || !c.mesh) return;
-    c.mesh.position.set(
-      (c.item.x || 0) * SCALE,
-      (c.item.y || 0) * SCALE,
-      (c.item.z || 0) * SCALE
-    );
-    snapMeshToPackerFootY(c.mesh, c.item);
-  });
 
   if (idx === 0 && currentLayout.oversized && currentLayout.oversized.length) {
     // Items outside container — render with REAL shapes (makeShape), not plain boxes.
@@ -1268,8 +1267,11 @@ function restackWithGravity(entries) {
     const box = new THREE.Box3().setFromObject(e.mesh);
     return { e, box };
   });
-  // Flatten to floor first, then stack in order of XZ footprint area (stable base first)
+  // Heavy first (shipping rule), then largest XZ footprint as stable base
   infos.sort((a, b) => {
+    const wa = yardItemWeightKg(a.e.item);
+    const wb = yardItemWeightKg(b.e.item);
+    if (Math.abs(wb - wa) > 1) return wb - wa;
     const aa = (a.box.max.x - a.box.min.x) * (a.box.max.z - a.box.min.z);
     const bb = (b.box.max.x - b.box.min.x) * (b.box.max.z - b.box.min.z);
     return bb - aa;
@@ -1338,7 +1340,8 @@ function resolveAabbOverlaps(entries) {
   if (!entries || entries.length < 2) return;
   // Tiny eps: separate dig-in only; final pose is flush (touch), not gapped
   const eps = 1e-4;
-  for (let pass = 0; pass < 8; pass++) {
+  const floorBand = 0.55; // metres — both near floor → prefer XZ, not Y float
+  for (let pass = 0; pass < 16; pass++) {
     let moved = false;
     const boxes = entries.map(e => {
       e.mesh.updateMatrixWorld(true);
@@ -1353,46 +1356,46 @@ function resolveAabbOverlaps(entries) {
         const oz = Math.min(a.max.z, b.max.z) - Math.max(a.min.z, b.min.z);
         if (ox <= eps || oy <= eps || oz <= eps) continue;
 
+        const bothFloor = a.min.y < floorBand && b.min.y < floorBand;
         let axis = 'y', pen = oy;
         if (ox < pen) { axis = 'x'; pen = ox; }
         if (oz < pen) { axis = 'z'; pen = oz; }
-        const push = pen; // exact — leaves faces touching, no extra air gap
+        // Floor layer: never create mid-air by Y-lift — shove in X/Z
+        if (bothFloor && (ox > eps || oz > eps)) {
+          axis = (ox <= oz || oz <= eps) ? (ox > eps ? 'x' : 'z') : 'z';
+          if (ox > eps && oz > eps) axis = ox <= oz ? 'x' : 'z';
+          pen = axis === 'x' ? ox : oz;
+        }
+        const push = pen;
+        const wA = yardItemWeightKg(A.e.item);
+        const wB = yardItemWeightKg(B.e.item);
+        // Heavier stays; lighter moves (shipping: heavy bottom / anchored)
+        const moveA = wA <= wB;
 
         if (axis === 'y') {
-          // Prefer horizontal separation when Y-lift would leave a floating overhang
           if (ox > eps * 2 && ox <= oy + 1e-6) {
-            const ca = (a.min.x + a.max.x) / 2;
-            const cb = (b.min.x + b.max.x) / 2;
-            if (ca >= cb) { A.e.mesh.position.x += ox / 2; B.e.mesh.position.x -= ox / 2; }
-            else { A.e.mesh.position.x -= ox / 2; B.e.mesh.position.x += ox / 2; }
+            axis = 'x';
           } else if (oz > eps * 2 && oz <= oy + 1e-6) {
-            const ca = (a.min.z + a.max.z) / 2;
-            const cb = (b.min.z + b.max.z) / 2;
-            if (ca >= cb) { A.e.mesh.position.z += oz / 2; B.e.mesh.position.z -= oz / 2; }
-            else { A.e.mesh.position.z -= oz / 2; B.e.mesh.position.z += oz / 2; }
+            axis = 'z';
           } else {
-            const ca = (a.min.y + a.max.y) / 2;
-            const cb = (b.min.y + b.max.y) / 2;
-            if (ca >= cb) A.e.mesh.position.y += push;
+            if (moveA) A.e.mesh.position.y += push;
             else B.e.mesh.position.y += push;
+            moved = true;
+            A.e.mesh.updateMatrixWorld(true);
+            B.e.mesh.updateMatrixWorld(true);
+            A.box.setFromObject(A.e.mesh);
+            B.box.setFromObject(B.e.mesh);
+            continue;
           }
-        } else if (axis === 'x') {
-          const ca = (a.min.x + a.max.x) / 2;
-          const cb = (b.min.x + b.max.x) / 2;
-          if (ca >= cb) { A.e.mesh.position.x += push / 2; B.e.mesh.position.x -= push / 2; }
-          else { A.e.mesh.position.x -= push / 2; B.e.mesh.position.x += push / 2; }
+        }
+        if (axis === 'x') {
+          if (moveA) A.e.mesh.position.x += (a.min.x + a.max.x >= b.min.x + b.max.x ? push : -push);
+          else B.e.mesh.position.x += (b.min.x + b.max.x >= a.min.x + a.max.x ? push : -push);
         } else {
-          const ca = (a.min.z + a.max.z) / 2;
-          const cb = (b.min.z + b.max.z) / 2;
-          if (ca >= cb) { A.e.mesh.position.z += push / 2; B.e.mesh.position.z -= push / 2; }
-          else { A.e.mesh.position.z -= push / 2; B.e.mesh.position.z += push / 2; }
+          if (moveA) A.e.mesh.position.z += (a.min.z + a.max.z >= b.min.z + b.max.z ? push : -push);
+          else B.e.mesh.position.z += (b.min.z + b.max.z >= a.min.z + a.max.z ? push : -push);
         }
         moved = true;
-        A.e.mesh.updateMatrixWorld(true);
-        B.e.mesh.updateMatrixWorld(true);
-        // Never push pieces through the container walls
-        const cont = currentLayout?.containers?.[currentContainerIdx];
-        if (cont) clampMeshesInsideContainer([A.e.mesh, B.e.mesh], cont);
         A.e.mesh.updateMatrixWorld(true);
         B.e.mesh.updateMatrixWorld(true);
         A.box.setFromObject(A.e.mesh);
@@ -2100,6 +2103,14 @@ function alignMeshToPackFootprint(mesh, it) {
     { x: -Math.PI / 2, y: Math.PI / 2, z: 0 },
     { x: 0, y: Math.PI / 2, z: Math.PI / 2 },
   ];
+  // Fine pitch-cancel — residual IFC roof slope after rest-pose
+  [-30, -20, -15, -10, -5, 5, 10, 15, 20, 30].forEach(d => {
+    const r = d * Math.PI / 180;
+    trials.push({ x: 0, y: r, z: 0 });
+    trials.push({ x: 0, y: 0, z: r });
+    trials.push({ x: Math.PI / 2, y: r, z: 0 });
+    trials.push({ x: ur.x || 0, y: (ur.y || 0) + r, z: ur.z || 0 });
+  });
   for (let i = 0; i < trials.length; i++) {
     const t = trials[i];
     mesh.quaternion.copy(qRest);
@@ -2133,6 +2144,328 @@ function snapMeshToPackerFootY(mesh, it) {
   const dy = y0mm * sc - box.min.y;
   if (Math.abs(dy) > 1e-5) mesh.position.y += dy;
   return dy;
+}
+
+/** Piece weight for yard order (heavier stays lower). */
+function yardItemWeightKg(it) {
+  if (!it) return 0;
+  return Math.max(
+    0,
+    Number(it.unitWeightKg) || Number(it.weight) || Number(it.weightKg) || 0
+  );
+}
+
+/**
+ * Shipping-yard settle after Optimise:
+ *  1) Align assembly meshes to pack footprint (cancel residual IFC pitch)
+ *  2) Heavy → light gravity onto real mesh supports (no mid-air)
+ *  3) Separate mesh AABB overlaps
+ *  4) Clamp inside walls; write world pose back to item
+ */
+function yardSettlePackedMeshes(entries, cont) {
+  if (!entries || !entries.length || typeof THREE === 'undefined') return;
+  const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.001;
+  const list = entries.filter(e => e && e.mesh && e.item && !e.outsideContainer);
+  if (!list.length) return;
+
+  // Heaviest first — they claim the floor; light goods stack / fill gaps
+  list.sort((a, b) => yardItemWeightKg(b.item) - yardItemWeightKg(a.item));
+
+  list.forEach(c => {
+    const it = c.item;
+    // Keep current mesh rotation (already applied by renderContainer).
+    // Re-seat XZ to packer lane; Y settled by gravity on real mesh AABB.
+    c.mesh.position.x = (it.x || 0) * sc;
+    c.mesh.position.z = (it.z || 0) * sc;
+    const asm = !!(it.isAssembly || it.groupKind === 'welded_assembly'
+      || (it.parts && it.parts.length > 1));
+    if (asm && typeof alignMeshToPackFootprint === 'function')
+      alignMeshToPackFootprint(c.mesh, it);
+    snapMeshToPackerFootY(c.mesh, it);
+  });
+
+  // Gravity + overlap on REAL mesh AABBs (ignore packPoseLock)
+  restackWithGravity(list);
+  resolveAabbOverlaps(list);
+  restackWithGravity(list);
+  resolveAabbOverlaps(list);
+  restackWithGravity(list);
+  resolveAabbOverlaps(list);
+
+  if (cont && typeof clampMeshesInsideContainer === 'function') {
+    clampMeshesInsideContainer(list.map(c => c.mesh), cont);
+  }
+  // Clamp can re-crowd — one more separate + gravity
+  resolveAabbOverlaps(list);
+  restackWithGravity(list);
+
+  // Chronic mesh dig-in after settle → eject lighter piece outside (honest load)
+  yardEjectChronicOverlaps(list, cont);
+  // Supports may have been ejected — drop remaining cargo again (no float)
+  const remain = list.filter(c => !c.outsideContainer);
+  if (remain.length) {
+    restackWithGravity(remain);
+    resolveAabbOverlaps(remain);
+    restackWithGravity(remain);
+    if (cont && typeof clampMeshesInsideContainer === 'function')
+      clampMeshesInsideContainer(remain.map(c => c.mesh), cont);
+    restackWithGravity(remain);
+  }
+
+  // Yard shove: slide floor cargo toward home corner (min X, min |Z|) for density
+  yardShoveFloorToHome(list.filter(c => !c.outsideContainer), cont);
+  // Shove can re-crowd — separate + gravity once more (no second eject — avoids thrash)
+  {
+    const afterShove = list.filter(c => !c.outsideContainer);
+    if (afterShove.length) {
+      resolveAabbOverlaps(afterShove);
+      restackWithGravity(afterShove);
+      resolveAabbOverlaps(afterShove);
+    }
+  }
+
+  // Nail any unsupported mid-air piece to the floor (shipping: no float)
+  const finalList = list.filter(c => !c.outsideContainer);
+  finalList.forEach(c => {
+    c.mesh.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(c.mesh);
+    if (!(box.min.y > 0.03)) return;
+    let supported = false;
+    for (let i = 0; i < finalList.length; i++) {
+      const o = finalList[i];
+      if (o === c) continue;
+      o.mesh.updateMatrixWorld(true);
+      const ob = new THREE.Box3().setFromObject(o.mesh);
+      const ox = Math.min(box.max.x, ob.max.x) - Math.max(box.min.x, ob.min.x);
+      const oz = Math.min(box.max.z, ob.max.z) - Math.max(box.min.z, ob.min.z);
+      if (ox > 0.01 && oz > 0.01 && Math.abs(ob.max.y - box.min.y) <= 0.04) {
+        supported = true;
+        break;
+      }
+    }
+    if (!supported) {
+      c.mesh.position.y -= box.min.y;
+      c.mesh.updateMatrixWorld(true);
+    }
+  });
+
+  // Sync packer records to settled mesh (keeps later Optimise/seed honest)
+  list.filter(c => !c.outsideContainer).forEach(c => {
+    const it = c.item;
+    c.mesh.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(c.mesh);
+    if (!isFinite(box.min.x)) return;
+    const cx = (box.min.x + box.max.x) * 0.5 / sc;
+    const cy = (box.min.y + box.max.y) * 0.5 / sc;
+    const cz = (box.min.z + box.max.z) * 0.5 / sc;
+    const fl = (box.max.x - box.min.x) / sc;
+    const fh = (box.max.y - box.min.y) / sc;
+    const fw = (box.max.z - box.min.z) / sc;
+    it.x = cx;
+    it.y = cy;
+    it.z = cz;
+    it.packFootprintL = fl;
+    it.packFootprintW = fw;
+    it.packFootprintH = fh;
+    it.packPoseLock = true;
+    it.yardSettled = true;
+  });
+}
+
+/**
+ * Slide near-floor pieces toward container home (door-end X→0, wall Z→-W/2)
+ * in small steps while keeping mesh AABB clear — denser floor utilization.
+ */
+function yardShoveFloorToHome(entries, cont) {
+  if (!entries || !entries.length || !cont || typeof THREE === 'undefined') return;
+  const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.001;
+  const L = (cont.lengthMm || 12000) * sc;
+  const halfW = ((cont.widthMm || 2438) * sc) / 2;
+  const floorBand = 0.45;
+  const step = 0.04; // 40mm
+  const list = entries.filter(e => e && e.mesh && !e.outsideContainer);
+  // Heaviest first stay put; shove lighter around them
+  list.sort((a, b) => yardItemWeightKg(b.item) - yardItemWeightKg(a.item));
+
+  function boxesExcept(skip) {
+    return list.filter(e => e !== skip).map(e => {
+      e.mesh.updateMatrixWorld(true);
+      return new THREE.Box3().setFromObject(e.mesh);
+    });
+  }
+  function clearAt(mesh, others) {
+    mesh.updateMatrixWorld(true);
+    const a = new THREE.Box3().setFromObject(mesh);
+    const eps = 1e-3;
+    for (let i = 0; i < others.length; i++) {
+      const b = others[i];
+      if (a.max.x > b.min.x + eps && a.min.x < b.max.x - eps
+          && a.max.y > b.min.y + eps && a.min.y < b.max.y - eps
+          && a.max.z > b.min.z + eps && a.min.z < b.max.z - eps)
+        return false;
+    }
+    // Inside walls
+    if (a.min.x < -eps || a.max.x > L + eps) return false;
+    if (a.min.z < -halfW - eps || a.max.z > halfW + eps) return false;
+    return true;
+  }
+
+  list.forEach(c => {
+    c.mesh.updateMatrixWorld(true);
+    let box = new THREE.Box3().setFromObject(c.mesh);
+    if (box.min.y > floorBand) return; // stacked — don't shove
+    for (let pass = 0; pass < 24; pass++) {
+      const others = boxesExcept(c);
+      let moved = false;
+      // Toward door end (X↓)
+      c.mesh.position.x -= step;
+      if (clearAt(c.mesh, others)) moved = true;
+      else c.mesh.position.x += step;
+      // Toward home wall (Z more negative)
+      c.mesh.position.z -= step;
+      if (clearAt(c.mesh, others)) moved = true;
+      else c.mesh.position.z += step;
+      if (!moved) break;
+    }
+  });
+}
+
+/**
+ * After yard settle: try lateral shove to clear dig-in first; eject only when
+ * interpenetration is severe and shove fails (keeps space utilization high).
+ */
+function yardEjectChronicOverlaps(entries, cont) {
+  if (!entries || entries.length < 2 || typeof THREE === 'undefined') return;
+  const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.001;
+  const minPen = 0.12; // 120 mm — ignore nest flush / hairline
+  const L = ((cont && cont.lengthMm) || 12000) * sc;
+  const halfW = (((cont && cont.widthMm) || 2438) * sc) / 2;
+  const alive = () => entries.filter(e => e && e.mesh && !e.outsideContainer);
+
+  function overlapFrac(a, b) {
+    const ox = Math.min(a.max.x, b.max.x) - Math.max(a.min.x, b.min.x);
+    const oy = Math.min(a.max.y, b.max.y) - Math.max(a.min.y, b.min.y);
+    const oz = Math.min(a.max.z, b.max.z) - Math.max(a.min.z, b.min.z);
+    if (!(ox > minPen && oy > minPen && oz > minPen)) return 0;
+    const vol = ox * oy * oz;
+    const volA = Math.max((a.max.x - a.min.x) * (a.max.y - a.min.y) * (a.max.z - a.min.z), 1e-9);
+    const volB = Math.max((b.max.x - b.min.x) * (b.max.y - b.min.y) * (b.max.z - b.min.z), 1e-9);
+    return vol / Math.min(volA, volB);
+  }
+  function clearOf(mesh, others) {
+    mesh.updateMatrixWorld(true);
+    const a = new THREE.Box3().setFromObject(mesh);
+    const eps = 2e-3;
+    if (a.min.x < -eps || a.max.x > L + eps) return false;
+    if (a.min.z < -halfW - eps || a.max.z > halfW + eps) return false;
+    for (let i = 0; i < others.length; i++) {
+      const b = others[i];
+      if (a.max.x > b.min.x + eps && a.min.x < b.max.x - eps
+          && a.max.y > b.min.y + eps && a.min.y < b.max.y - eps
+          && a.max.z > b.min.z + eps && a.min.z < b.max.z - eps)
+        return false;
+    }
+    return true;
+  }
+  /** Push lighter piece on X/Z up to 8×50mm to clear dig-in without eject. */
+  function tryShoveClear(victim, otherBox) {
+    const step = 0.05;
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, 1], [1, -1], [-1, -1]];
+    const others = alive().filter(e => e !== victim).map(e => {
+      e.mesh.updateMatrixWorld(true);
+      return new THREE.Box3().setFromObject(e.mesh);
+    });
+    const ox0 = victim.mesh.position.x;
+    const oz0 = victim.mesh.position.z;
+    for (let d = 0; d < dirs.length; d++) {
+      for (let k = 1; k <= 10; k++) {
+        victim.mesh.position.x = ox0 + dirs[d][0] * step * k;
+        victim.mesh.position.z = oz0 + dirs[d][1] * step * k;
+        if (clearOf(victim.mesh, others)) {
+          victim.mesh.updateMatrixWorld(true);
+          const box = new THREE.Box3().setFromObject(victim.mesh);
+          if (isFinite(box.min.y) && box.min.y > 1e-4)
+            victim.mesh.position.y -= box.min.y;
+          return true;
+        }
+      }
+    }
+    victim.mesh.position.x = ox0;
+    victim.mesh.position.z = oz0;
+    return false;
+  }
+
+  let guard = 0;
+  while (guard++ < 24) {
+    const cur = alive();
+    const boxes = cur.map(e => {
+      e.mesh.updateMatrixWorld(true);
+      return { e, box: new THREE.Box3().setFromObject(e.mesh) };
+    });
+    let victim = null;
+    let otherBox = null;
+    let bestVol = 0;
+    for (let i = 0; i < boxes.length; i++) {
+      for (let j = i + 1; j < boxes.length; j++) {
+        const a = boxes[i].box, b = boxes[j].box;
+        const frac = overlapFrac(a, b);
+        // Severe dig-in only (≥22%); light plates need ≥35%
+        if (frac < 0.22) continue;
+        const eA = boxes[i].e, eB = boxes[j].e;
+        const wA = yardItemWeightKg(eA.item), wB = yardItemWeightKg(eB.item);
+        if (Math.min(wA, wB) < 40 && frac < 0.35) continue;
+        const ox = Math.min(a.max.x, b.max.x) - Math.max(a.min.x, b.min.x);
+        const oy = Math.min(a.max.y, b.max.y) - Math.max(a.min.y, b.min.y);
+        const oz = Math.min(a.max.z, b.max.z) - Math.max(a.min.z, b.min.z);
+        const vol = ox * oy * oz;
+        if (vol > bestVol) {
+          bestVol = vol;
+          const asmA = !!(eA.item && (eA.item.isAssembly || eA.item.groupKind === 'welded_assembly'));
+          const asmB = !!(eB.item && (eB.item.isAssembly || eB.item.groupKind === 'welded_assembly'));
+          // Prefer keeping nest L stacks / heavy assemblies inside
+          const nestA = /nest_[lcz]|l_angle|z_channel|c_channel/i.test(
+            String(eA.item?.groupKind || '') + ' ' + (eA.item?.shapeKey || ''));
+          const nestB = /nest_[lcz]|l_angle|z_channel|c_channel/i.test(
+            String(eB.item?.groupKind || '') + ' ' + (eB.item?.shapeKey || ''));
+          if (asmA && !asmB) { victim = eB; otherBox = a; }
+          else if (asmB && !asmA) { victim = eA; otherBox = b; }
+          else if (nestA && !nestB) { victim = eB; otherBox = a; }
+          else if (nestB && !nestA) { victim = eA; otherBox = b; }
+          else if (wA <= wB) { victim = eA; otherBox = b; }
+          else { victim = eB; otherBox = a; }
+        }
+      }
+    }
+    if (!victim) break;
+    // Prefer shove over eject — keep util high (no gravity here; avoids thrash)
+    if (tryShoveClear(victim, otherBox)) continue;
+    victim.outsideContainer = true;
+    if (victim.item) {
+      victim.item.outsideContainer = true;
+      victim.item.packPoseLock = false;
+      victim.item.needsRotate = true;
+      victim.item.fitReason = 'YARD_OVERLAP_EJECT';
+      victim.item.fitReasonMsg = 'Mesh overlap after yard settle — left outside';
+    }
+    // Park beside container for inspection
+    const W = (cont && cont.widthMm) || 2438;
+    victim.mesh.position.z = (W / 2 + 1200) * sc;
+    victim.mesh.position.y = 0;
+    victim.mesh.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(victim.mesh);
+    if (isFinite(box.min.y)) victim.mesh.position.y -= box.min.y;
+    // Drop from active container item list
+    if (currentLayout && currentLayout.containers) {
+      currentLayout.containers.forEach(c => {
+        if (!c.items) return;
+        c.items = c.items.filter(it => it !== victim.item
+          && !(victim.item && it.mark && it.mark === victim.item.mark));
+      });
+      if (!currentLayout.oversized) currentLayout.oversized = [];
+      if (victim.item && !currentLayout.oversized.includes(victim.item))
+        currentLayout.oversized.push(victim.item);
+    }
+  }
 }
 
 /** Apply packer rotation onto a mesh that already has makeShape rest-pose. */
@@ -2378,7 +2711,11 @@ async function layoutPlaceSelected() {
   // STEP 8: pack units in #1→#n order (already weight-ranked)
   const packUnits = [];
   checkedGroups.forEach(g => {
-    const pus = g.packUnits || (typeof createPackUnits === 'function' ? createPackUnits(g) : []);
+    // Always rebuild at Optimise — Group-time units may predate axis/span fixes
+    const pus = (typeof createPackUnits === 'function')
+      ? createPackUnits(g)
+      : (g.packUnits || []);
+    if (pus && pus.length) g.packUnits = pus;
     const gw = Math.max(0, Number(g.sortWeightKg || g.weightKg) || 0);
     const r1 = g.rule1_orientation
       || (g.stabilityInfo && g.stabilityInfo.rule1_orientation)

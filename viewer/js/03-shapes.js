@@ -700,13 +700,20 @@ function detectFromName(name) {
   if (/BEND_?SAG|BENT_?SAG|SAG_?BEND|SAG_?BENT|BENDSAGROD|BENTSAGROD/.test(n)
       || /SAG[_\s-]*ROD|SAGROD/.test(n))
     return { shape: 'bent_sag_rod' };
+  // Round brace rods — before angle/flange brace
   if (/ROD_?BRACE|BRACE_?ROD|^ROD\b/.test(n)) return { shape: 'rod' };
+  // Hot-rolled L / flange brace / angle brace — NEVER plate or rod
+  // (bare "FLANGE" alone is a built-up plate; "FLANGE BRACE" is an L)
+  if (/FLANGE[_\s-]*BRACE|ANGLE[_\s-]*BRACE|L[_\s-]*BRACE|BRACE[_\s-]*ANGLE|BRACE[_\s-]*L\b/
+      .test(n)
+      || /EQUAL[_\s-]*ANGLE|UNEQUAL[_\s-]*ANGLE|L_?ANGLE|^ANGLE\b|\bL\d{2,}X\d/.test(n))
+    return { shape: 'l_angle' };
   if (/CHANNEL|CEE/.test(n)) return { shape: 'c_channel' };
   // GIRT can be C or Z — only guess Z when no part Description (200C18 / 200Z18)
   if (/PURLIN/.test(n)) return { shape: 'z_channel' };
   if (/GIRT/.test(n)) return { shape: 'z_channel' }; // fallback only; part desc wins upstream
-  if (/L_?ANGLE|^ANGLE/.test(n)) return { shape: 'l_angle' };
-  if (/PLT|PLATE|SHIM|SHEET|FLANGE|STIFFENER|END_?PLT|PANEL/.test(n)) return { shape: 'plate' };
+  // Built-up plate parts (not flange brace — already handled above)
+  if (/PLT|PLATE|SHIM|SHEET|\bFLANGE\b|STIFFENER|END_?PLT|PANEL/.test(n)) return { shape: 'plate' };
   if (/COLUMN|RAFTER|^BEAM|^TUBE/.test(n)) return { shape: 'i_beam' };
   return null;
 }
@@ -1016,7 +1023,49 @@ function makeShapeRaw(it, color, opacity) {
   // Single-part known profiles → analytic nest shapes (Z/C/L/plate/rod…).
   // Do NOT send these through makeIfcAssembly — that shows building pose / skips yard nest.
   const sk0 = it.shapeKey || it.profileShape || '';
-  const singlePartAnalytic = !!(it.parts && it.parts.length === 1 && CS_ANALYTIC_SHAPES[sk0]);
+  const nameBlob = `${it.assemblyName || ''} ${it.mark || ''} ${it.profileDesc || ''}`;
+  const part0 = (it.parts && it.parts[0]) || null;
+  const partBlob = part0
+    ? `${part0.name || ''} ${part0.profileDesc || ''} ${part0.shapeKey || ''}` : '';
+  const descL = (typeof detectFromDescription === 'function')
+    && (detectFromDescription(it.profileDesc || '')?.shape === 'l_angle'
+      || detectFromDescription(part0?.profileDesc || '')?.shape === 'l_angle');
+  const forceLAngle = sk0 === 'l_angle'
+    || it.groupKind === 'nest_l'
+    || descL
+    || (typeof detectFromName === 'function'
+      && (detectFromName(nameBlob)?.shape === 'l_angle'
+        || detectFromName(partBlob)?.shape === 'l_angle'));
+  const singlePartAnalytic = !!(it.parts && it.parts.length === 1 && CS_ANALYTIC_SHAPES[sk0])
+    || (forceLAngle && (!it.parts || it.parts.length <= 1));
+
+  // L-angle / flange brace: always analytic extrusion (never IFC plate-wafer path)
+  if (forceLAngle && !it._assemblyChild) {
+    let sectL = {
+      shapeKey: 'l_angle',
+      sectH: it.sectH || part0?.sectH || 0,
+      sectW: it.sectW || part0?.sectW || 0,
+      sectT: it.sectT || part0?.sectT || 0,
+    };
+    if (!(sectL.sectH > 0) && typeof detectFromDescription === 'function') {
+      const d = detectFromDescription(it.profileDesc || part0?.profileDesc || '');
+      if (d && d.shape === 'l_angle') {
+        if (d.H) sectL.sectH = d.H;
+        if (d.W) sectL.sectW = d.W;
+        if (d.T) sectL.sectT = d.T;
+      }
+    }
+    const useHL = (sectL.sectH > 0) ? sectL.sectH
+      : (it.unitHeight > 0 ? it.unitHeight : it.heightMm);
+    const useWL = (sectL.sectW > 0) ? sectL.sectW
+      : (it.unitWidth > 0 ? it.unitWidth : it.widthMm);
+    const useL = Math.max(it.lengthMm || part0?.lengthMm || 0, 50);
+    const lIt = { ...it, shapeKey: 'l_angle', profileShape: 'l_angle',
+      sectH: useHL, sectW: useWL, sectT: sectL.sectT, lengthMm: useL };
+    if (it.qty > 1 || (it.bundled && (it.gridCols || it.gridRows)))
+      return makeLAngleBundle(lIt, color, opacity);
+    return makeLAngle(useL, useHL, useWL, color, opacity, lIt);
+  }
 
   // Assembly / xBIM: multi-part welded OR unknown single-part only
   if (it.isAssembly && it.parts && it.parts.length >= 1 && !it._assemblyChild

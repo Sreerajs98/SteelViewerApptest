@@ -338,35 +338,363 @@ public class MainForm : Form
             lblStatus.Text = $"{job.JobNo}  |  {phaseText}  |  {items.Count} assemblies " +
                               $"({skipped} skipped - no usable part), {Math.Round(totalWeight, 1)} kg total{warnText}";
 
-            // CLI --ifc: Group → select all → Optimise so upright floor anchors are visible
+            // CLI --ifc: Group → select all → Optimise; write pack report for RF012 verify
             if (skipPhasePicker && webView.CoreWebView2 != null)
             {
                 lblStatus.Text += "  |  Auto Optimise…";
                 await Task.Delay(2800);
+                // Fire async pack into window.__cliPackReport (ExecuteScript may not await Promise)
                 await webView.CoreWebView2.ExecuteScriptAsync(
                     """
-                    (async function () {
-                      try {
-                        if (typeof groupByShape === 'function') groupByShape();
-                        await new Promise(r => setTimeout(r, 900));
-                        if (typeof assemblyGroups !== 'undefined' && assemblyGroups.length) {
-                          assemblyGroups.forEach(g => {
-                            if (g.state !== 'oversized') g.checked = true;
+                    (function () {
+                      window.__cliPackReport = null;
+                      window.__cliPackBusy = true;
+                      (async function () {
+                        try {
+                          if (typeof groupByShape === 'function') groupByShape();
+                          await new Promise(r => setTimeout(r, 900));
+                          if (typeof assemblyGroups !== 'undefined' && assemblyGroups.length) {
+                            assemblyGroups.forEach(g => {
+                              if (g.state !== 'oversized') g.checked = true;
+                            });
+                            if (typeof renumberCheckOrderByWeight === 'function')
+                              renumberCheckOrderByWeight();
+                            if (typeof renderStagingList === 'function') renderStagingList();
+                            if (typeof updateSelectAllBox === 'function') updateSelectAllBox();
+                          }
+                          await new Promise(r => setTimeout(r, 500));
+                          if (typeof layoutPlaceSelected === 'function')
+                            await layoutPlaceSelected();
+                          await new Promise(r => setTimeout(r, 2500));
+                          const all = [];
+                          const list = (typeof clickable !== 'undefined' && clickable) ? clickable : [];
+                          for (const c of list) {
+                            const it = c.item || {};
+                            const mark = String(it.mark || c.mark || '');
+                            const sb = it.stableBundleMm || it.packEnvelopeMm || null;
+                            const marks = (it.marks && it.marks.length) ? it.marks : [mark];
+                            all.push({
+                              mark: mark,
+                              marks: marks,
+                              outside: !!(c.outsideContainer || it.outsideContainer),
+                              fitReason: it.fitReason || c.fitReason || null,
+                              fitReasonMsg: it.fitReasonMsg || null,
+                              needsRotate: !!(it.needsRotate || c.needsRotate),
+                              l: it.l || it.lengthMm || (sb && sb.l) || null,
+                              w: it.w || it.widthMm || (sb && sb.w) || null,
+                              h: it.h || it.heightMm || (sb && sb.h) || null,
+                              sbSource: (sb && sb.source) || null,
+                              pitchedFrom: (sb && sb.pitchedFrom) || null,
+                              sb: sb ? { l: sb.l, w: sb.w, h: sb.h, source: sb.source || null } : null,
+                            });
+                          }
+                          const isRf012 = (s) => /RF012/i.test(String(s || ''));
+                          const groups = (typeof assemblyGroups !== 'undefined' && assemblyGroups)
+                            ? assemblyGroups.filter(g =>
+                                isRf012(g.mark) || (g.marks || []).some(isRf012))
+                              .map(g => ({
+                                mark: g.mark,
+                                marks: g.marks || [],
+                                state: g.state,
+                                fitReason: g.fitReason || null,
+                                fitReasonMsg: g.fitReasonMsg || null,
+                                needsRotate: !!g.needsRotate,
+                                qty: g.qty,
+                                weightKg: g.weightKg,
+                                isAssembly: !!g.isAssembly,
+                                packUnit: g.packUnit ? {
+                                  mark: g.packUnit.mark,
+                                  l: g.packUnit.l || g.packUnit.lengthMm,
+                                  w: g.packUnit.w || g.packUnit.widthMm,
+                                  h: g.packUnit.h || g.packUnit.heightMm,
+                                  sb: g.packUnit.stableBundleMm || null,
+                                } : null,
+                              }))
+                            : [];
+                          const sceneRf = ((typeof rawScene !== 'undefined' && rawScene && rawScene.items) || [])
+                            .filter(it => isRf012(it.mark) || (it.marks || []).some(isRf012))
+                            .map(it => ({
+                              mark: it.mark,
+                              lengthMm: it.lengthMm,
+                              widthMm: it.widthMm,
+                              heightMm: it.heightMm,
+                              sectH: it.sectH, sectW: it.sectW,
+                              isAssembly: !!it.isAssembly,
+                              sb: it.stableBundleMm || null,
+                            }));
+                          const layout = (typeof currentLayout !== 'undefined' && currentLayout) ? currentLayout : null;
+                          const placedRf = [];
+                          ((layout && layout.containers) || []).forEach(c => {
+                            (c.items || []).forEach(it => {
+                              if (isRf012(it.mark) || (it.marks || []).some(isRf012)) {
+                                placedRf.push({
+                                  mark: it.mark, marks: it.marks || [],
+                                  container: c.containerNumber,
+                                  x: it.x, y: it.y, z: it.z,
+                                  l: it.l, w: it.w, h: it.h,
+                                  footL: it.packFootprintL || null,
+                                  footW: it.packFootprintW || null,
+                                  footH: it.packFootprintH || null,
+                                  sb: it.stableBundleMm || null,
+                                  tag: it.packOrientTag || null,
+                                  weight: it.weight || it.unitWeightKg || null,
+                                });
+                              }
+                            });
                           });
-                          if (typeof renumberCheckOrderByWeight === 'function')
-                            renumberCheckOrderByWeight();
-                          if (typeof renderStagingList === 'function') renderStagingList();
-                          if (typeof updateSelectAllBox === 'function') updateSelectAllBox();
+                          const overRf = ((layout && layout.oversized) || [])
+                            .filter(it => isRf012(it.mark) || (it.marks || []).some(isRf012))
+                            .map(it => ({
+                              mark: it.mark, marks: it.marks || [],
+                              fitReason: it.fitReason || null,
+                              fitReasonMsg: it.fitReasonMsg || null,
+                              l: it.l, w: it.w, h: it.h,
+                              sb: it.stableBundleMm || null,
+                            }));
+                          // Live pack-unit probe from RF012 staging group
+                          let unitProbe = null;
+                          try {
+                            const g0 = (typeof assemblyGroups !== 'undefined' && assemblyGroups || [])
+                              .find(g => isRf012(g.mark) || (g.marks || []).some(isRf012));
+                            if (g0 && typeof createPackUnits === 'function') {
+                              const pus = createPackUnits(g0);
+                              const pu = pus && pus[0];
+                              let u = null;
+                              if (pu && typeof cs8UnitFromPackUnit === 'function')
+                                u = cs8UnitFromPackUnit(pu);
+                              let diag = null;
+                              if (u && typeof cs8DiagnoseUnfit === 'function' && rawScene) {
+                                const sp = rawScene.containerSpec || {};
+                                diag = cs8DiagnoseUnfit(
+                                  u,
+                                  sp.lengthMm || 12000,
+                                  sp.widthMm || 2350,
+                                  (sp.heightMm || 2690) - 2.5,
+                                  [],
+                                  sp.maxWeightKg || 26000
+                                );
+                              }
+                              unitProbe = {
+                                puMark: pu && pu.mark || null,
+                                puLWH: pu ? {
+                                  l: pu.lengthMm, w: pu.widthMm, h: pu.heightMm,
+                                } : null,
+                                puSb: pu && pu.stableBundleMm || null,
+                                puBb: pu && pu.bundle_bbox || null,
+                                unit: u ? {
+                                  mark: u.mark, l: u.l, w: u.w, h: u.h,
+                                  lengthMm: u.lengthMm, widthMm: u.widthMm, heightMm: u.heightMm,
+                                  isAssembly: !!u.isAssembly, weight: u.weight,
+                                } : null,
+                                diagnose: diag,
+                              };
+                            } else {
+                              unitProbe = { error: 'RF012 group or createPackUnits missing' };
+                            }
+                          } catch (pe) {
+                            unitProbe = { error: String(pe && pe.message || pe) };
+                          }
+                          // L / flange-brace nest pack-unit probe (why unplaced?)
+                          let braceProbe = null;
+                          try {
+                            const gL = (typeof assemblyGroups !== 'undefined' && assemblyGroups || [])
+                              .filter(g => g && (g.shapeKey === 'l_angle' || g.groupKind === 'nest_l'))
+                              .sort((a, b) => (b.qty || 0) - (a.qty || 0))[0];
+                            if (gL) {
+                              const pus = (gL.packUnits && gL.packUnits.length)
+                                ? gL.packUnits
+                                : (typeof createPackUnits === 'function' ? createPackUnits(gL) : []);
+                              const pu = pus && pus[0];
+                              let u = null;
+                              if (pu && typeof cs8UnitFromPackUnit === 'function')
+                                u = cs8UnitFromPackUnit(pu);
+                              let diag = null;
+                              if (u && typeof cs8DiagnoseUnfit === 'function' && rawScene) {
+                                const sp = rawScene.containerSpec || {};
+                                diag = cs8DiagnoseUnfit(
+                                  u,
+                                  sp.lengthMm || 12000,
+                                  sp.widthMm || 2350,
+                                  (sp.heightMm || 2690) - 2.5,
+                                  [],
+                                  sp.maxWeightKg || 26000
+                                );
+                              }
+                              const overL = ((layout && layout.oversized) || [])
+                                .filter(it => {
+                                  const blob = String(it.shapeKey || '') + ' '
+                                    + String(it.groupKind || '') + ' ' + String(it.mark || '');
+                                  return /l_angle|nest_l|STACK|40.|50./i.test(blob);
+                                })
+                                .slice(0, 8)
+                                .map(it => ({
+                                  mark: it.mark, fitReason: it.fitReason,
+                                  l: it.l || it.lengthMm, w: it.w || it.widthMm, h: it.h || it.heightMm,
+                                }));
+                              const ni = gL.nestingInfo || null;
+                              const placedL = ((layout && layout.containers) || [])
+                                .reduce((n, c) => n + ((c.items || []).filter(it => {
+                                  const blob = String(it.groupKind || '') + ' ' + String(it.shapeKey || '');
+                                  return /nest_l|l_angle/i.test(blob);
+                                }).length), 0);
+                              braceProbe = {
+                                groupMark: gL.mark, qty: gL.qty, setCount: (pus || []).length,
+                                sect: { H: gL.sectH, W: gL.sectW, T: gL.sectT },
+                                nestMethod: (gL.nestMethod && gL.nestMethod.method) || null,
+                                nestOff: (ni && ni.nesting_offset) || gL.nestingOffsetMm || null,
+                                puLWH: pu ? { l: pu.lengthMm, w: pu.widthMm, h: pu.heightMm } : null,
+                                puBb: pu && pu.bundle_bbox || null,
+                                unit: u ? { l: u.l, w: u.w, h: u.h, weight: u.weight } : null,
+                                diagnose: diag,
+                                placedNestL: placedL,
+                                oversizedL: overL,
+                              };
+                            } else {
+                              braceProbe = { error: 'no nest_l group' };
+                            }
+                          } catch (be) {
+                            braceProbe = { error: String(be && be.message || be) };
+                          }
+                          const rf012 = all.filter(r =>
+                            isRf012(r.mark) || (r.marks || []).some(isRf012));
+                          const outside = all.filter(r => r.outside);
+                          const widthExceeds = []
+                            .concat(overRf, groups, rf012)
+                            .filter(r => /WIDTH_EXCEEDS/i.test(
+                              String(r.fitReason || '') + String(r.fitReasonMsg || '')));
+                          // Pack quality: unsupported mid-air + mesh AABB dig-in
+                          let floatCount = 0;
+                          let overlapCount = 0;
+                          const meshBoxes = [];
+                          for (const c of list) {
+                            if (!c || c.outsideContainer || !c.mesh) continue;
+                            try {
+                              c.mesh.updateMatrixWorld(true);
+                              const box = new THREE.Box3().setFromObject(c.mesh);
+                              if (!isFinite(box.min.y)) continue;
+                              meshBoxes.push({ box: box, mark: (c.item && c.item.mark) || '' });
+                            } catch (_) { /* */ }
+                          }
+                          const eps = 1e-3;
+                          const floorEps = 0.03; // 30mm — skid / floor sit OK
+                          for (let i = 0; i < meshBoxes.length; i++) {
+                            const a = meshBoxes[i].box;
+                            // Stacked on another mesh = OK; mid-air with no support = float
+                            if (a.min.y > floorEps) {
+                              let supported = false;
+                              for (let j = 0; j < meshBoxes.length; j++) {
+                                if (i === j) continue;
+                                const b = meshBoxes[j].box;
+                                const ox = Math.min(a.max.x, b.max.x) - Math.max(a.min.x, b.min.x);
+                                const oz = Math.min(a.max.z, b.max.z) - Math.max(a.min.z, b.min.z);
+                                if (ox <= 0.01 || oz <= 0.01) continue;
+                                if (Math.abs(b.max.y - a.min.y) <= 0.04) { supported = true; break; }
+                              }
+                              if (!supported) floatCount++;
+                            }
+                          }
+                          for (let i = 0; i < meshBoxes.length; i++) {
+                            for (let j = i + 1; j < meshBoxes.length; j++) {
+                              const a = meshBoxes[i].box, b = meshBoxes[j].box;
+                              const ox = Math.min(a.max.x, b.max.x) - Math.max(a.min.x, b.min.x);
+                              const oy = Math.min(a.max.y, b.max.y) - Math.max(a.min.y, b.min.y);
+                              const oz = Math.min(a.max.z, b.max.z) - Math.max(a.min.z, b.min.z);
+                              // 80mm — ignore nest flush / hairline; count real dig-in only
+                              if (ox > 0.08 && oy > 0.08 && oz > 0.08) {
+                                const vol = ox * oy * oz;
+                                const volA = Math.max((a.max.x-a.min.x)*(a.max.y-a.min.y)*(a.max.z-a.min.z), 1e-9);
+                                const volB = Math.max((b.max.x-b.min.x)*(b.max.y-b.min.y)*(b.max.z-b.min.z), 1e-9);
+                                if (vol / Math.min(volA, volB) >= 0.15) overlapCount++;
+                              }
+                            }
+                          }
+                          const placedOk = placedRf.length > 0;
+                          const widthOk = widthExceeds.length === 0;
+                          // Float must be zero; allow a few residual AABB dig-ins after settle
+                          // (nest flush / plate faces still inflate AABB counts)
+                          const qualityOk = floatCount === 0 && overlapCount <= 12;
+                          const braceLike = all.filter(r =>
+                            /FLANGE[_\s-]*BRACE|ANGLE[_\s-]*BRACE|L[_\s-]*BRACE|L_?ANGLE/i
+                              .test(String(r.mark || '') + ' ' + (r.marks || []).join(' ')));
+                          const braceGroups = (typeof assemblyGroups !== 'undefined' && assemblyGroups || [])
+                            .filter(g => {
+                              const sk = String(g.shapeKey || g.profileShape || '');
+                              const blob = String(g.mark || '') + ' ' + sk + ' ' + (g.groupKind || '');
+                              return sk === 'l_angle' || g.groupKind === 'nest_l'
+                                || /FLANGE[_\s-]*BRACE|ANGLE[_\s-]*BRACE|L[_\s-]*BRACE|L_?ANGLE/i.test(blob);
+                            })
+                            .map(g => ({
+                              mark: g.mark,
+                              shapeKey: g.shapeKey || g.profileShape || null,
+                              state: g.state,
+                              qty: g.qty,
+                              groupKind: g.groupKind || null,
+                            }));
+                          window.__cliPackReport = {
+                            ok: placedOk && widthOk && qualityOk && !groups.some(g =>
+                              /WIDTH_EXCEEDS/i.test(String(g.fitReason || ''))),
+                            totalClickable: all.length,
+                            inside: all.filter(r => !r.outside).length,
+                            outsideCount: outside.length,
+                            floatCount: floatCount,
+                            overlapCount: overlapCount,
+                            packStrategy: (typeof currentLayout !== 'undefined'
+                              && currentLayout && currentLayout.packStrategy)
+                              || (window.__lastPackStrategy || null),
+                            braceClickable: braceLike.slice(0, 20),
+                            braceGroups: braceGroups.slice(0, 20),
+                            rf012Clickable: rf012,
+                            rf012Groups: groups,
+                            rf012Scene: sceneRf,
+                            rf012Placed: placedRf,
+                            rf012Oversized: overRf,
+                            unitProbe: unitProbe,
+                            braceProbe: braceProbe,
+                            widthExceedsCount: widthExceeds.length,
+                            outsideSample: outside.slice(0, 15),
+                          };
+                        } catch (e) {
+                          window.__cliPackReport = {
+                            ok: false,
+                            error: String(e && e.message || e),
+                          };
+                        } finally {
+                          window.__cliPackBusy = false;
                         }
-                        await new Promise(r => setTimeout(r, 500));
-                        if (typeof layoutPlaceSelected === 'function')
-                          await layoutPlaceSelected();
-                        console.info('[CLI] Group + Optimise done');
-                      } catch (e) {
-                        console.error('[CLI] auto pack failed', e);
-                      }
+                      })();
+                      return 'started';
                     })()
                     """);
+                string packJson = "{\"ok\":false,\"error\":\"pack report timeout\"}";
+                for (int i = 0; i < 150; i++) // up to ~5 min for large IFC best-of pack
+                {
+                    await Task.Delay(2000);
+                    string probe = await webView.CoreWebView2.ExecuteScriptAsync(
+                        "window.__cliPackReport ? JSON.stringify(window.__cliPackReport) : (window.__cliPackBusy ? '\"BUSY\"' : 'null')");
+                    string? probeVal = null;
+                    try { probeVal = JsonSerializer.Deserialize<string>(probe); } catch { /* */ }
+                    if (probeVal == "BUSY" || probeVal == null) continue;
+                    if (!string.IsNullOrWhiteSpace(probeVal) && probeVal.StartsWith('{'))
+                    {
+                        packJson = probeVal;
+                        break;
+                    }
+                }
+                try
+                {
+                    string reportPath = Path.Combine(AppContext.BaseDirectory, "_ifc_pack_report.json");
+                    await File.WriteAllTextAsync(reportPath, packJson);
+                }
+                catch (Exception rex)
+                {
+                    try
+                    {
+                        await File.WriteAllTextAsync(
+                            Path.Combine(AppContext.BaseDirectory, "_ifc_pack_report.json"),
+                            $"{{\"ok\":false,\"error\":{JsonSerializer.Serialize(rex.Message)}}}");
+                    }
+                    catch { /* */ }
+                }
                 lblStatus.Text = $"{job.JobNo}  |  {phaseText}  |  {items.Count} assemblies " +
                                   $"({skipped} skipped), {Math.Round(totalWeight, 1)} kg  |  Optimised";
             }

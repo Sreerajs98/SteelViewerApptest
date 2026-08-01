@@ -172,7 +172,8 @@ function refineAssemblyGroundPose(group, it, orientationInfo) {
   const alignInfo = cstabAlignLongestToWorldX(group);
   const qFlat = group.quaternion.clone();
 
-  // Face rolls a human would try on the yard after laying length horizontal
+  // Face rolls a yard man tries after laying length horizontal, plus fine
+  // pitch-cancel about Y/Z (IFC roof slope often remains after PCA).
   const trials = [
     { tag: 'flat', qx: 0, qy: 0, qz: 0 },
     { tag: 'Rx90', qx: Math.PI / 2, qy: 0, qz: 0 },
@@ -183,6 +184,13 @@ function refineAssemblyGroundPose(group, it, orientationInfo) {
     { tag: 'Ry180', qx: 0, qy: Math.PI, qz: 0 },
     { tag: 'Rx90_Ry180', qx: Math.PI / 2, qy: Math.PI, qz: 0 },
   ];
+  const pitchDeg = [-30, -25, -20, -15, -10, -5, 5, 10, 15, 20, 25, 30];
+  pitchDeg.forEach(d => {
+    const r = d * Math.PI / 180;
+    trials.push({ tag: `Ry${d}`, qx: 0, qy: r, qz: 0 });
+    trials.push({ tag: `Rz${d}`, qx: 0, qy: 0, qz: r });
+    trials.push({ tag: `Rx90_Ry${d}`, qx: Math.PI / 2, qy: r, qz: 0 });
+  });
   let best = null;
 
   function snapGround() {
@@ -199,6 +207,22 @@ function refineAssemblyGroundPose(group, it, orientationInfo) {
     group.position.x = keepX;
     group.position.z = keepZ;
     group.updateMatrixWorld(true);
+  }
+
+  // 40ft-ish inner limits in scene units (reject residual roof-pitch footprint)
+  const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.001;
+  const shipW = 2438 * sc;
+  const shipH = 2690 * sc;
+  const shipL = 12192 * sc;
+
+  function poseShipsIn40ft(ev) {
+    const sx = ev.size?.x || 0;
+    const sy = ev.size?.y || 0;
+    const sz = ev.size?.z || 0;
+    // Rest pose: length on X, lateral Z ≤ W, height Y ≤ H
+    return sx <= shipL * 1.02 + 1e-6
+      && sz <= shipW * 1.02 + 1e-6
+      && sy <= shipH * 1.02 + 1e-6;
   }
 
   function scorePose(ev) {
@@ -222,12 +246,19 @@ function refineAssemblyGroundPose(group, it, orientationInfo) {
     score -= sy * 25;
     score -= (ev.cog_height || 0) * 80;
     score -= (ev.tip_ratio || 0) * 2e4;
-    // Reward low vertical / long footprint (shippable)
+    // Reward length on X — NOT a huge Z (that was rewarding roof pitch ~21°)
     score += Math.min(sx, 50000) * 2;
-    score += Math.min(sz, 20000);
+    // Compact lateral (flange/web), not residual roof-pitch span
+    if (sz > shipW * 1.02) score -= 8e7;
+    else score += (shipW - sz) * 50;
+    if (sy > shipH * 1.02) score -= 5e7;
+    if (poseShipsIn40ft(ev)) score += 2e7;
+    // Prefer lowest CoG + widest base among shippable faces (yard stable)
+    score += (ev.base_area || 0) * 0.5;
     return score;
   }
 
+  const candidates = [];
   for (const tr of trials) {
     group.quaternion.copy(qFlat);
     if (tr.qx || tr.qy || tr.qz) {
@@ -239,15 +270,22 @@ function refineAssemblyGroundPose(group, it, orientationInfo) {
     snapGround();
     const ev = evaluateMeshGroupStability(group);
     const score = scorePose(ev);
-    if (!best || score > best.score) {
-      best = {
-        score,
-        tag: tr.tag,
-        ev,
-        q: group.quaternion.clone(),
-        py: group.position.y,
-      };
-    }
+    const row = {
+      score,
+      tag: tr.tag,
+      ev,
+      q: group.quaternion.clone(),
+      py: group.position.y,
+      ships: poseShipsIn40ft(ev),
+    };
+    candidates.push(row);
+    if (!best || score > best.score) best = row;
+  }
+  // Prefer any face that fits a 40ft envelope over a higher-scoring pitched sit
+  const shipOk = candidates.filter(c => c.ships);
+  if (shipOk.length) {
+    shipOk.sort((a, b) => b.score - a.score);
+    best = shipOk[0];
   }
 
   if (!best) return evaluateMeshGroupStability(group);

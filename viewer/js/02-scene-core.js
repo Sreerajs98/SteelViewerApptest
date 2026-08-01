@@ -553,8 +553,13 @@ function packFootprintFitsInContainer(it, cont) {
  */
 function itemPoseFitsInContainer(it, cont) {
   if (!it || !cont) return false;
-  // Face-roll / sole upright: packer AABB is the contract — don't reject on mesh compose quirks
-  if (it.packComposeRot || it.packOrientTag && /Rx|Rz/i.test(String(it.packOrientTag))) {
+  // Face-roll / sole upright / welded assemblies: packer AABB is the contract —
+  // IFC mesh may still carry residual roof-pitch that makeShape cannot undo here.
+  const assemblyPack = !!(it.isAssembly || it.groupKind === 'welded_assembly'
+    || (it.parts && it.parts.length > 1)
+    || /RAFTER|COLUMN|PORTAL|FRAME/i.test(String(it.assemblyName || it.mark || '')));
+  if (it.packComposeRot || assemblyPack
+      || (it.packOrientTag && /Rx|Rz|yaw/i.test(String(it.packOrientTag)))) {
     const fp = packFootprintFitsInContainer(it, cont);
     if (fp != null) return fp;
   }

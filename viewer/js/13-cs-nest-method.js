@@ -124,6 +124,20 @@ function decideNestMethod(it) {
     density = 'dense';
   }
 
+  // L-angle / flange brace: NEVER interlock — heel dig-in & wrong wafer look.
+  // Yard practice = same-orient stack_up (STACK_NEST).
+  const skNest = it.shapeKey || it.profileShape || '';
+  const nameNest = `${it.assemblyName || ''} ${it.mark || ''}`;
+  if (skNest === 'l_angle'
+      || /FLANGE[_\s-]*BRACE|ANGLE[_\s-]*BRACE|L[_\s-]*BRACE/i.test(nameNest)) {
+    if (method === 'INTERLOCK_NEST') {
+      method = 'STACK_NEST';
+      alternate_flip = false;
+      density = 'moderate';
+      reason = 'l_angle_no_interlock';
+    }
+  }
+
   const nestMethod = {
     method,                 // PER_MARK_STACK | INTERLOCK_NEST | STACK_NEST | …
     alternate_flip,         // true → later nest may flip every other piece

@@ -15,7 +15,15 @@ public static class ShapeCategorizer
         if (n.Contains("COLUMN") || n.Contains("RAFTER") || n.Contains("BEAM"))
             return "beam";          // solid I/W-section members -> drawn as a box, laid end to end
 
-        if (n.Contains("ROD") || n.Contains("BRACE") || n.Contains("PIPE"))
+        // Hot-rolled L / flange brace / angle brace — not round rod, not plate stack
+        if (n.Contains("FLANGE BRACE") || n.Contains("FLANGE_BRACE")
+            || n.Contains("ANGLE BRACE") || n.Contains("ANGLE_BRACE")
+            || n.Contains("L_BRACE") || n.Contains("L-BRACE")
+            || n.Contains("L_ANGLE") || n.Contains("EQUAL ANGLE") || n.Contains("UNEQUAL ANGLE"))
+            return "purlin";        // nestable open section family (L stack in JS)
+
+        if (n.Contains("ROD") || n.Contains("PIPE")
+            || (n.Contains("BRACE") && !n.Contains("ANGLE") && !n.Contains("FLANGE") && !n.Contains("L_")))
             return "rod";           // thin round members -> drawn as a slim box, laid end to end
 
         if (n.Contains("PANEL") || n.Contains("PLT") || n.Contains("PLATE") || n.Contains("SHIM") || n.Contains("SHEET"))

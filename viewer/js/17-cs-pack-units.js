@@ -354,26 +354,58 @@ function cspuBundleBBox(pieces, nestInfo, method, stageGroup) {
     } catch (_) { /* fall through */ }
   }
 
+  // Nest families (L/Z/C): ALWAYS nest stack envelope — even when Tekla marks
+  // each piece isAssembly. Using assembly_single here under-sizes the pack unit
+  // vs makeLAngleBundle height → yard dig-in / eject / braces left outside.
+  const nestFam = stageGroup.groupKind === 'nest_l'
+    || stageGroup.groupKind === 'nest_z'
+    || stageGroup.groupKind === 'nest_c'
+    || stageGroup.shapeKey === 'l_angle'
+    || stageGroup.shapeKey === 'z_channel'
+    || stageGroup.shapeKey === 'c_channel'
+    || method === 'STACK_NEST' || method === 'INTERLOCK_NEST'
+    || method === 'PARALLEL_BUNDLE' || method === 'FLAT_STACK';
+
   // Welded / assembly: envelope of ONE piece (pack units are 1-each)
-  if (stageGroup.groupKind === 'welded_assembly' || pieces[0]?.isAssembly) {
+  if (!nestFam && (stageGroup.groupKind === 'welded_assembly' || pieces[0]?.isAssembly)) {
     const p0 = pieces[0] || {};
-    const aL = Math.max(L, p0.lengthMm || 0, 1);
-    const aW = Math.max(
+    let aL = Math.max(L, p0.lengthMm || 0, 1);
+    let aW = Math.max(
       Number(p0.widthMm) || 0,
       Number(p0.sectW) || 0,
       Number(stageGroup.virtualWmm) || 0,
       W, 1);
-    const aH = Math.max(
+    let aH = Math.max(
       Number(p0.heightMm) || 0,
       Number(p0.sectH) || 0,
       Number(stageGroup.virtualHmm) || 0,
       H, 1);
+    // IFC axis swap: span often lands on widthMm (RF012 200×11607×2507)
+    if (typeof cs8NormalizeAssemblyShipAxes === 'function') {
+      const ax = cs8NormalizeAssemblyShipAxes(aL, aW, aH, {
+        mark: p0.mark || stageGroup.mark,
+        assemblyName: p0.assemblyName || stageGroup.name,
+        isAssembly: true,
+        groupKind: 'welded_assembly',
+      });
+      if (ax) { aL = ax.l; aW = ax.w; aH = ax.h; }
+    }
     return cspuWithSkid({ l: aL, w: aW, h: aH, source: 'assembly_single' });
   }
 
   if (typeof computeNestBundleBounds === 'function' && nestInfo) {
     try {
-      const b = computeNestBundleBounds(n, nestInfo, {
+      // Prefer pack-unit method (STACK for L) over stale nestingInfo.method
+      const info = Object.assign({}, nestInfo, {
+        method: method || nestInfo.method,
+      });
+      // L STACK: never tilted dual-axis growth (wafer / fat foot)
+      if ((method === 'STACK_NEST' || stageGroup.groupKind === 'nest_l'
+          || stageGroup.shapeKey === 'l_angle')
+          && info.use_tilted_nest_axis) {
+        info.use_tilted_nest_axis = false;
+      }
+      const b = computeNestBundleBounds(n, info, {
         length: L, width: W, height: H, thickness: T,
       });
       if (b) {
@@ -396,7 +428,18 @@ function cspuBundleBBox(pieces, nestInfo, method, stageGroup) {
     const step = off > 0 ? off : (W + 3);
     return cspuWithSkid({ l: L, w: step * n, h: H, source: 'parallel_formula' });
   }
-  // STACK / INTERLOCK fallback: grow on both nest axes lightly
+  // STACK_NEST / L face-down: grow on Y only (matches makeLAngleBundle)
+  if (method === 'STACK_NEST' || stageGroup.shapeKey === 'l_angle'
+      || stageGroup.groupKind === 'nest_l') {
+    const stepY = off > 0 ? off : Math.max(T, 1.5);
+    return cspuWithSkid({
+      l: L,
+      w: W,
+      h: H + Math.max(0, n - 1) * stepY,
+      source: 'stack_y_only',
+    });
+  }
+  // INTERLOCK fallback: grow on both nest axes lightly
   const step = off > 0 ? off : Math.max(T, 1.5);
   return cspuWithSkid({
     l: L,
@@ -423,7 +466,16 @@ function cspuMakePackUnit(pieces, stageGroup, idx, method) {
   const marks = [];
   const lengths = [];
   ordered.forEach(p => {
-    const L = p.lengthMm || 0;
+    let L = p.lengthMm || 0;
+    // IFC sometimes leaves flange-brace length 0 — use part box / fallback
+    if (!(L > 10)) {
+      const bx = Math.max(p.boxXMm || 0, p.widthMm || 0, 0);
+      const by = Math.max(p.boxYMm || 0, p.heightMm || 0, 0);
+      const bz = Math.max(p.boxZMm || 0, 0);
+      L = Math.max(bx, by, bz, 0);
+      if (L < 10 || L <= Math.max(p.sectH || 0, p.sectW || 0) * 1.5)
+        L = Math.max(stageGroup.lengthMm || 0, 300);
+    }
     maxL = Math.max(maxL, L);
     if (L > 0) minL = Math.min(minL, L);
     weight += Math.max(0, Number(p.unitWeightKg) || 0);
@@ -431,6 +483,7 @@ function cspuMakePackUnit(pieces, stageGroup, idx, method) {
     lengths.push(L);
   });
   if (!isFinite(minL)) minL = maxL;
+  if (!(maxL > 10)) maxL = 300;
 
   const mixed = lengths.length > 1
     && (Math.max(...lengths) - Math.min(...lengths)) > 1;
@@ -456,7 +509,38 @@ function cspuMakePackUnit(pieces, stageGroup, idx, method) {
   const nesting_offset = nestingInfo?.nesting_offset > 0
     ? nestingInfo.nesting_offset
     : (stageGroup.nestingOffsetMm || first.nestingOffsetMm || 0);
-  const bundle_bbox = cspuBundleBBox(ordered, nestingInfo, method, stageGroup);
+  let bundle_bbox = cspuBundleBBox(ordered, nestingInfo, method, stageGroup);
+  // Keep pack-unit lengthMm on the true member span (not IFC short axis)
+  let packLen = maxL;
+  let packW = bundle_bbox.w;
+  let packH = bundle_bbox.h;
+  if (family === 'welded_assembly' && typeof cs8NormalizeAssemblyShipAxes === 'function') {
+    const ax = cs8NormalizeAssemblyShipAxes(
+      maxL,
+      Math.max(Number(first.widthMm) || 0, packW),
+      Math.max(Number(first.heightMm) || 0, packH),
+      {
+        mark: first.mark || stageGroup.mark,
+        assemblyName: first.assemblyName || stageGroup.name,
+        isAssembly: true,
+        groupKind: 'welded_assembly',
+      }
+    );
+    if (ax) {
+      packLen = ax.l;
+      packW = ax.w;
+      packH = ax.h;
+      const skid = (bundle_bbox && bundle_bbox.skidMm != null)
+        ? bundle_bbox.skidMm : cspuSkidHeightMm();
+      bundle_bbox = {
+        l: ax.l, w: ax.w,
+        h: ax.h + (Number(skid) || 0),
+        hSteel: ax.h,
+        skidMm: skid,
+        source: (bundle_bbox && bundle_bbox.source) || 'assembly_single',
+      };
+    }
+  }
 
   const nestPieces = ordered.map((p, i) => {
     const s = (typeof resolveItemSection === 'function')
@@ -498,11 +582,11 @@ function cspuMakePackUnit(pieces, stageGroup, idx, method) {
     qty: ordered.length,
     weightKg: weight,
     total_weight: weight,
-    lengthMm: maxL,
-    lengthMinMm: minL,
-    lengthMaxMm: maxL,
-    widthMm: bundle_bbox.w,
-    heightMm: bundle_bbox.h,
+    lengthMm: packLen,
+    lengthMinMm: family === 'welded_assembly' ? packLen : minL,
+    lengthMaxMm: packLen,
+    widthMm: packW,
+    heightMm: packH,
     skidMm: bundle_bbox.skidMm != null ? bundle_bbox.skidMm : cspuSkidHeightMm(),
     memberItems: Array.from(byMark.values()),
     nestPieces,
@@ -548,7 +632,7 @@ function cspuMakePackUnit(pieces, stageGroup, idx, method) {
   // Assemblies: measure real rest-pose AABB so staging/pack spacing matches mesh
   if (pu.isAssembly && typeof measureStableBundleMm === 'function') {
     try {
-      const sb = measureStableBundleMm({
+      let sb = measureStableBundleMm({
         mark: pu.mark,
         marks: pu.marks,
         profileShape: pu.profileShape || pu.shapeKey,
@@ -565,12 +649,21 @@ function cspuMakePackUnit(pieces, stageGroup, idx, method) {
         orientation_info: orient,
       });
       if (sb && sb.l > 0) {
+        // Strip residual roof-pitch mid-edge before pack/staging stamps AABB
+        if (typeof cs8SanitizePitchedAssemblyEnvelope === 'function') {
+          sb = cs8SanitizePitchedAssemblyEnvelope(
+            sb, pu,
+            pu.lengthMm || sb.l,
+            first.widthMm || pu.widthMm,
+            first.heightMm || pu.heightMm
+          ) || sb;
+        }
         pu.stableBundleMm = sb;
         // Keep construction dims; refresh envelope metadata only
         pu.bundle_bbox = {
           l: sb.l, w: sb.w, h: sb.h,
           skidMm: pu.skidMm,
-          source: 'assembly_measured',
+          source: sb.source || 'assembly_measured',
         };
       }
     } catch (_) { /* */ }

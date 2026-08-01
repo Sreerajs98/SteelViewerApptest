@@ -678,8 +678,14 @@ public static class XbimIfcIngest
     private static string GuessPartKind(string name, string profile, IIfcProduct prod)
     {
         string s = $"{name} {profile}".ToUpperInvariant();
+        // Flange brace / angle brace = L member, not a built-up plate flange
+        if (System.Text.RegularExpressions.Regex.IsMatch(s,
+                @"FLANGE[_\s-]*BRACE|ANGLE[_\s-]*BRACE|L[_\s-]*BRACE|L_?ANGLE|EQUAL\s*ANGLE"))
+            return "other";
         if (s.Contains("WEB") || System.Text.RegularExpressions.Regex.IsMatch(s, @"\bWB\d")) return "web";
-        if (s.Contains("FLANGE") || System.Text.RegularExpressions.Regex.IsMatch(s, @"\bFL\d")) return "flange";
+        if (System.Text.RegularExpressions.Regex.IsMatch(s, @"\bFL\d")
+            || (s.Contains("FLANGE") && !s.Contains("BRACE")))
+            return "flange";
         if (s.Contains("STIFF") || s.Contains("END_PLT") || System.Text.RegularExpressions.Regex.IsMatch(s, @"\b(EP|BP|ST|PL)\d"))
             return "stiff";
         if (prod is IIfcPlate) return "plate";

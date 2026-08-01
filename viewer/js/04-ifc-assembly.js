@@ -15,6 +15,57 @@ function makeIfcAssembly(it, color, opacity) {
     return 2;
   };
   const parts = (it.parts || []).slice().sort((a, b) => kindRank(a) - kindRank(b));
+  // Flange brace / L-angle: NEVER use xBIM wafer tessellation — solid analytic L
+  const asmNameBlob = `${it.assemblyName || ''} ${it.mark || ''} ${it.profileDesc || ''} ${it.shapeKey || ''}`;
+  const partL = parts.some(p => {
+    const pd = String(p.profileDesc || '');
+    const nm = `${p.name || ''} ${pd}`;
+    return (p.shapeKey === 'l_angle')
+      || /^\s*L\s*\d/i.test(pd) || /\bL\d{2,}/i.test(pd)
+      || /FLANGE[_\s-]*BRACE|ANGLE[_\s-]*BRACE|L[_\s-]*BRACE/i.test(nm);
+  });
+  const isLAngleAsm = it.shapeKey === 'l_angle' || it.profileShape === 'l_angle'
+    || it.groupKind === 'nest_l'
+    || /FLANGE[_\s-]*BRACE|ANGLE[_\s-]*BRACE|L[_\s-]*BRACE/i.test(asmNameBlob)
+    || (typeof detectFromName === 'function' && detectFromName(asmNameBlob)?.shape === 'l_angle')
+    || (typeof detectFromDescription === 'function'
+      && detectFromDescription(it.profileDesc || '')?.shape === 'l_angle')
+    || partL;
+  if (isLAngleAsm && typeof makeLAngle === 'function' && !it._assemblyChild) {
+    const p0 = parts[0] || {};
+    const sect = {
+      shapeKey: 'l_angle',
+      sectH: it.sectH || p0.sectH || 0,
+      sectW: it.sectW || p0.sectW || 0,
+      sectT: it.sectT || p0.sectT || 0,
+    };
+    if (!(sect.sectH > 0) && typeof detectFromDescription === 'function') {
+      const d = detectFromDescription(it.profileDesc || p0.profileDesc || '');
+      if (d && d.shape === 'l_angle') {
+        if (d.H) sect.sectH = d.H;
+        if (d.W) sect.sectW = d.W;
+        if (d.T) sect.sectT = d.T;
+      }
+    }
+    const L = Math.max(it.lengthMm || p0.lengthMm || 0, 50);
+    const H = sect.sectH || it.unitHeight || it.heightMm || 40;
+    const W = sect.sectW || it.unitWidth || it.widthMm || H;
+    const child = {
+      ...it,
+      shapeKey: 'l_angle',
+      profileShape: 'l_angle',
+      sectH: H, sectW: W, sectT: sect.sectT || it.sectT || 0,
+      lengthMm: L, heightMm: H, widthMm: W,
+      unitHeight: H, unitWidth: W,
+      isAssembly: false,
+      parts: null,
+    };
+    if ((it.qty || 1) > 1 || (it.bundled && (it.gridCols || it.gridRows))) {
+      if (typeof makeLAngleBundle === 'function')
+        return makeLAngleBundle(child, color, opacity);
+    }
+    return makeLAngle(L, H, W, color, opacity, child);
+  }
   const isRafterOrColumnAsm = /RAFTER|COLUMN/i.test(`${it.assemblyName || ''} ${it.mark || ''}`);
   const isWebP = (p) =>
     String(p.partKind || '').toLowerCase() === 'web'
@@ -282,15 +333,29 @@ function makeIfcAssembly(it, color, opacity) {
   function resolvePartShape(p) {
     const t = String(p.ifcType || '').toUpperCase();
     const nm = `${p.name || ''} ${p.profileDesc || ''}`.toUpperCase();
+    const prof = String(p.profileDesc || '');
+    // Profile / shape family wins — L-angle & flange brace must NOT become plate wafers
+    let skEarly = p.shapeKey
+      || (typeof detectFromDescription === 'function'
+        ? detectFromDescription(prof)?.shape : null)
+      || (typeof detectFromName === 'function'
+        ? detectFromName(`${p.name || ''} ${prof}`)?.shape : null);
+    if (skEarly === 'l_angle'
+        || /FLANGE[_\s-]*BRACE|ANGLE[_\s-]*BRACE|L[_\s-]*BRACE/i.test(nm)
+        || /^\s*L\s*\d/i.test(prof) || /\bL\d{2,}X\d/i.test(prof))
+      return 'l_angle';
+
     // Tekla plate-built marks (rafter drawing: FL####, WB####, PL####, EP####, BP####)
-    if (/\bFL\d|FLANGE|\bWB\d|\bWEB\b|\bPL\d|\bEP\d|\bBP\d|\bST\d|SGP|SSP|SWC|STIFFENER|\bSTIFF\b|END_?PLT/.test(nm))
+    // Bare FLANGE / FL#### only — not "FLANGE BRACE"
+    if (/\bFL\d|\bWB\d|\bWEB\b|\bPL\d|\bEP\d|\bBP\d|\bST\d|SGP|SSP|SWC|STIFFENER|\bSTIFF\b|END_?PLT/.test(nm)
+        || (/\bFLANGE\b/.test(nm) && !/BRACE/.test(nm)))
       return 'plate';
-    if (t.includes('PLATE')) return 'plate';
+    if (t.includes('PLATE') && skEarly !== 'l_angle') return 'plate';
 
     const rolled = /IPE|HEA|HEB|UB\s*\d|UC\s*\d/i.test(p.profileDesc || '');
     if (rolled) return 'i_beam';
 
-    let sk = p.shapeKey || (detectFromDescription(p.profileDesc)?.shape) || null;
+    let sk = skEarly || p.shapeKey || (detectFromDescription(p.profileDesc)?.shape) || null;
     if (sk === 'plate') return 'plate';
     if (sk === 'i_beam' && !/\bFL\d|\bWB\d/.test(nm)) return 'i_beam';
 
@@ -395,8 +460,10 @@ function makeIfcAssembly(it, color, opacity) {
 
     let mesh = null;
 
-    // Prefer xBIM tessellated solid whenever mesh data is present (any IFC product)
-    mesh = makeMeshFromXbim(p, color, opacity);
+    // Prefer xBIM tessellation ONLY for non-L parts. L / flange brace xBIM
+    // meshes are thin wafer stacks (IFC sweep tessellation) — use analytic L.
+    if (shapeKey !== 'l_angle')
+      mesh = makeMeshFromXbim(p, color, opacity);
 
     if (!mesh && shapeKey === 'i_beam') {
       const { L, H, W } = partBeamDims(p);

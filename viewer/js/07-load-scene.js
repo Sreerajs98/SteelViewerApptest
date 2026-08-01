@@ -123,7 +123,12 @@ const DEFAULT_CONTAINER = { lengthMm: 12000, widthMm: 2350, heightMm: 2690, maxW
 function categorizeName(name) {
   const n = (name || '').toUpperCase();
   if (n.includes('COLUMN') || n.includes('RAFTER') || n.includes('BEAM')) return 'beam';
-  if (n.includes('ROD') || n.includes('BRACE') || n.includes('PIPE')) return 'rod';
+  // L / flange brace before bare BRACE→rod
+  if (/FLANGE[_\s-]*BRACE|ANGLE[_\s-]*BRACE|L[_\s-]*BRACE|L_?ANGLE|EQUAL\s*ANGLE/.test(n))
+    return 'purlin';
+  if (n.includes('ROD') || n.includes('PIPE')
+      || (n.includes('BRACE') && !n.includes('ANGLE') && !n.includes('FLANGE')))
+    return 'rod';
   if (n.includes('PLT') || n.includes('PLATE') || n.includes('SHIM') || n.includes('SHEET')) return 'plate';
   if (n.includes('PURLIN') || n.includes('CHANNEL') || n.includes('GIRT')) return 'purlin';
   return 'other';

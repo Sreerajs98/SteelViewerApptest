@@ -224,6 +224,206 @@
     group.traverse(o => { if (o.geometry) o.geometry.dispose(); });
   });
 
+  t('W.12d2', 'Pitch footprint rejected — ship pose fits 40ft W×H', () => {
+    if (typeof THREE === 'undefined' || typeof refineAssemblyGroundPose !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    // Long rafter with ~21.5° pitch baked in (RF012-class Z span)
+    const group = new THREE.Group();
+    const beam = new THREE.Mesh(
+      new THREE.BoxGeometry(11.864, 0.2, 0.869),
+      new THREE.MeshBasicMaterial()
+    );
+    group.add(beam);
+    // Pitch about Y → long axis spills into Z (RF012-class width 4341)
+    group.rotation.y = Math.atan(4341 / 11864); // ~21.5°
+    group.updateMatrixWorld(true);
+    const before = new THREE.Box3().setFromObject(group);
+    const bsz = new THREE.Vector3();
+    before.getSize(bsz);
+    assert(bsz.z > 2.5, `pitched Z before=${bsz.z.toFixed(2)} (want >2.5)`);
+
+    refineAssemblyGroundPose(group, {
+      mark: 'RF012', isAssembly: true, parts: [{}, {}],
+      groupKind: 'welded_assembly', assemblyName: 'RAFTER',
+    }, null);
+    group.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(group);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.001;
+    assert(size.z <= 2438 * sc * 1.05 + 0.02,
+      `ship Z=${(size.z / sc).toFixed(0)}mm (want ≤2438, pitch stripped)`);
+    assert(size.y <= 2690 * sc * 1.05 + 0.02,
+      `ship Y=${(size.y / sc).toFixed(0)}mm (want ≤2690)`);
+    assert(size.x > size.z * 2 && size.x > size.y * 2, 'length still on X');
+    group.traverse(o => { if (o.geometry) o.geometry.dispose(); });
+  });
+
+  t('W.12d5', 'axis-swap construct preferred over plate CS stamp', () => {
+    if (typeof cs8UnitFromPackUnit !== 'function') { assert(true, 'skip'); return; }
+    const pu = {
+      mark: 'ASM-A', marks: ['ASM-A'],
+      groupKind: 'welded_assembly', shapeKey: 'i_beam', category: 'beam',
+      isAssembly: true, parts: [{}, {}],
+      assemblyName: 'RAFTER',
+      qty: 1, total_weight: 711, weightKg: 711,
+      lengthMm: 11607.8, widthMm: 200, heightMm: 2507.5,
+      // Plate CS stamp from "604.2A-6" must NOT override envelope
+      sectW: 6, sectH: 604.2,
+      stableBundleMm: {
+        l: 200, w: 11607.8, h: 2507.5, source: 'measured_rest_pose',
+      },
+      bundle_bbox: { l: 11607.8, w: 200, h: 2507.5 },
+    };
+    const u = cs8UnitFromPackUnit(pu);
+    assert(u.l > 10000, `span kept ${u.l}`);
+    assert(u.h > 2000 && u.w <= 500, `upright web ${u.l}×${u.w}×${u.h}`);
+    assert(u.widthMm > 50 || u.w > 50, 'not 6mm plate width');
+  });
+
+  t('W.12d6', 'yardSettlePackedMeshes exists for post-pack gravity', () => {
+    assert(typeof yardSettlePackedMeshes === 'function', 'yardSettle missing');
+    assert(typeof yardItemWeightKg === 'function', 'yardWeight missing');
+  });
+
+  t('W.25', 'FLANGE BRACE / ANGLE BRACE classify as l_angle not plate/rod', () => {
+    if (typeof detectFromName !== 'function') { assert(true, 'skip'); return; }
+    const cases = [
+      'FLANGE BRACE', 'FLANGE_BRACE', 'Flange Brace ASSY',
+      'ANGLE BRACE', 'L_BRACE', 'EQUAL ANGLE',
+    ];
+    cases.forEach(n => {
+      const d = detectFromName(n);
+      assert(d && d.shape === 'l_angle', `${n} → ${d && d.shape}`);
+    });
+    // Bare plate flange still plate; rod brace still rod
+    assert(detectFromName('FLANGE PLATE')?.shape === 'plate'
+      || detectFromName('TOP FLANGE')?.shape === 'plate', 'bare flange→plate');
+    assert(detectFromName('ROD_BRACE')?.shape === 'rod', 'rod brace stays rod');
+    // Nest pack bbox must grow for isAssembly L pieces (not assembly_single)
+    if (typeof cspuBundleBBox === 'function') {
+      const pieces = Array.from({ length: 4 }, (_, i) => ({
+        mark: 'FB' + i, isAssembly: true, lengthMm: 600,
+        sectH: 40, sectW: 40, sectT: 2.5, widthMm: 40, heightMm: 40,
+      }));
+      const bb = cspuBundleBBox(pieces, {
+        method: 'STACK_NEST', nesting_offset: 5.5,
+      }, 'STACK_NEST', {
+        groupKind: 'nest_l', shapeKey: 'l_angle',
+        sectH: 40, sectW: 40, sectT: 2.5, lengthMm: 600,
+      });
+      assert(bb && bb.h > 40 + 2 * 5, `nest L pack H grows (h=${bb && bb.h})`);
+      assert(bb.w < 80, `nest L pack W stays section (w=${bb && bb.w})`);
+    }
+  });
+
+  t('W.26', 'pack best-of picks a strategy with placed items', () => {
+    if (typeof layoutOptimized !== 'function') { assert(true, 'skip'); return; }
+    const spec = { lengthMm: 12000, widthMm: 2350, heightMm: 2690, maxWeightKg: 26000 };
+    const packUnits = [
+      {
+        mark: 'B1', marks: ['B1'], groupKind: 'bundle_beam', shapeKey: 'i_beam',
+        isAssembly: true, qty: 1, total_weight: 800, weightKg: 800,
+        lengthMm: 11000, widthMm: 200, heightMm: 400,
+        stableBundleMm: { l: 11000, w: 200, h: 400 },
+        bundle_bbox: { l: 11000, w: 200, h: 400 },
+      },
+      {
+        mark: 'N1', marks: ['N1'], groupKind: 'nest_l', shapeKey: 'l_angle',
+        qty: 6, total_weight: 180, weightKg: 180,
+        lengthMm: 6000, widthMm: 75, heightMm: 75, sectH: 75, sectW: 75, sectT: 6,
+        stableBundleMm: { l: 6000, w: 90, h: 200 },
+        bundle_bbox: { l: 6000, w: 90, h: 200 },
+      },
+    ];
+    const res = layoutOptimized([], spec, null, {
+      packUnits, maxContainers: 1, pass2: true, markOrder: null,
+    });
+    const n = ((res.containers || [])[0]?.items || []).length;
+    assert(n >= 1, `bestOf placed ${n}`);
+    assert(res.packStrategy, 'packStrategy stamped');
+  });
+
+  t('W.12d4', 'IFC axis-swap RF012 200×11607×2507 remaps and places', () => {
+    if (typeof cs8NormalizeAssemblyShipAxes !== 'function'
+        || typeof cs8UnitFromPackUnit !== 'function'
+        || typeof layoutContainerPackStep8 !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const ax = cs8NormalizeAssemblyShipAxes(200, 11607.8, 2507.5, {
+      mark: 'RF012', assemblyName: 'RAFTER', isAssembly: true,
+      groupKind: 'welded_assembly',
+    });
+    assert(ax && ax.l > 10000 && ax.w < 500 && ax.h > 2000,
+      `axis ${ax && ax.l}×${ax && ax.w}×${ax && ax.h}`);
+    const pu = {
+      mark: 'RF012', marks: ['RF012'],
+      groupKind: 'welded_assembly', shapeKey: 'i_beam', category: 'beam',
+      isAssembly: true, parts: [{}, {}],
+      assemblyName: 'RAFTER',
+      qty: 1, total_weight: 711, weightKg: 711,
+      // Real A1321 scene axes (span on widthMm)
+      lengthMm: 200, widthMm: 11607.8, heightMm: 2507.5,
+      sectW: 200, sectH: 2507.5, sectT: 12,
+      stableBundleMm: { l: 200, w: 11607.8, h: 2507.5 },
+      bundle_bbox: { l: 200, w: 11607.8, h: 2507.5 },
+    };
+    const u = cs8UnitFromPackUnit(pu);
+    assert(u.l > 10000 && u.w <= 2438 && u.h <= 2690,
+      `unit ${u.l}×${u.w}×${u.h}`);
+    const spec = { lengthMm: 12000, widthMm: 2350, heightMm: 2690, maxWeightKg: 26000 };
+    const res = layoutContainerPackStep8([], spec, null, {
+      packUnits: [pu], maxContainers: 1, pass2: true, markOrder: null,
+    });
+    const placed = (res.containers[0] && res.containers[0].items) || [];
+    const ov = (res.oversized || []).map(o => o.fitReason).join(',');
+    assert(placed.length >= 1, `axis-swap RF012 not placed; ov=${ov || 'none'}`);
+  });
+
+  t('W.12d3', 'pitched measure + ship construct → placeable (no invent)', () => {
+    if (typeof cs8SanitizePitchedAssemblyEnvelope !== 'function'
+        || typeof cs8UnitFromPackUnit !== 'function'
+        || typeof layoutContainerPackStep8 !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    // Measured still pitched; construct already ship axes (same member L)
+    const raw = { l: 11864, w: 4341, h: 869, source: 'assembly_measured' };
+    const fixed = cs8SanitizePitchedAssemblyEnvelope(
+      raw,
+      {
+        mark: 'ASM-R', assemblyName: 'RAFTER', isAssembly: true,
+        groupKind: 'welded_assembly',
+      },
+      11864, 200, 2507
+    );
+    assert(fixed && fixed.w <= 2438 && fixed.h <= 2690,
+      `ship ${fixed && fixed.l}×${fixed && fixed.w}×${fixed && fixed.h}`);
+    const pu = {
+      mark: 'ASM-R', marks: ['ASM-R'],
+      groupKind: 'welded_assembly', shapeKey: 'i_beam', category: 'beam',
+      isAssembly: true, parts: [{}, {}],
+      assemblyName: 'RAFTER',
+      qty: 1, total_weight: 711, weightKg: 711,
+      lengthMm: 11864, widthMm: 200, heightMm: 2507,
+      sectW: 200, sectH: 2507, sectT: 12,
+      stableBundleMm: { l: 11864, w: 4341, h: 869 },
+      bundle_bbox: { l: 11864, w: 200, h: 2507 },
+    };
+    const u = cs8UnitFromPackUnit(pu);
+    assert(u.w <= 2438 && u.h <= 2690, `unit ${u.l}×${u.w}×${u.h}`);
+    const spec = { lengthMm: 12000, widthMm: 2350, heightMm: 2690, maxWeightKg: 26000 };
+    const res = layoutContainerPackStep8([], spec, null, {
+      packUnits: [pu], maxContainers: 1, pass2: true, markOrder: null,
+    });
+    const placed = (res.containers[0] && res.containers[0].items) || [];
+    const ov = (res.oversized || []).map(o => o.fitReason).join(',');
+    assert(placed.length >= 1, `rafter-class not placed; ov=${ov || 'none'}`);
+  });
+
   t('W.12d', 'PCA cancels IFC roof-pitch — length ends along +X, ground', () => {
     if (typeof THREE === 'undefined' || typeof refineAssemblyGroundPose !== 'function') {
       assert(true, 'skip');
@@ -773,6 +973,90 @@
     const dx = Math.abs((it.x || 0) - expectRenderX);
     assert(dx <= 80,
       `back-hug dx=${Math.round(dx)}mm (x=${Math.round(it.x)} want≈${Math.round(expectRenderX)})`);
+  });
+
+  t('W.24', 'Yard compact: ground sit + inner-line (no muttiyal)', () => {
+    if (typeof layoutContainerPackStep8 !== 'function'
+        || typeof cs8PoseInsideSafeEnvelope !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const spec = {
+      lengthMm: 12192, widthMm: 2438, heightMm: 2591, maxWeightKg: 26000,
+    };
+    const mk = (i) => ({
+      mark: `YC${i}`, marks: [`YC${i}`],
+      groupKind: 'bundle_beam', shapeKey: 'i_beam', category: 'beam',
+      qty: 1, total_weight: 400, weightKg: 400, unitWeightKg: 400,
+      lengthMm: 9000, widthMm: 200, heightMm: 300,
+      bundle_bbox: { l: 9000, w: 200, h: 300 },
+      stableBundleMm: { l: 9000, w: 200, h: 300 },
+      l: 9000, w: 200, h: 300,
+    });
+    const res = layoutContainerPackStep8([], spec, null, {
+      packUnits: [mk(1), mk(2), mk(3), mk(4)],
+      maxContainers: 1, pass2: true, markOrder: null,
+    });
+    const placed = (res.containers[0] && res.containers[0].items) || [];
+    assert(placed.length >= 3, `placed=${placed.length}`);
+    // Compact step should have run in Pass1 (even if 0 moves — already snug)
+    const compactSteps = (res.placementSteps || []).filter(s => s.type === 'compact');
+    assert(compactSteps.length >= 1,
+      `expected Pass1 compact step(s), got ${compactSteps.length}; p2=${JSON.stringify(res.packPasses || {})}`);
+    const Lmax = spec.lengthMm;
+    const Wmax = spec.widthMm;
+    placed.forEach((it, i) => {
+      const fl = it.packFootprintL || it.lengthMm || 9000;
+      const fw = it.packFootprintW || it.widthMm || 200;
+      const fh = it.packFootprintH || it.heightMm || 300;
+      // Result x is render-mirrored; packerCx = Lmax - x
+      const packerCx = Lmax - (it.x || 0);
+      const packerX0 = packerCx - fl / 2;
+      const packerZ0 = (it.z || 0) + Wmax / 2 - fw / 2;
+      const y0 = (it.y || 0) - fh / 2;
+      // Ground touch (floor seat)
+      assert(y0 <= 30,
+        `item[${i}] y0=${Math.round(y0)} (want ground ~0)`);
+      assert(cs8PoseInsideSafeEnvelope(
+        packerX0, packerZ0, Math.max(0, y0), fl, fw, fh, Lmax, Wmax, spec.heightMm
+      ), `item[${i}] outside safe envelope (muttiyal)`);
+    });
+    // Neighbour Z gaps tight after compact
+    const zSpans = placed.map(it => {
+      const fw = it.packFootprintW || 200;
+      const z0 = (it.z || 0) + Wmax / 2 - fw / 2;
+      return { z0, z1: z0 + fw };
+    }).sort((a, b) => a.z0 - b.z0);
+    const gap = (typeof cs8BundleGap === 'function') ? cs8BundleGap() : 20;
+    for (let i = 1; i < Math.min(zSpans.length, 4); i++) {
+      const clear = zSpans[i].z0 - zSpans[i - 1].z1;
+      if (clear < 0) continue; // stacked / same bay overlap in projection
+      // Same bay neighbours should be snug; door-bay jump can be large — only check small gaps
+      if (clear < 800) {
+        assert(clear <= gap + 50,
+          `Z gap[${i}]=${Math.round(clear)} after compact (want ~${gap})`);
+      }
+    }
+  });
+
+  t('W.23', 'Envelope guard: position (x+fl), not dims alone', () => {
+    if (typeof cs8PoseInsideSafeEnvelope !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const Lmax = 12000, Wmax = 2350;
+    const fl = 9000, fw = 200, fh = 300;
+    // Dims fit but seat starts too far toward door → overhang past end clearance
+    assert(!cs8PoseInsideSafeEnvelope(4000, 50, 0, fl, fw, fh, Lmax, Wmax, 2690),
+      'must reject x+fl past safe end');
+    // Legal closed-end seat
+    const gL = (typeof cs8WallGapEnd === 'function') ? cs8WallGapEnd() : 2.5;
+    const gW = (typeof cs8WallGapSide === 'function') ? cs8WallGapSide() : 2.5;
+    assert(cs8PoseInsideSafeEnvelope(gL, gW, 0, fl, fw, fh, Lmax, Wmax, 2690),
+      'legal back+home seat ok');
+    // Dims alone would pass but Z overflows
+    assert(!cs8PoseInsideSafeEnvelope(gL, Wmax - 50, 0, fl, fw, fh, Lmax, Wmax, 2690),
+      'must reject z+fw past side');
   });
 
   t('W.22', 'Inch-by-inch: 3 narrow beams fill Z from home wall (no mid corridor)', () => {

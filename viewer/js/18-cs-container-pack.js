@@ -135,6 +135,9 @@ function cs8Dunnage() {
 /** Fine scan step (mm) — used for narrow feet / tight leftover strips. */
 const CS8_FINE_STEP_MM = 50;
 
+/** Pass1: rebalance (compact) after this many successful seats — yard shove. */
+const CS8_PASS1_COMPACT_EVERY = 3;
+
 /**
  * Build X/Z scan axes for a footprint.
  * - Narrow foot (<30% axis) OR leftover strip <400mm → 50mm step
@@ -504,13 +507,21 @@ function layoutContainerPackStep8(items, spec, rotMap, opts) {
     Houter: Hmax,
     floorClearMm: floorClear,
     maxKg,
+    sortMode: o.sortMode || 'heavy',
   };
   units.forEach(u => {
     u._Houter = Hmax;
     u._floorClearMm = floorClear;
+    // L / nest packs: never inherit Z two-point rails (blocks planar floor seats)
+    if (cs8IsNestPackUnit(u) || String(u.shapeKey || '') === 'l_angle') {
+      u.two_point_base = false;
+      if (u.rule1_orientation) u.rule1_orientation = {
+        ...u.rule1_orientation, two_point_base: false,
+      };
+    }
   });
 
-  // Rule #1 Constraint-First: most constrained → first. Click Order ignored.
+  // Rule #1 Constraint-First (or length/volume strategy). Click Order ignored.
   cs8SortHeavyAnchor(units, Lmax, envOpts);
 
   const containers = [];
@@ -629,6 +640,7 @@ function layoutContainerPackStep8(items, spec, rotMap, opts) {
       last.baseLayerLock = cs8IsFloorAnchorCargo(u, Lmax, envOpts);
       last.floorAnchor = !!(placeOpts && placeOpts.floorAnchor);
       last.anchorTier = cs8ConstraintTier(u, Lmax, envOpts);
+      last._softLock = true; // movable until Pass1/2 compact hardens seat
       for (let ti = 0; ti < trialLog.length; ti++) placementSteps.push(trialLog[ti]);
       placementSteps.push({
         type: 'commit',
@@ -656,6 +668,7 @@ function layoutContainerPackStep8(items, spec, rotMap, opts) {
           last.baseLayerLock = cs8IsFloorAnchorCargo(u, Lmax, envOpts);
           last.floorAnchor = !!(placeOpts && placeOpts.floorAnchor);
           last.anchorTier = cs8ConstraintTier(u, Lmax, envOpts);
+          last._softLock = true;
           for (let ti = 0; ti < trialLog.length; ti++) placementSteps.push(trialLog[ti]);
           placementSteps.push({
             type: 'commit',
@@ -700,10 +713,78 @@ function layoutContainerPackStep8(items, spec, rotMap, opts) {
     return false;
   }
 
+  // Pass1: place → every N seats COMPACT (slide to wall/neighbour) → continue
+  let pass1Placed = 0;
+  let pass1CompactMoves = 0;
+  function pass1CompactAll(reason) {
+    let moved = 0;
+    (containers || []).forEach(c => {
+      if (!(c.items && c.items.length)) return;
+      moved += cs8CompactReseatAll(
+        c, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm
+      );
+    });
+    pass1CompactMoves += moved;
+    placementSteps.push({
+      type: 'compact',
+      reason: reason || 'pass1',
+      moved,
+      afterPlaced: pass1Placed,
+    });
+    return moved;
+  }
+
+  // Pass1 phases: assemblies → nest strip fill → remaining (beams/filler).
+  // Nest packs claim residual floor beside mega rafters BEFORE more long
+  // members seal the strips (rafters already fill height → stack fails).
+  const nestUnits = [];
+  const mainUnits = [];
   units.forEach(u => {
-    const anchor = cs8IsFloorAnchorCargo(u, Lmax, envOpts);
-    pass1Place(u, anchor); // anchors: floor-only; loose: floor then stack
+    if (cs8IsNestPackUnit(u)) nestUnits.push(u);
+    else mainUnits.push(u);
   });
+  function placeList(list) {
+    list.forEach(u => {
+      const anchor = cs8IsFloorAnchorCargo(u, Lmax, envOpts);
+      if (pass1Place(u, anchor)) {
+        pass1Placed++;
+        if (pass1Placed % CS8_PASS1_COMPACT_EVERY === 0) {
+          pass1CompactAll('every_' + CS8_PASS1_COMPACT_EVERY);
+        }
+      }
+    });
+  }
+  const asmUnits = mainUnits.filter(u => cs8IsAssemblyUnit(u));
+  const nonAsmMain = mainUnits.filter(u => !cs8IsAssemblyUnit(u));
+  // Mega = long lane OR tall (near full height) — these seal stack space
+  const megaAsm = asmUnits.filter(u => {
+    const longest = cs8LongestDimMm(u);
+    const hh = Math.max(+u.h || 0, +u.heightMm || 0, 0);
+    return longest >= Lmax * CS8_CONSTRAINT_LEN_FLOOR || hh >= Hpack * 0.45;
+  });
+  const otherAsm = asmUnits.filter(u => !megaAsm.includes(u));
+  if (megaAsm.length) {
+    // Seat first mega lane only, then nest-fill the open strip, then rest.
+    // Placing ALL megas first seals the floor before any L/Z/C nest can sit.
+    placeList([megaAsm[0]]);
+    if (nestUnits.length) pass1CompactAll('pre_nest_strip');
+    placeList(nestUnits);
+    placeList(megaAsm.slice(1));
+    placeList(otherAsm);
+    placeList(nonAsmMain);
+  } else if (asmUnits.length) {
+    placeList([asmUnits[0]]);
+    if (nestUnits.length) pass1CompactAll('pre_nest_strip');
+    placeList(nestUnits);
+    placeList(asmUnits.slice(1));
+    placeList(nonAsmMain);
+  } else {
+    // No assemblies: keep Rule#1 — floor beams before nest secondary
+    placeList(nonAsmMain);
+    placeList(nestUnits);
+  }
+  // Final Pass1 shove before leftover fill
+  if (pass1Placed > 0) pass1CompactAll('pass1_final');
 
   // ── Pass 2: compact (locked yaw) + residual gap fill ────────────────────
   let pass2Stats = { compacted: 0, filled: 0 };
@@ -713,6 +794,8 @@ function layoutContainerPackStep8(items, spec, rotMap, opts) {
       wallGap, bundleGap, dunnageMm, maxKg, maxContainers, placementSteps
     );
   }
+  pass2Stats.pass1CompactMoves = pass1CompactMoves;
+  pass2Stats.pass1Placed = pass1Placed;
 
   const filled = containers.filter(c => c.items && c.items.length);
   if (!filled.length && containers.length) filled.push(containers[0]);
@@ -762,29 +845,253 @@ function layoutContainerPackStep8(items, spec, rotMap, opts) {
   };
 }
 
-/** Step 8 becomes the default Optimise / Place packer (Y-yaw only). */
+/**
+ * Score a pack result — shipping yard KPI:
+ *   more placed, less leftover, higher volume util, balanced CoG.
+ */
+function cs8ScorePackResult(res) {
+  if (!res) return -1e18;
+  const placed = ((res.containers || []).reduce(
+    (n, c) => n + ((c.items && c.items.length) || 0), 0));
+  const left = (res.oversized || []).length;
+  const vol = (res.containers || []).reduce(
+    (s, c) => s + (Number(c.volumeUtilizationPct) || 0), 0);
+  const bal = (res.containers || []).filter(c => c.cogBalanced).length;
+  // Prefer: max placed, then min leftover, then util, then balance
+  return placed * 1e9 - left * 1e6 + vol * 1e3 + bal * 10;
+}
+
+/**
+ * Best-of-N packing strategies (shipping architect):
+ *   A) heavy-first floor anchors (default Rule #1)
+ *   B) length-first lane claimers (long members claim floor early)
+ *   C) volume-first bulky cargo, then dense Pass2 fill
+ * Pick the result that places the most with fewest leftovers.
+ */
 function layoutOptimized(items, spec, rotMap, opts) {
-  if (!(opts && opts.forceLegacyPacker)) {
-    return layoutContainerPackStep8(items, spec, rotMap, opts);
+  if (opts && opts.forceLegacyPacker) {
+    return _layoutOptimizedLegacy
+      ? _layoutOptimizedLegacy(items, spec, rotMap, opts)
+      : { containers: [], oversized: items || [] };
   }
-  return _layoutOptimizedLegacy
-    ? _layoutOptimizedLegacy(items, spec, rotMap, opts)
-    : { containers: [], oversized: items || [] };
+  const base = opts || {};
+  if (base.skipBestOf || base._bestOfChild) {
+    return layoutContainerPackStep8(items, spec, rotMap, base);
+  }
+  const nHint = (base.packUnits && base.packUnits.length)
+    || (items && items.length) || 0;
+  // Large jobs: length_lanes first (won A1321); optional heavy if time allows.
+  // Very large (>120 units): single strategy — bestOf doubles wall-clock.
+  const strategies = nHint > 120
+    ? [
+        { name: 'length_lanes', sortMode: 'length', pass2: true },
+      ]
+    : (nHint > 50
+      ? [
+          { name: 'length_lanes', sortMode: 'length', pass2: true },
+          { name: 'heavy_floor', sortMode: 'heavy', pass2: true },
+        ]
+      : [
+          { name: 'heavy_floor', sortMode: 'heavy', pass2: true },
+          { name: 'length_lanes', sortMode: 'length', pass2: true },
+          { name: 'volume_dense', sortMode: 'volume', pass2: true },
+        ]);
+  let best = null;
+  let bestScore = -1e18;
+  let bestName = strategies[0].name;
+  for (let i = 0; i < strategies.length; i++) {
+    const st = strategies[i];
+    try {
+      const res = layoutContainerPackStep8(items, spec, rotMap, {
+        ...base,
+        pass2: st.pass2 !== false,
+        sortMode: st.sortMode,
+        _bestOfChild: true,
+        _strategyName: st.name,
+      });
+      const sc = cs8ScorePackResult(res);
+      if (sc > bestScore) {
+        bestScore = sc;
+        best = res;
+        bestName = st.name;
+      }
+      // Perfect load — stop early
+      if ((res.oversized || []).length === 0
+          && ((res.containers || [])[0]?.items || []).length > 0)
+        break;
+    } catch (e) {
+      try { console.warn('[pack-strategy]', st.name, e); } catch (_) { /* */ }
+    }
+  }
+  if (!best) {
+    return layoutContainerPackStep8(items, spec, rotMap, { ...base, _bestOfChild: true });
+  }
+  try {
+    const n = ((best.containers || [])[0]?.items || []).length;
+    const left = (best.oversized || []).length;
+    console.info(`[pack-bestOf] winner=${bestName} placed=${n} leftover=${left}`);
+  } catch (_) { /* */ }
+  best.packStrategy = bestName;
+  try { window.__lastPackStrategy = bestName; } catch (_) { /* */ }
+  return best;
 }
 layoutOptimized._isStep8 = true;
 
 // ── unit builders (metadata / dims only — never rewrite sect geometry) ─────
 
+/**
+ * IFC often stores member length on widthMm (RF012: L=200, W=11607, H=2507).
+ * Remap structural assemblies to ship axes: longest→L, smallest→W, mid→H (upright).
+ */
+function cs8NormalizeAssemblyShipAxes(l, w, h, pu) {
+  const L0 = Math.max(+l || 0, 0);
+  const W0 = Math.max(+w || 0, 0);
+  const H0 = Math.max(+h || 0, 0);
+  if (!(L0 > 0 && W0 > 0 && H0 > 0)) return null;
+  const blob = `${(pu && pu.assemblyName) || ''} ${(pu && pu.mark) || ''}`
+    + ` ${(pu && pu.groupKind) || ''} ${(pu && pu.category) || ''}`;
+  const structural = !!(pu && (pu.isAssembly || pu.groupKind === 'welded_assembly'
+    || pu.groupKind === 'bundle_beam'))
+    || /RAFTER|COLUMN|PORTAL|FRAME|BEAM/i.test(blob);
+  if (!structural) return null;
+  const dims = [L0, W0, H0].slice().sort((a, b) => b - a);
+  const longest = dims[0];
+  const mid = dims[1];
+  const small = dims[2];
+  // Already length-primary and upright-friendly
+  if (L0 >= longest * 0.95 && Math.min(W0, H0) <= 2438 + 1
+      && Math.max(W0, H0) <= 2690 + 1) {
+    return {
+      l: L0,
+      w: Math.min(W0, H0),
+      h: Math.max(W0, H0),
+      source: 'axis_ok',
+    };
+  }
+  // True residual pitch (mid exceeds both W and H): do NOT invent a fake
+  // height — caller must improve ground pose or reject. Axis remap alone
+  // cannot invent a shippable section from pitched AABB.
+  if (mid > 2438 && mid > 2690) {
+    return null;
+  }
+  return {
+    l: longest,
+    w: small,
+    h: mid,
+    source: 'axis_remap',
+  };
+}
+
+/**
+ * If measured AABB still has roof-pitch mid-edge (>40ft W and H), remap to
+ * length × section so Step8 can upright-pack (RF012 WIDTH_EXCEEDS fix).
+ * Also forces longest edge onto L when IFC swapped length/width.
+ */
+function cs8SanitizePitchedAssemblyEnvelope(sb, pu, memberL, constructW, constructH) {
+  if (!sb || !(sb.l > 0 && sb.w > 0 && sb.h > 0)) return sb;
+  const blob = `${(pu && pu.assemblyName) || ''} ${(pu && pu.mark) || ''}`
+    + ` ${(pu && pu.groupKind) || ''} ${(pu && pu.category) || ''}`;
+  const structural = !!(pu && (pu.isAssembly || pu.groupKind === 'welded_assembly'))
+    || /RAFTER|COLUMN|PORTAL|FRAME|BEAM/i.test(blob);
+  if (!structural) return sb;
+  const Wmax = 2438;
+  const Hmax = 2690;
+  const dims = [sb.l, sb.w, sb.h].slice().sort((a, b) => b - a);
+  const longest = dims[0];
+  const mid = dims[1];
+  const small = dims[2];
+
+  // Prefer construction member length when IFC put span on width/height
+  const constructNorm = cs8NormalizeAssemblyShipAxes(
+    memberL || sb.l,
+    constructW || sb.w,
+    constructH || sb.h,
+    pu
+  );
+
+  // Mid edge cannot sit in W or H → residual roof-pitch in measured mesh.
+  // Only adopt construction ship axes when they share the same member length
+  // (no invented H). Otherwise keep measured — ground pose must flatten.
+  if (mid > Wmax && mid > Hmax) {
+    if (constructNorm
+        && constructNorm.w <= Wmax + 1 && constructNorm.h <= Hmax + 1
+        && constructNorm.l >= longest * 0.85
+        && constructNorm.l <= longest * 1.15
+        && constructNorm.source !== 'axis_pitch_strip') {
+      try {
+        console.warn(
+          `[pitch→construct] ${(pu && pu.mark) || '?'} ${Math.round(sb.l)}×${Math.round(sb.w)}×${Math.round(sb.h)}`
+          + ` → ${Math.round(constructNorm.l)}×${Math.round(constructNorm.w)}×${Math.round(constructNorm.h)}`
+        );
+      } catch (_) { /* */ }
+      return {
+        l: constructNorm.l, w: constructNorm.w, h: constructNorm.h,
+        source: 'pitch_to_construct',
+        pitchedFrom: { l: sb.l, w: sb.w, h: sb.h },
+      };
+    }
+    return {
+      ...sb,
+      source: 'pitched_unresolved',
+      pitchedFrom: { l: sb.l, w: sb.w, h: sb.h },
+    };
+  }
+
+  // Shippable but axes swapped (RF012: 200×11607×2507) → longest on L
+  const axis = cs8NormalizeAssemblyShipAxes(sb.l, sb.w, sb.h, pu);
+  if (axis && (axis.source === 'axis_remap' || axis.source === 'axis_ok')) {
+    if (Math.abs(axis.l - sb.l) > 1 || Math.abs(axis.w - sb.w) > 1
+        || Math.abs(axis.h - sb.h) > 1) {
+      try {
+        console.warn(
+          `[axis-remap] ${(pu && pu.mark) || '?'} ${Math.round(sb.l)}×${Math.round(sb.w)}×${Math.round(sb.h)}`
+          + ` → ${Math.round(axis.l)}×${Math.round(axis.w)}×${Math.round(axis.h)}`
+        );
+      } catch (_) { /* */ }
+      return {
+        l: axis.l, w: axis.w, h: axis.h,
+        source: axis.source,
+        pitchedFrom: { l: sb.l, w: sb.w, h: sb.h },
+      };
+    }
+  }
+  if (constructNorm && constructNorm.source === 'axis_remap'
+      && constructNorm.l > sb.l * 1.5) {
+    // Measured sb kept short L; prefer remapped construction span
+    return {
+      l: constructNorm.l, w: constructNorm.w, h: constructNorm.h,
+      source: 'axis_remap_construct',
+      pitchedFrom: { l: sb.l, w: sb.w, h: sb.h },
+    };
+  }
+  return sb;
+}
+
 function cs8UnitFromPackUnit(pu) {
   if (!pu) return null;
   const bb = pu.bundle_bbox || {};
-  // Construction dims for makeShape / nest (NEVER rewritten by rest-pose swap)
-  const memberL = Math.max(
+  // Construction dims — remap IFC axis swap (length on widthMm) for assemblies.
+  // Prefer envelope heightMm/widthMm over sectH/sectW: Tekla CS labels like
+  // "604.2A-6" stamp sectH=604/sectW=6 (one plate), not the rafter web depth.
+  let memberL = Math.max(
     pu.lengthMaxMm || pu.lengthMm || bb.l || pu.l || 1, 1);
-  const constructH = Math.max(
-    pu.sectH || pu.unitHeight || pu.heightMm || bb.h || 1, 1);
-  const constructW = Math.max(
-    pu.sectW || pu.unitWidth || pu.widthMm || bb.w || 1, 1);
+  const isAsm = !!(pu.isAssembly || pu.groupKind === 'welded_assembly'
+    || (pu.parts && pu.parts.length >= 2));
+  let constructH = isAsm
+    ? Math.max(pu.heightMm || bb.h || pu.sectH || pu.unitHeight || 1, 1)
+    : Math.max(pu.sectH || pu.unitHeight || pu.heightMm || bb.h || 1, 1);
+  let constructW = isAsm
+    ? Math.max(pu.widthMm || bb.w || pu.sectW || pu.unitWidth || 1, 1)
+    : Math.max(pu.sectW || pu.unitWidth || pu.widthMm || bb.w || 1, 1);
+  const axis0 = cs8NormalizeAssemblyShipAxes(memberL, constructW, constructH, pu);
+  if (axis0 && (axis0.source === 'axis_remap' || axis0.source === 'axis_pitch_strip')) {
+    memberL = axis0.l;
+    constructW = axis0.w;
+    constructH = axis0.h;
+  } else if (axis0 && axis0.source === 'axis_ok') {
+    constructW = axis0.w;
+    constructH = axis0.h;
+  }
 
   // Pack footprint: prefer measured post-rest-pose AABB (matches render)
   let sb = pu.stableBundleMm;
@@ -816,6 +1123,31 @@ function cs8UnitFromPackUnit(pu) {
       if (sb) pu.stableBundleMm = sb;
     } catch (_) { /* */ }
   }
+
+  // Strip residual roof-pitch AABB (e.g. RF012 11864×4341×869) → shippable L×sect
+  sb = cs8SanitizePitchedAssemblyEnvelope(sb, pu, memberL, constructW, constructH);
+  // Guard: collapsed plate measure only — never invent over pitched_unresolved
+  const lostSpan = sb && memberL > 1000 && sb.l < memberL * 0.85
+    && sb.source !== 'pitched_unresolved';
+  const lostWeb = sb && constructH > 1000 && constructH <= 2690
+    && sb.h < constructH * 0.55
+    && sb.source !== 'pitched_unresolved'
+    && !(sb.pitchedFrom && sb.pitchedFrom.h > 2690);
+  if (sb && (lostSpan || lostWeb)) {
+    try {
+      console.warn(
+        `[span-guard] ${(pu && pu.mark) || '?'} measured ${Math.round(sb.l)}×${Math.round(sb.w)}×${Math.round(sb.h)}`
+        + ` vs construct ${Math.round(memberL)}×${Math.round(constructW)}×${Math.round(constructH)}`
+        + ` — using ship axes`
+      );
+    } catch (_) { /* */ }
+    sb = {
+      l: memberL, w: constructW, h: constructH,
+      source: 'construct_span_guard',
+      pitchedFrom: { l: sb.l, w: sb.w, h: sb.h },
+    };
+  }
+  if (sb && pu) pu.stableBundleMm = sb;
 
   const l = Math.max(sb?.l || bb.l || memberL, 1);
   const w = Math.max(sb?.w || bb.w || constructW, 1);
@@ -926,12 +1258,36 @@ function cs8UnitLengthMm(u) {
   );
 }
 
+/** True for L/Z/C nest pack units (strip fillers beside mega assemblies). */
+function cs8IsNestPackUnit(u) {
+  if (!u || cs8IsAssemblyUnit(u)) return false;
+  const gk = String(u.groupKind || '').toLowerCase();
+  const sk = String(u.shapeKey || u.profileShape || '').toLowerCase();
+  return /^nest_/.test(gk)
+    || sk === 'l_angle' || sk === 'z_channel' || sk === 'c_channel';
+}
+
+/**
+ * Pack wave for Pass2 leftover priority (not sort — sort keeps Rule#1).
+ * Nest packs = 0 so residual strip fill runs before stranded megas.
+ */
+function cs8PackWave(u, Lref, envOpts) {
+  if (!u) return 5;
+  if (cs8IsNestPackUnit(u)) return 0;
+  if (cs8IsAssemblyUnit(u)) return 1;
+  const tier = cs8ConstraintTier(u, Math.max(1, Number(Lref) || 12192), envOpts || {});
+  if (tier <= 1) return 2;
+  if (tier === 2) return 3;
+  return 4;
+}
+
 /**
  * Optimise insert order — RULE #1 Constraint-First:
  *   1) Assemblies: heaviest piece → longest
  *   2) Floor (tier 1): longest → heaviest → fewest valid orients
  *   3) Secondary / filler: heaviest → longest
  * Click Order ignored.
+ * (Nest strip fill is a separate Pass1 phase — see layoutContainerPackStep8.)
  *
  * @param {object[]} units
  * @param {number} LmaxHint
@@ -940,6 +1296,7 @@ function cs8UnitLengthMm(u) {
 function cs8SortHeavyAnchor(units, LmaxHint, envOpts) {
   const Lref = LmaxHint || 0;
   const eo = envOpts || {};
+  const mode = String(eo.sortMode || 'heavy').toLowerCase(); // heavy | length | volume
   const orientKey = (u) => {
     if (!(eo.Wmax > 0 && eo.Hmax > 0)) return 99;
     return cs8ValidOrientCount(u, Lref, eo.Wmax, eo.Hmax, {
@@ -951,24 +1308,39 @@ function cs8SortHeavyAnchor(units, LmaxHint, envOpts) {
     const aAsm = cs8IsAssemblyUnit(a) ? 0 : 1;
     const bAsm = cs8IsAssemblyUnit(b) ? 0 : 1;
     if (aAsm !== bAsm) return aAsm - bAsm;
+    const dL = cs8LongestDimMm(b) - cs8LongestDimMm(a);
+    const dw = cs8PackSortWeightKg(b) - cs8PackSortWeightKg(a);
+    const volA = Math.max(+a.l || 1, 1) * Math.max(+a.w || 1, 1) * Math.max(+a.h || 1, 1);
+    const volB = Math.max(+b.l || 1, 1) * Math.max(+b.w || 1, 1) * Math.max(+b.h || 1, 1);
+    const dV = volB - volA;
     if (aAsm === 0) {
-      const dw = cs8PackSortWeightKg(b) - cs8PackSortWeightKg(a);
+      // Assemblies: strategy switches primary key
+      if (mode === 'length') {
+        if (Math.abs(dL) > 50) return dL;
+        if (Math.abs(dw) > 1e-3) return dw;
+        return dV;
+      }
+      if (mode === 'volume') {
+        if (Math.abs(dV) > 1e6) return dV;
+        if (Math.abs(dw) > 1e-3) return dw;
+        return dL;
+      }
+      // default heavy
       if (Math.abs(dw) > 1e-3) return dw;
-      return cs8LongestDimMm(b) - cs8LongestDimMm(a);
+      return dL;
     }
     const ta = cs8ConstraintTier(a, Lref, eo);
     const tb = cs8ConstraintTier(b, Lref, eo);
     if (ta !== tb) return ta - tb;
-    const dL = cs8LongestDimMm(b) - cs8LongestDimMm(a);
-    const dw = cs8PieceWeightKg(b) - cs8PieceWeightKg(a);
+    const dPw = cs8PieceWeightKg(b) - cs8PieceWeightKg(a);
     // Floor: length first (lane claimers), then kg, then fewer orients
-    if (ta === 1) {
+    if (ta === 1 || mode === 'length') {
       if (Math.abs(dL) > 100) return dL;
-      if (Math.abs(dw) > 1e-3) return dw;
+      if (Math.abs(dPw) > 1e-3) return dPw;
       return orientKey(a) - orientKey(b);
     }
     // Secondary + filler: heavier first, then longer
-    if (Math.abs(dw) > 1e-3) return dw;
+    if (Math.abs(dPw) > 1e-3) return dPw;
     if (Math.abs(dL) > 1) return dL;
     return orientKey(a) - orientKey(b);
   });
@@ -1227,6 +1599,9 @@ function cs8StableBaseOrients(u, Lmax, Wmax, Hmax, opts) {
 /** OPEN+concave (Z-style): two contact rails, not planar 80% bearing. */
 function cs8NeedsTwoPointBase(u) {
   if (!u) return false;
+  // L-angle / nest_l stacks sit on the horizontal leg — planar bearing, NOT Z rails
+  if (cs8IsNestPackUnit(u) || String(u.shapeKey || u.profileShape || '') === 'l_angle')
+    return false;
   if (u.two_point_base || (u.rule1_orientation && u.rule1_orientation.two_point_base))
     return true;
   if (u.stabilityInfo && u.stabilityInfo.two_point_base) return true;
@@ -1613,6 +1988,25 @@ function cs8YawTagFromRad(y) {
 }
 
 /**
+ * True when packer AABB sits inside the safe-zone (inner load line).
+ * Dimension-only (fl≤Lmax) is NOT enough — must check x+fl / z+fw (muttiyal).
+ */
+function cs8PoseInsideSafeEnvelope(x, z, y0, fl, fw, fh, Lmax, Wmax, Hceil) {
+  if (!(fl > 0 && fw > 0 && fh > 0)) return false;
+  if (fl > Lmax + CS8_EPS || fw > Wmax + CS8_EPS) return false;
+  const gaps = cs8EffectiveWallGaps(fl, fw, Lmax, Wmax);
+  const gL = gaps.gL;
+  const gW = gaps.gW;
+  if (x < gL - CS8_EPS) return false;
+  if ((x + fl) > Lmax - gL + CS8_EPS) return false;
+  if (z < gW - CS8_EPS) return false;
+  if ((z + fw) > Wmax - gW + CS8_EPS) return false;
+  if (y0 < -CS8_EPS) return false;
+  if (Hceil != null && (y0 + fh) > Hceil + CS8_EPS) return false;
+  return true;
+}
+
+/**
  * Validate one packer-space seat (x,z). Same gates as findPlacement slots.
  * Returns pose { x,z,y0,o,box,fl,fw,... } or null.
  */
@@ -1622,6 +2016,12 @@ function cs8TrySeatAt(
 ) {
   const fl = o.l, fw = o.w, fh = o.h;
   const gap = bundleGap != null ? bundleGap : cs8BundleGap();
+  const Hceil = cs8AbsolutePackHeightMm(Houter, floorClearMm);
+
+  // XY position vs inner line first (reject overhang before support map)
+  if (!cs8PoseInsideSafeEnvelope(x, z, 0, fl, fw, fh, Lmax, Wmax, null))
+    return null;
+
   const ev = cs8EvalFootprint(c, x, z, fl, fw, u, o);
   if (!ev) return null;
   if (!cs8SupportAccepted(ev, u, o, supportMin, floorAnchor)) return null;
@@ -1635,9 +2035,8 @@ function cs8TrySeatAt(
       y0 += (dunnageMm != null ? dunnageMm : cs8Dunnage());
   }
   if (floorAnchor && !cs8IsFloorOrSkidY(y0)) return null;
-
-  const Hceil = cs8AbsolutePackHeightMm(Houter, floorClearMm);
-  if (y0 + fh > Hceil + CS8_EPS) return null;
+  if (!cs8PoseInsideSafeEnvelope(x, z, y0, fl, fw, fh, Lmax, Wmax, Hceil))
+    return null;
 
   const box = {
     minX: x, maxX: x + fl,
@@ -1658,8 +2057,6 @@ function cs8TrySeatAt(
     };
     return cs8AabbCollide(boxInfl, bi);
   })) return null;
-
-  if (fl > Lmax + CS8_EPS || fw > Wmax + CS8_EPS) return null;
 
   return {
     x, z, y0, o, box, fl, fw,
@@ -2116,14 +2513,14 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
     }
   }
 
-  // Hard envelope guard — never accept a pose that sticks through the wall
-  pool = pool.filter(p =>
-    p.fl <= Lmax + CS8_EPS
-    && p.fw <= Wmax + CS8_EPS
-    && (p.y0 + ((p.o && p.o.h) || 0)) <= cs8AbsolutePackHeightMm(
-      orientOpts.Houter, orientOpts.floorClearMm
-    ) + CS8_EPS
+  // Hard envelope guard — POSITION + dims (not dims alone — muttiyal fix)
+  const HceilGuard = cs8AbsolutePackHeightMm(
+    orientOpts.Houter, orientOpts.floorClearMm
   );
+  pool = pool.filter(p => cs8PoseInsideSafeEnvelope(
+    p.x, p.z, p.y0, p.fl, p.fw, (p.o && p.o.h) || 0,
+    Lmax, Wmax, HceilGuard
+  ));
   if (!pool.length) {
     if (log) log.push({ type: 'orient_fail', mark, tag: '*', reason: 'envelope_guard' });
     return null;
@@ -2422,9 +2819,26 @@ function cs8MaxFloorStripMm(c, Lmax, Wmax) {
 function cs8CompactReseatAll(c, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm) {
   let moved = 0;
   const seeds = (c.items || []).filter(it => it._seeded);
+  // Soft-lock + unlocked: all non-seed seats can shove; user seeds stay fixed
   const movable = (c.items || []).filter(it => !it._seeded);
   if (!movable.length) return 0;
+  // Yard order: floor → closed-end bay (low packer X) → home side (low Z)
   movable.sort((a, b) => {
+    const flA = a.packFootprintL || a.lengthMm || a.l || 0;
+    const fwA = a.packFootprintW || a.widthMm || a.w || 0;
+    const fhA = a.packFootprintH || a.heightMm || a.h || 0;
+    const flB = b.packFootprintL || b.lengthMm || b.l || 0;
+    const fwB = b.packFootprintW || b.widthMm || b.w || 0;
+    const fhB = b.packFootprintH || b.heightMm || b.h || 0;
+    const y0A = (a.y || 0) - fhA / 2;
+    const y0B = (b.y || 0) - fhB / 2;
+    if (Math.abs(y0A - y0B) > 40) return y0A - y0B;
+    const x0A = (a.x || 0) - flA / 2;
+    const x0B = (b.x || 0) - flB / 2;
+    if (Math.abs(x0A - x0B) > 40) return x0A - x0B;
+    const z0A = (a.z || 0) + Wmax / 2 - fwA / 2;
+    const z0B = (b.z || 0) + Wmax / 2 - fwB / 2;
+    if (Math.abs(z0A - z0B) > 20) return z0A - z0B;
     const ta = a.anchorTier != null ? a.anchorTier : cs8AnchorTier(a);
     const tb = b.anchorTier != null ? b.anchorTier : cs8AnchorTier(b);
     if (ta !== tb) return ta - tb;
@@ -2496,13 +2910,21 @@ function cs8Pass2CompactAndFill(
     const movable = prev.filter(it => !it._seeded);
     if (!movable.length) return;
 
+    // Same yard order as Pass1 compact (floor → back bay → home Z)
     movable.sort((a, b) => {
-      const ta = a.anchorTier != null ? a.anchorTier : cs8AnchorTier(a);
-      const tb = b.anchorTier != null ? b.anchorTier : cs8AnchorTier(b);
-      if (ta !== tb) return ta - tb;
-      const dw = (b.weight || 0) - (a.weight || 0);
-      if (Math.abs(dw) > 1e-6) return dw;
-      return (a.x || 0) - (b.x || 0);
+      const flA = a.packFootprintL || a.l || 0;
+      const fwA = a.packFootprintW || a.w || 0;
+      const fhA = a.packFootprintH || a.h || 0;
+      const flB = b.packFootprintL || b.l || 0;
+      const fwB = b.packFootprintW || b.w || 0;
+      const fhB = b.packFootprintH || b.h || 0;
+      const y0A = (a.y || 0) - fhA / 2;
+      const y0B = (b.y || 0) - fhB / 2;
+      if (Math.abs(y0A - y0B) > 40) return y0A - y0B;
+      const x0A = (a.x || 0) - flA / 2;
+      const x0B = (b.x || 0) - flB / 2;
+      if (Math.abs(x0A - x0B) > 40) return x0A - x0B;
+      return ((a.z || 0) + Wmax / 2 - fwA / 2) - ((b.z || 0) + Wmax / 2 - fwB / 2);
     });
 
     cs8ResetContainerForCompact(c, seeds, Lmax, Wmax);
@@ -2557,7 +2979,7 @@ function cs8Pass2CompactAndFill(
     );
   });
 
-  // Sort leftovers: secondary then filler (constraint tier), heaviest first
+  // Sort leftovers: nest packs first (strip fill), then by wave / weight
   const leftovers = [];
   for (let i = oversized.length - 1; i >= 0; i--) {
     const u0 = oversized[i];
@@ -2568,9 +2990,9 @@ function cs8Pass2CompactAndFill(
   leftovers.sort((a, b) => {
     const ua = cs8UnitFromPackedItem(a.u0) || a.u0;
     const ub = cs8UnitFromPackedItem(b.u0) || b.u0;
-    const ta = cs8ConstraintTier(ua, Lmax, { Wmax, Hmax: Hpack });
-    const tb = cs8ConstraintTier(ub, Lmax, { Wmax, Hmax: Hpack });
-    if (ta !== tb) return ta - tb;
+    const wa = cs8PackWave(ua, Lmax, { Wmax, Hmax: Hpack });
+    const wb = cs8PackWave(ub, Lmax, { Wmax, Hmax: Hpack });
+    if (wa !== wb) return wa - wb;
     return (ub.weight || 0) - (ua.weight || 0);
   });
 
