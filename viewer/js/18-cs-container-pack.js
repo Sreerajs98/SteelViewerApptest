@@ -3,21 +3,27 @@
  * ╔══════════════════════════════════════════════════════════════════════╗
  * ║  SHAPE SAFETY — HARD RULES                                           ║
  * ║  • NEVER morph meshes / ExtrudeGeometry / sect dims / parts          ║
- * ║  • Bundle rest-pose stays from stability; pack adds Y-yaw ONLY       ║
- * ║  • ❌ NEVER tilt / flip sideways / rotate X or Z for container fit   ║
+ * ║  • Bundle rest-pose stays from stability; pack may try stable faces  ║
+ * ║  • Face rolls ONLY when needed for envelope fit (constraint Rule #1) ║
  * ╚══════════════════════════════════════════════════════════════════════╝
  *
  * Shipping policy (Pass 1 + Pass 2):
- *   RULE #1 FLOOR ANCHOR (Pass1 foundation — CoG down):
- *     Hierarchical Weight-Down: assemblies/portal → heavy beams → loose
- *     Pre-orient from Stage A/B (15a/11b) is PRIMARY — packer does NOT
- *     re-roll faces when Rule1 already found a gravity-stable pose.
+ *   RULE #1 CONSTRAINT-FIRST (Pass1 foundation):
+ *     Most constrained cargo first (fewest valid orients / longest / heaviest)
+ *     Discrete tiers: assembly → floor → secondary → filler
+ *     Pre-orient from Stage A/B is PRIMARY; face-roll fallback for fit
  *     Planar bearing ≥80% · OR two-point rails for OPEN+concave (Z)
  *     MinY = floor or skid · no tip
  *   Pass2 COMPACT+FILL: lock yaw, slide toward back/gaps, residual fill
  *
  * Heightmap 100mm; AABB; CoG soft 10% / hard 15%
  */
+
+/** Constraint-first thresholds (Rule #1). */
+const CS8_CONSTRAINT_LEN_FLOOR = 0.70;
+const CS8_CONSTRAINT_LEN_FILLER = 0.30;
+const CS8_CONSTRAINT_KG_FLOOR = 1000;
+const CS8_CONSTRAINT_KG_FILLER = 100;
 
 const CS8_CELL_MM = 100;
 const CS8_SUPPORT_MIN = 0.40;           // Pass2 / upper loose
@@ -198,31 +204,168 @@ function cs8IsAssemblyUnit(u) {
     || (u.parts && u.parts.length >= 2)));
 }
 
+/** Absolute pack height ceiling (may shrink preferred top clearance to 0). */
+function cs8AbsolutePackHeightMm(Houter, floorClearMm) {
+  const H = Math.max(1, Number(Houter) || 0);
+  const floor = Math.max(0, Number(floorClearMm) || 0);
+  return Math.max(1, H - floor);
+}
+
 /**
- * Rule #1 hierarchical tier (Floor Anchor before bundle fillers):
- *   0 = assemblies / portal frames
- *   1 = beams + LONG members (lane claimers — even if light kg)
- *   2 = loose short bundles (Z/C nests, plates, rods) — fill AFTER anchors
- *
- * Shipping: an 8.4 m / 66 kg beam must beat a 400 kg × 0.4 m nest on the floor.
+ * Preferred Hpack, but allow near-full-height floor cargo by shrinking top gap
+ * (same idea as cs8EffectiveWallGaps for length/width).
  */
-function cs8AnchorTier(u, LmaxHint) {
-  if (!u) return 2;
+function cs8EffectiveOrientHeightMm(needH, Hpack, Houter, floorClearMm) {
+  const prefer = Math.max(1, Number(Hpack) || 0);
+  const abs = cs8AbsolutePackHeightMm(Houter != null ? Houter : prefer, floorClearMm);
+  const h = Math.max(0, Number(needH) || 0);
+  if (h <= prefer + CS8_EPS) return prefer;
+  return abs;
+}
+
+/** Longest AABB edge — used for length-ratio constraint. */
+function cs8LongestDimMm(u) {
+  if (!u) return 0;
+  return Math.max(
+    +u.l || 0, +u.w || 0, +u.h || 0,
+    +u.lengthMm || 0, +u.lengthMaxMm || 0, +u.widthMm || 0, +u.heightMm || 0,
+    0
+  );
+}
+
+/** kg per piece for constraint thresholds (never nest/pack bulk as "piece"). */
+function cs8PieceWeightKg(u) {
+  if (!u) return 0;
+  const uw = Math.max(0, Number(u.unitWeightKg) || 0);
+  if (uw > 0) return uw;
+  const qty = Math.max(1, Number(u.qty) || 1);
+  const total = cs8UnitWeightKg(u);
+  if (cs8IsAssemblyUnit(u)) return total / qty;
+  const gk = String(u.groupKind || '').toLowerCase();
+  // Nest / multi-piece packs: total is the set, not one lift piece
+  if (/^nest_/.test(gk) || gk === 'bundle_rod' || gk === 'bundle_rhs'
+      || gk === 'bundle_bent') {
+    if (qty > 1) return total / qty;
+    // Unknown set size — do not treat pack kg as a single-piece floor trigger
+    return Math.min(total, CS8_CONSTRAINT_KG_FILLER);
+  }
+  if (qty > 1) return total / qty;
+  return total;
+}
+
+/**
+ * Family hint only (no length/orient math). Used inside constraint tier.
+ *   0 assembly · 1 floor family · 2 secondary · 3 filler · -1 unknown
+ */
+function cs8FamilyTierHint(u, LmaxHint) {
+  if (!u) return -1;
   if (cs8IsAssemblyUnit(u)) return 0;
+  const gk = String(u.groupKind || '').toLowerCase();
   const blob = `${u.assemblyName || ''} ${u.mark || ''} ${u.profileDesc || ''} ${u.groupKind || ''}`;
-  if (/PORTAL|FRAME|RAFTER|COLUMN|BUILT[\s-]?UP|welded_assembly/i.test(blob))
+  if (gk === 'welded_assembly'
+      || /PORTAL|FRAME|RAFTER|COLUMN|BUILT[\s-]?UP|welded_assembly/i.test(blob))
     return 0;
-  const sk = u.shapeKey || u.profileShape || '';
-  const cat = u.category || '';
+  if (gk === 'bundle_beam' || gk === 'stack_plate') return 1;
+  if (gk === 'bundle_rhs' || gk === 'nest_z' || gk === 'nest_c' || gk === 'nest_l')
+    return 2;
+  if (gk === 'bundle_rod' || gk === 'bundle_bent' || gk === 'loose_small')
+    return 3;
+
+  const sk = String(u.shapeKey || u.profileShape || '').toLowerCase();
+  const cat = String(u.category || '').toLowerCase();
   const L = Math.max(+u.l || 0, +u.lengthMm || 0, +u.lengthMaxMm || 0, 0);
   const longLane = L >= 6000 || (LmaxHint > 0 && L >= LmaxHint * 0.50);
   if (sk === 'i_beam' || cat === 'beam' || longLane) return 1;
+  if (sk === 'plate' || sk === 'flat' || cat === 'plate') return 1;
+  if (sk === 'z_channel' || sk === 'c_channel' || sk === 'l_angle'
+      || sk === 'rhs' || sk === 'shs' || sk === 'chs' || cat === 'rhs')
+    return 2;
+  if (sk === 'rod' || sk === 'round_bar' || sk === 'bar' || cat === 'rod')
+    return 3;
+  return -1;
+}
+
+/**
+ * Valid gravity-stable orients that FIT the envelope.
+ * Allows shrinking preferred top clearance up to absolute roof (Houter).
+ */
+function cs8ValidOrients(u, Lmax, Wmax, Hmax, opts) {
+  const o = opts || {};
+  if (typeof cs8StableBaseOrients === 'function')
+    return cs8StableBaseOrients(u, Lmax, Wmax, Hmax, o);
+  return cs8YawOrientsFloorAnchor(u, Lmax, Wmax, Hmax);
+}
+
+function cs8ValidOrientCount(u, Lmax, Wmax, Hmax, opts) {
+  return (cs8ValidOrients(u, Lmax, Wmax, Hmax, opts) || []).length;
+}
+
+/**
+ * RULE #1 — Constraint-First tier:
+ *   0 = assemblies / portal (floor)
+ *   1 = floor anchors (long / heavy / single-orient / beam·plate)
+ *   2 = secondary (nests, RHS, medium)
+ *   3 = gap fillers (short+light / rod·loose)
+ *
+ * @param {object} u
+ * @param {number} LmaxHint
+ * @param {object} [envOpts] { Wmax, Hmax, Houter, floorClearMm, maxKg }
+ */
+function cs8ConstraintTier(u, LmaxHint, envOpts) {
+  if (!u) return 3;
+  const Lref = Math.max(1, Number(LmaxHint) || 12192);
+  const eo = envOpts || {};
+  const fam = cs8FamilyTierHint(u, Lref);
+  if (fam === 0 || cs8IsAssemblyUnit(u)) return 0;
+
+  const longest = cs8LongestDimMm(u);
+  const lengthRatio = longest / Lref;
+  const kg = cs8PieceWeightKg(u);
+
+  let nOri = eo.validOrients;
+  if (nOri == null && eo.Wmax > 0 && eo.Hmax > 0) {
+    nOri = cs8ValidOrientCount(u, Lref, eo.Wmax, eo.Hmax, {
+      Houter: eo.Houter != null ? eo.Houter : eo.Hmax,
+      floorClearMm: eo.floorClearMm || 0,
+    });
+  }
+  const singleOrient = nOri != null && nOri > 0 && nOri <= 1;
+  const familyFloor = fam === 1;
+  const familySecondary = fam === 2;
+  const familyFiller = fam === 3;
+
+  // Tier 1 — most constrained floor cargo
+  // (nest/RHS pack totals must NOT trigger the 1000 kg rule)
+  if (lengthRatio >= CS8_CONSTRAINT_LEN_FLOOR
+      || familyFloor
+      || singleOrient
+      || (kg >= CS8_CONSTRAINT_KG_FLOOR && !familySecondary && !familyFiller)) {
+    return 1;
+  }
+
+  // Tier 3 — explicit fillers, or short+light unknowns (not nests/RHS)
+  if (familyFiller) return 3;
+  if (!familySecondary
+      && lengthRatio < CS8_CONSTRAINT_LEN_FILLER
+      && kg < CS8_CONSTRAINT_KG_FILLER) {
+    return 3;
+  }
+
+  // Tier 2 — secondary (nests / RHS / medium)
   return 2;
 }
 
+/**
+ * Legacy name — delegates to constraint-first tier (Rule #1).
+ * Staging + packer share this.
+ */
+function cs8AnchorTier(u, LmaxHint, envOpts) {
+  return cs8ConstraintTier(u, LmaxHint, envOpts);
+}
+
 /** Floor-anchor cargo must stay on the floor layer (not stacked). */
-function cs8IsFloorAnchorCargo(u, LmaxHint) {
-  return cs8AnchorTier(u, LmaxHint) <= 1;
+function cs8IsFloorAnchorCargo(u, LmaxHint, envOpts) {
+  return cs8ConstraintTier(u, LmaxHint, envOpts) <= 1;
 }
 
 /** True 90° yaw only — NOT 180° (π). Bug: |y|>0.1 treated 180 as 90. */
@@ -285,8 +428,21 @@ function layoutContainerPackStep8(items, spec, rotMap, opts) {
     units = expanded.map(cs8UnitFromExpand).filter(Boolean);
   }
 
-  // Rule #1: tier (anchors before loose) → weight → length. Click Order ignored.
-  cs8SortHeavyAnchor(units, Lmax);
+  // Stamp envelope so diagnose / orient can shrink top clearance for tall uprights
+  const envOpts = {
+    Wmax,
+    Hmax: Hpack,
+    Houter: Hmax,
+    floorClearMm: floorClear,
+    maxKg,
+  };
+  units.forEach(u => {
+    u._Houter = Hmax;
+    u._floorClearMm = floorClear;
+  });
+
+  // Rule #1 Constraint-First: most constrained → first. Click Order ignored.
+  cs8SortHeavyAnchor(units, Lmax, envOpts);
 
   const containers = [];
   const oversized = [];
@@ -370,7 +526,7 @@ function layoutContainerPackStep8(items, spec, rotMap, opts) {
       mark,
       marks: u.marks ? [...u.marks] : [mark],
       weight: cs8UnitWeightKg(u),
-      tier: cs8AnchorTier(u, Lmax),
+      tier: cs8ConstraintTier(u, Lmax, envOpts),
       isAssembly: cs8IsAssemblyUnit(u),
       floorAnchor: !!(placeOpts && placeOpts.floorAnchor),
       pass: (placeOpts && placeOpts.pass) || 1,
@@ -381,7 +537,11 @@ function layoutContainerPackStep8(items, spec, rotMap, opts) {
       return false;
     }
 
-    const optsWithLog = Object.assign({}, placeOpts || {}, { trialLog: trialLog });
+    const optsWithLog = Object.assign({}, placeOpts || {}, {
+      trialLog: trialLog,
+      Houter: Hmax,
+      floorClearMm: floorClear,
+    });
     let placed = false;
     for (const c of containers) {
       if (c.weightUsed + u.weight > maxKg + 1e-6) continue;
@@ -390,9 +550,9 @@ function layoutContainerPackStep8(items, spec, rotMap, opts) {
       if (!pose) continue;
       cs8Commit(c, u, pose, Lmax, Wmax);
       const last = c.items[c.items.length - 1];
-      last.baseLayerLock = cs8IsFloorAnchorCargo(u);
+      last.baseLayerLock = cs8IsFloorAnchorCargo(u, Lmax, envOpts);
       last.floorAnchor = !!(placeOpts && placeOpts.floorAnchor);
-      last.anchorTier = cs8AnchorTier(u);
+      last.anchorTier = cs8ConstraintTier(u, Lmax, envOpts);
       for (let ti = 0; ti < trialLog.length; ti++) placementSteps.push(trialLog[ti]);
       placementSteps.push({
         type: 'commit',
@@ -418,9 +578,9 @@ function layoutContainerPackStep8(items, spec, rotMap, opts) {
         if (pose) {
           cs8Commit(c, u, pose, Lmax, Wmax);
           const last = c.items[c.items.length - 1];
-          last.baseLayerLock = cs8IsFloorAnchorCargo(u);
+          last.baseLayerLock = cs8IsFloorAnchorCargo(u, Lmax, envOpts);
           last.floorAnchor = !!(placeOpts && placeOpts.floorAnchor);
-          last.anchorTier = cs8AnchorTier(u);
+          last.anchorTier = cs8ConstraintTier(u, Lmax, envOpts);
           for (let ti = 0; ti < trialLog.length; ti++) placementSteps.push(trialLog[ti]);
           placementSteps.push({
             type: 'commit',
@@ -456,7 +616,7 @@ function layoutContainerPackStep8(items, spec, rotMap, opts) {
     oversized.push(cs8ToOversized(u, diag.code, diag));
     try {
       console.warn(
-        `[FloorAnchor REJECT] ${u.mark || '?'} tier=${cs8AnchorTier(u, Lmax)}`
+        `[Constraint REJECT] ${u.mark || '?'} tier=${cs8ConstraintTier(u, Lmax, envOpts)}`
         + ` ${Math.round(cs8UnitWeightKg(u))}kg`
         + ` ${Math.round(u.l || 0)}×${Math.round(u.w || 0)}×${Math.round(u.h || 0)}`
         + ` → ${diag.code}: ${diag.msg}`
@@ -466,7 +626,7 @@ function layoutContainerPackStep8(items, spec, rotMap, opts) {
   }
 
   units.forEach(u => {
-    const anchor = cs8IsFloorAnchorCargo(u, Lmax);
+    const anchor = cs8IsFloorAnchorCargo(u, Lmax, envOpts);
     pass1Place(u, anchor); // anchors: floor-only; loose: floor then stack
   });
 
@@ -692,14 +852,26 @@ function cs8UnitLengthMm(u) {
 }
 
 /**
- * Optimise insert order (try → if no fit skip → next):
- *   1) ALL assemblies heaviest PIECE → lightest (base layer — Rule #1)
- *   2) Beams / long lanes: length first (claim floor), then bundle weight
- *   3) Short loose nests: bundle weight → length
+ * Optimise insert order — RULE #1 Constraint-First:
+ *   1) Assemblies: heaviest piece → longest
+ *   2) Floor (tier 1): longest → heaviest → fewest valid orients
+ *   3) Secondary / filler: heaviest → longest
  * Click Order ignored.
+ *
+ * @param {object[]} units
+ * @param {number} LmaxHint
+ * @param {object} [envOpts] { Wmax, Hmax, Houter, floorClearMm }
  */
-function cs8SortHeavyAnchor(units, LmaxHint) {
+function cs8SortHeavyAnchor(units, LmaxHint, envOpts) {
   const Lref = LmaxHint || 0;
+  const eo = envOpts || {};
+  const orientKey = (u) => {
+    if (!(eo.Wmax > 0 && eo.Hmax > 0)) return 99;
+    return cs8ValidOrientCount(u, Lref, eo.Wmax, eo.Hmax, {
+      Houter: eo.Houter != null ? eo.Houter : eo.Hmax,
+      floorClearMm: eo.floorClearMm || 0,
+    });
+  };
   (units || []).sort((a, b) => {
     const aAsm = cs8IsAssemblyUnit(a) ? 0 : 1;
     const bAsm = cs8IsAssemblyUnit(b) ? 0 : 1;
@@ -707,21 +879,23 @@ function cs8SortHeavyAnchor(units, LmaxHint) {
     if (aAsm === 0) {
       const dw = cs8PackSortWeightKg(b) - cs8PackSortWeightKg(a);
       if (Math.abs(dw) > 1e-3) return dw;
-      return cs8UnitLengthMm(b) - cs8UnitLengthMm(a);
+      return cs8LongestDimMm(b) - cs8LongestDimMm(a);
     }
-    const ta = cs8AnchorTier(a, Lref);
-    const tb = cs8AnchorTier(b, Lref);
+    const ta = cs8ConstraintTier(a, Lref, eo);
+    const tb = cs8ConstraintTier(b, Lref, eo);
     if (ta !== tb) return ta - tb;
-    const dL = cs8UnitLengthMm(b) - cs8UnitLengthMm(a);
-    const dw = cs8PackSortWeightKg(b) - cs8PackSortWeightKg(a);
+    const dL = cs8LongestDimMm(b) - cs8LongestDimMm(a);
+    const dw = cs8PieceWeightKg(b) - cs8PieceWeightKg(a);
+    // Floor: length first (lane claimers), then kg, then fewer orients
     if (ta === 1) {
       if (Math.abs(dL) > 100) return dL;
       if (Math.abs(dw) > 1e-3) return dw;
-      return 0;
+      return orientKey(a) - orientKey(b);
     }
+    // Secondary + filler: heavier first, then longer
     if (Math.abs(dw) > 1e-3) return dw;
     if (Math.abs(dL) > 1) return dL;
-    return 0;
+    return orientKey(a) - orientKey(b);
   });
   return units;
 }
@@ -760,14 +934,18 @@ function cs8DiagnoseUnfit(u, Lmax, Wmax, Hmax, containers, maxKg) {
       msg: `Largest dim ${Math.round(Math.max(L, W, H))} mm > box max ${Math.round(maxEdge)} mm`,
     };
   }
-  const orients = typeof cs8StableBaseOrients === 'function'
-    ? cs8StableBaseOrients(u, Lmax, Wmax, Hmax)
-    : cs8YawOrientsFloorAnchor(u, Lmax, Wmax, Hmax);
+  // Prefer Hmax as pack height; also try absolute roof if caller passed raw H via u._Houter
+  const Houter = (u && u._Houter != null) ? +u._Houter : Hmax;
+  const orients = cs8ValidOrients(u, Lmax, Wmax, Hmax, {
+    Houter,
+    floorClearMm: (u && u._floorClearMm) || 0,
+  });
   if (!orients.length) {
     return {
       code: 'WIDTH_EXCEEDS_ENVELOPE',
       msg: `No face/yaw fit for ${Math.round(L)}×${Math.round(W)}×${Math.round(H)} mm`
-        + ` in ${Lmax}×${Wmax}×${Math.round(Hmax)} (tried all stable-base directions)`,
+        + ` in ${Lmax}×${Wmax}×${Math.round(Houter)} (tried all stable-base directions)`
+        + ` — need Open Top / Flat Rack`,
     };
   }
   // Fits only if end clearance shrinks below preferred 100 mm
@@ -840,11 +1018,47 @@ function cs8YawOrientsFloorAnchor(u, Lmax, Wmax, Hmax) {
 }
 
 /**
- * Yard-style ALL-DIRECTION trials for Floor Anchor:
- * yaw 0/90/180/270 + Rx/Rz face rolls. Sorted most-stable base first
- * (largest footprint, lowest tip ratio). Only orients that FIT the box.
+ * Tip score for a candidate face — MUST NOT bury the only envelope-fit pose.
+ * Upright I-beam / assembly on flange is normal shipping (high tipRatio OK).
  */
-function cs8StableBaseOrients(u, Lmax, Wmax, Hmax) {
+function cs8OrientTipPenalty(f, u) {
+  const tipRatio = f.h / Math.max(Math.min(f.l, f.w), 1);
+  const sk = String((u && (u.shapeKey || u.profileShape)) || '').toLowerCase();
+  const cat = String((u && u.category) || '').toLowerCase();
+  const blob = `${(u && u.assemblyName) || ''} ${(u && u.mark) || ''} ${(u && u.groupKind) || ''}`;
+  const structuralUpright = !!(
+    cs8IsAssemblyUnit(u)
+    || sk === 'i_beam' || sk === 'built_up' || cat === 'beam'
+    || /RAFTER|COLUMN|PORTAL|FRAME|BUILT[\s-]?UP/i.test(blob)
+  );
+  // Narrow-long base + tall = flange-standing member (shipping-normal)
+  const flangeStand = tipRatio > 2.0
+    && Math.min(f.l, f.w) <= Math.max(f.l, f.w) * 0.08
+    && f.h >= 800;
+  if (structuralUpright || flangeStand) {
+    // Mild rank only — never 1e9-scale bury
+    return tipRatio * 50 + f.h * 0.02;
+  }
+  if (tipRatio > 3.0) return 2e4 * (tipRatio - 3);
+  if (tipRatio > 2.0) return 5e3 * (tipRatio - 2);
+  return tipRatio * 200;
+}
+
+/**
+ * Yard-style ALL-DIRECTION trials for Floor Anchor:
+ * yaw 0/90/180/270 + Rx/Rz face rolls. Only orients that FIT the box.
+ * Sole-fit poses (e.g. upright rafter) always rank first — tipPen cannot bury them.
+ *
+ * opts.Houter / opts.floorClearMm — allow shrinking preferred top clearance
+ * so upright rafters (e.g. H=2508 in 2591 box) still get a valid orient.
+ */
+function cs8StableBaseOrients(u, Lmax, Wmax, Hmax, opts) {
+  const o = opts || {};
+  const Hprefer = Math.max(1, Number(Hmax) || 1);
+  const Houter = o.Houter != null ? Number(o.Houter) : Hprefer;
+  const floorClear = Math.max(0, Number(o.floorClearMm) || 0);
+  const Habs = cs8AbsolutePackHeightMm(Houter, floorClear);
+
   const A = Math.max(+u.l || 1, 1);
   const B = Math.max(+u.w || 1, 1);
   const C = Math.max(+u.h || 1, 1);
@@ -865,26 +1079,48 @@ function cs8StableBaseOrients(u, Lmax, Wmax, Hmax) {
   const list = [];
   const seen = new Set();
   faces.forEach(f => {
-    if (f.l > Lmax + CS8_EPS || f.w > Wmax + CS8_EPS || f.h > Hmax + CS8_EPS) return;
-    const key = `${Math.round(f.l)}|${Math.round(f.w)}|${Math.round(f.h)}|${f.tag}`;
+    if (f.l > Lmax + CS8_EPS || f.w > Wmax + CS8_EPS) return;
+    if (f.h > Habs + CS8_EPS) return;
+    const reducedTop = f.h > Hprefer + CS8_EPS;
+    // Keep yaw0+yaw180 (same box, door face); collapse duplicate face-roll dims
+    const key = f.yawOnly
+      ? `${Math.round(f.l)}|${Math.round(f.w)}|${Math.round(f.h)}|${f.tag}`
+      : `${Math.round(f.l)}|${Math.round(f.w)}|${Math.round(f.h)}`;
     if (seen.has(key)) return;
     seen.add(key);
     const baseArea = f.l * f.w;
     const tipRatio = f.h / Math.max(Math.min(f.l, f.w), 1);
-    const tipPen = tipRatio > 2.0 ? 1e9 * (tipRatio - 2) : tipRatio * 1e4;
+    const tipPen = cs8OrientTipPenalty(f, u);
+    const topPen = reducedTop ? 5e3 : 0;
     list.push({
       l: f.l, w: f.w, h: f.h,
       rot: { x: f.rot.x || 0, y: f.rot.y || 0, z: f.rot.z || 0 },
       tag: f.tag,
-      shipPreferred: f.yawOnly && (f.tag === 'yaw0' || f.tag === 'yaw180'),
+      shipPreferred: f.yawOnly && (f.tag === 'yaw0' || f.tag === 'yaw180') && !reducedTop,
       floorAnchor: true,
       packYawOnly: !!f.yawOnly,
       packComposeRot: !f.yawOnly,
       baseArea,
       tipRatio,
-      stabilityScore: baseArea - f.h * 40 - tipPen,
+      reducedTopClearance: reducedTop,
+      soleFit: false,
+      stabilityScore: baseArea - f.h * 40 - tipPen - topPen,
     });
   });
+
+  // Sole envelope-fit pose = ALWAYS first (constraint-first). tipPen cannot bury it.
+  if (list.length === 1) {
+    list[0].soleFit = true;
+    list[0].shipPreferred = true;
+    list[0].stabilityScore += 1e12;
+  } else if (list.length > 1) {
+    // Among fits: prefer longitudinal length along container X (lane claimers)
+    list.forEach(o => {
+      if (o.l >= Lmax * 0.70 && o.w <= Wmax + CS8_EPS && o.h <= Habs + CS8_EPS)
+        o.stabilityScore += o.l * 0.5;
+    });
+  }
+
   list.sort((a, b) => (b.stabilityScore - a.stabilityScore)
     || (b.baseArea - a.baseArea)
     || ((a.tipRatio || 0) - (b.tipRatio || 0)));
@@ -941,17 +1177,17 @@ function cs8Rule1PrimaryOrients(u, Lmax, Wmax, Hmax) {
  *   1) Rule1 primary (gravity pose) if present + fits
  *   2) Else / fallback: cs8StableBaseOrients or yaw orients
  * When `preferRule1Only`, return primary alone (caller retries fallback if empty).
+ * opts: { Houter, floorClearMm } — allow upright near-full-height fits.
  */
-function cs8ResolveTryOrients(u, Lmax, Wmax, Hmax, floorAnchor, preferRule1Only) {
+function cs8ResolveTryOrients(u, Lmax, Wmax, Hmax, floorAnchor, preferRule1Only, opts) {
+  const o = opts || {};
   const primary = cs8Rule1PrimaryOrients(u, Lmax, Wmax, Hmax);
-  if (primary.length && preferRule1Only !== false) {
-    return { primary, fallback: floorAnchor
-      ? cs8StableBaseOrients(u, Lmax, Wmax, Hmax)
-      : cs8YawOrients(u, Lmax, Wmax, Hmax) };
-  }
   const fallback = floorAnchor
-    ? cs8StableBaseOrients(u, Lmax, Wmax, Hmax)
+    ? cs8StableBaseOrients(u, Lmax, Wmax, Hmax, o)
     : cs8YawOrients(u, Lmax, Wmax, Hmax);
+  if (primary.length && preferRule1Only !== false) {
+    return { primary, fallback };
+  }
   return { primary: [], fallback };
 }
 
@@ -1262,12 +1498,20 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
   const floorAnchor = !!po.floorAnchor;
   const log = Array.isArray(po.trialLog) ? po.trialLog : null;
   const mark = u.mark || (u.marks && u.marks[0]) || '?';
+  const orientOpts = {
+    Houter: po.Houter != null ? po.Houter : (u._Houter != null ? u._Houter : Hmax),
+    floorClearMm: po.floorClearMm != null ? po.floorClearMm
+      : (u._floorClearMm != null ? u._floorClearMm : 0),
+  };
 
-  // Rule1 continuity: Stage A/B gravity pose PRIMARY; face-roll only as fallback
-  const resolved = cs8ResolveTryOrients(u, Lmax, Wmax, Hmax, floorAnchor, true);
+  // Rule1 continuity: Stage A/B gravity pose PRIMARY; face-roll fallback for fit
+  const resolved = cs8ResolveTryOrients(
+    u, Lmax, Wmax, Hmax, floorAnchor, true, orientOpts
+  );
   let tryOrients;
   if (resolved.primary.length) {
     const fb = (resolved.fallback || []).filter(o => !o.rule1Primary);
+    // If primary dims don't leave room but a face-roll does, still try rolls
     tryOrients = resolved.primary.concat(fb);
   } else {
     tryOrients = (resolved.fallback || []).slice();
@@ -1412,7 +1656,9 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
           continue;
         }
 
-        if (y0 + fh > Hmax + CS8_EPS) continue;
+        // Prefer Hpack; allow absolute roof when upright needs reduced top clearance
+        const Hceil = cs8AbsolutePackHeightMm(orientOpts.Houter, orientOpts.floorClearMm);
+        if (y0 + fh > Hceil + CS8_EPS) continue;
 
         const box = {
           minX: x, maxX: x + fl,
@@ -1489,17 +1735,36 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
     }
   }
 
+  // Hard envelope guard — never accept a pose that sticks through the wall
+  pool = pool.filter(p =>
+    p.fl <= Lmax + CS8_EPS
+    && p.fw <= Wmax + CS8_EPS
+    && (p.y0 + ((p.o && p.o.h) || 0)) <= cs8AbsolutePackHeightMm(
+      orientOpts.Houter, orientOpts.floorClearMm
+    ) + CS8_EPS
+  );
+  if (!pool.length) {
+    if (log) log.push({ type: 'orient_fail', mark, tag: '*', reason: 'envelope_guard' });
+    return null;
+  }
+
   // If Rule1 gravity pose found ANY valid seat — never override with face-roll
+  // UNLESS that seat is the only class… already filtered by envelope above.
   const rule1Pool = pool.filter(p => p.o && p.o.rule1Primary);
   if (rule1Pool.length) pool = rule1Pool;
 
-  // Select: lowest Y → Rule1 → most stable base → ship-preferred → CoG → X/Z
+  // Prefer ship yaw ONLY when a ship-preferred fit exists; never bury sole face-roll
+  const anyShip = pool.some(p => p.o && p.o.shipPreferred);
+  const anySole = pool.some(p => p.o && p.o.soleFit);
+
+  // Select: lowest Y → sole-fit / stable → ship-preferred (if any) → CoG → X/Z
   let best = null;
   for (const p of pool) {
     const stabCost = -((p.o && p.o.stabilityScore) || (p.fl * p.fw) || 0);
-    const yawCost = (p.o && p.o.shipPreferred === false) ? 1e8 : 0;
+    const yawCost = (anyShip && !anySole && p.o && p.o.shipPreferred === false) ? 1e8 : 0;
     const yaw180Cost = (p.o && (p.o.tag === 'yaw180' || p.o.tag === 'rule1_yaw180')) ? 1e5 : 0;
-    const score = p.y0 * 1e12 + stabCost * 1e0 + yawCost + yaw180Cost
+    const soleBonus = (p.o && p.o.soleFit) ? -1e11 : 0;
+    const score = p.y0 * 1e12 + stabCost * 1e0 + yawCost + yaw180Cost + soleBonus
       + p.cog.penalty * 1e9 + p.x * 1e3 + p.z;
     if (!best || score < best.score) best = { score, ...p };
   }

@@ -334,8 +334,9 @@ function renderContainer(idx) {
     outsFree.forEach(snapOut);
   }
 
-  camera.position.set(cL*0.9, cH*1.6, cL*0.7);
-  controls.target.set(cL/2, cH*0.35, 0);
+  // Zoom out enough to see full 40ft box + outside staging lane
+  camera.position.set(cL * 1.25, cH * 2.2, cL * 1.05);
+  controls.target.set(cL / 2, cH * 0.35, 0);
   controls.update();
 
   // Update right-panel container stats (null-safe — element may not exist in current layout)

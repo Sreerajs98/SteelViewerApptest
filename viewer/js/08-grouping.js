@@ -452,15 +452,18 @@ function groupItemsRealWorld(items) {
       default: return 10;
     }
   };
-  // Pack-unit weight: assemblies = single piece; nests/bundles = group/unit total
+  // Pack-unit weight — never raw group total for multi-qty (see groupPackSortWeightKg)
   const packW = (g) => {
     if (typeof groupPackSortWeightKg === 'function') return groupPackSortWeightKg(g);
     const total = Math.max(0, Number(g.weightKg) || 0);
-    if (g.groupKind === 'welded_assembly' || g.isAssembly) {
-      const qty = Math.max(1, Number(g.qty) || 1);
-      return total / qty;
+    const qty = Math.max(1, Number(g.qty) || 1);
+    if (qty <= 1) return total;
+    if (g.groupKind === 'welded_assembly' || g.isAssembly) return total / qty;
+    if (/^nest_[zcl]$/.test(g.groupKind || '')) {
+      const setSize = Math.min(12, qty);
+      return total / Math.max(1, Math.ceil(qty / setSize));
     }
-    return total;
+    return total / qty; // rod/plate/beam → piece kg fallback
   };
   list.sort((a, b) => {
     const dW = packW(b) - packW(a);

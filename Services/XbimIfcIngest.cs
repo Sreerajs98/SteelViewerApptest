@@ -405,8 +405,9 @@ public static class XbimIfcIngest
         var psets = psetsOf(asm);
         string mark = PickMark(asm, psets);
         string name = asm.Name?.ToString() ?? "ASSEMBLY";
-        double weight = PickWeight(psets);
         string profile = PickProfile(asm, psets);
+        double estimateKg = EstimateSteelWeightKg(union);
+        double weight = PickWeight(asm, psets, estimateKg);
 
         var phaseTags = new HashSet<double>();
         CollectPhaseTags(psets, phaseTags, out bool asmUntagged);
@@ -425,7 +426,7 @@ public static class XbimIfcIngest
 
         bool weightEst = !(weight > 0);
         if (weightEst)
-            weight = EstimateSteelWeightKg(union);
+            weight = estimateKg;
 
         string remarks = $"[xBIM assembly ×{parts.Count} parts; L={union.MaxX - union.MinX:0} H={union.MaxZ - union.MinZ:0} W={union.MaxY - union.MinY:0}]";
         return new SteelItem
@@ -467,10 +468,11 @@ public static class XbimIfcIngest
         var part = MakePartFromMesh(prod, mesh.Pos, mesh.Idx, cx, cy, cz, psetsOf);
         string mark = PickMark(prod, psets);
         string name = prod.Name?.ToString() ?? prod.GetType().Name;
-        double weight = PickWeight(psets);
         string profile = PickProfile(prod, psets);
+        double estimateKg = EstimateSteelWeightKg(b);
+        double weight = PickWeight(prod, psets, estimateKg);
         bool weightEst = !(weight > 0);
-        if (weightEst) weight = EstimateSteelWeightKg(b);
+        if (weightEst) weight = estimateKg;
 
         var phaseTags = new HashSet<double>();
         CollectPhaseTags(psets, phaseTags, out bool untagged);
@@ -752,17 +754,159 @@ public static class XbimIfcIngest
         return "";
     }
 
-    private static double PickWeight(List<(string Key, object? Val)> psets)
+    /// <summary>
+    /// Read IFC mass and normalize to kilograms.
+    /// Tekla exports often store grams (e.g. 47356 g → 47.356 kg) with no unit label.
+    /// Uses explicit unit when present; otherwise picks among raw /÷1000 /×1000
+    /// whichever best matches the bbox steel estimate.
+    /// </summary>
+    private static double PickWeight(
+        IIfcObject? obj,
+        List<(string Key, object? Val)> psets,
+        double estimateKg = 0)
     {
-        foreach (var key in new[] {
-            "Weight", "WEIGHT", "NetWeight", "GrossWeight",
-            "Assembly/Cast unit weight", "Assembly Weight" })
+        // 1) Prefer typed property + Unit from the object
+        if (obj != null)
         {
-            var hit = psets.FirstOrDefault(p => p.Key.Equals(key, StringComparison.OrdinalIgnoreCase)
-                || p.Key.Contains("weight", StringComparison.OrdinalIgnoreCase));
-            if (hit.Val != null && TryToDouble(hit.Val, out var w) && w > 0) return w;
+            try
+            {
+                foreach (var rel in obj.IsDefinedBy.OfType<IIfcRelDefinesByProperties>())
+                {
+                    if (rel.RelatingPropertyDefinition is not IIfcPropertySet pset) continue;
+                    foreach (var prop in pset.HasProperties.OfType<IIfcPropertySingleValue>())
+                    {
+                        string key = prop.Name.ToString() ?? "";
+                        if (!IsWeightPropertyKey(key)) continue;
+                        object? nom = prop.NominalValue?.Value;
+                        if (nom == null) continue;
+                        if (!TryToDouble(nom, out var w) || w <= 0) continue;
+                        string? unit = FormatIfcUnit(prop.Unit);
+                        return NormalizeMassToKg(w, unit, estimateKg);
+                    }
+                }
+            }
+            catch { /* broken pset links */ }
+        }
+
+        // 2) Fallback: flat pset list (+ optional WEIGHT_UNIT hint)
+        string? unitHint = null;
+        foreach (var (key, val) in psets)
+        {
+            if (val == null) continue;
+            if (key.Contains("WEIGHT_UNIT", StringComparison.OrdinalIgnoreCase)
+                || key.Equals("MassUnit", StringComparison.OrdinalIgnoreCase)
+                || key.Equals("UNIT", StringComparison.OrdinalIgnoreCase))
+            {
+                unitHint = val.ToString();
+                break;
+            }
+        }
+
+        foreach (var (key, val) in psets)
+        {
+            if (val == null || !IsWeightPropertyKey(key)) continue;
+            if (!TryToDouble(val, out var w) || w <= 0) continue;
+            return NormalizeMassToKg(w, unitHint, estimateKg);
         }
         return 0;
+    }
+
+    private static bool IsWeightPropertyKey(string key)
+    {
+        if (string.IsNullOrWhiteSpace(key)) return false;
+        if (key.Contains("WEIGHT_UNIT", StringComparison.OrdinalIgnoreCase)) return false;
+        foreach (var k in new[] {
+            "Weight", "WEIGHT", "NetWeight", "GrossWeight",
+            "Assembly/Cast unit weight", "Assembly Weight", "Mass" })
+        {
+            if (key.Equals(k, StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        return key.Contains("weight", StringComparison.OrdinalIgnoreCase)
+            && !key.Contains("unit", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? FormatIfcUnit(IIfcUnit? unit)
+    {
+        if (unit == null) return null;
+        try
+        {
+            if (unit is IIfcSIUnit si)
+            {
+                // KILOGRAM → "kg"; bare GRAM → "g"; etc.
+                string name = si.Name.ToString();
+                if (name.Equals("GRAM", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (si.Prefix.HasValue
+                        && si.Prefix.Value.ToString().Equals("KILO", StringComparison.OrdinalIgnoreCase))
+                        return "kg";
+                    return "g";
+                }
+                string prefix = si.Prefix.HasValue ? si.Prefix.Value.ToString() : "";
+                return string.IsNullOrEmpty(prefix) ? name : $"{prefix}_{name}";
+            }
+            return unit.ToString();
+        }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Convert raw IFC mass number → kg. Explicit unit wins; else estimate-guided.
+    /// Example: Tekla 47356 (g) + rod estimate ~40 kg → 47.356 kg.
+    /// </summary>
+    internal static double NormalizeMassToKg(double raw, string? unitHint, double estimateKg = 0)
+    {
+        if (!(raw > 0) || double.IsNaN(raw) || double.IsInfinity(raw)) return 0;
+
+        string u = (unitHint ?? "").Trim().ToLowerInvariant();
+        if (u.Length > 0)
+        {
+            if (u == "kg" || u.Contains("kilogram") || u == "kilo_gram" || u.Contains("kilo_gram"))
+                return raw;
+            if (u == "g" || u == "gram" || u.Contains("gramme")
+                || (u.Contains("gram") && !u.Contains("kilo") && !u.Contains("kg")))
+                return raw / 1000.0;
+            if (u.Contains("tonne") || u == "t" || u.Contains("metric ton")
+                || (u.Contains("ton") && !u.Contains("newton")))
+                return raw * 1000.0;
+        }
+
+        const double maxUnitKg = 26000; // container payload — one placeable unit cannot exceed
+        double asG = raw / 1000.0;
+        double asT = raw * 1000.0;
+
+        // Hard: raw already heavier than a full container → grams
+        if (raw > maxUnitKg && asG >= 0.05 && asG <= maxUnitKg)
+            return asG;
+
+        // Estimate-guided (cap estimate — fat assembly AABB must not “prove” tonnes)
+        if (estimateKg >= 1.0)
+        {
+            double estUse = Math.Min(estimateKg, 5000);
+            double best = raw;
+            double bestScore = double.PositiveInfinity;
+            foreach (double c in new[] { raw, asG, asT })
+            {
+                if (c < 0.05 || c > maxUnitKg) continue;
+                double ratio = c / estUse;
+                if (ratio < 0.05 || ratio > 25) continue;
+                double score = Math.Abs(Math.Log(ratio));
+                if (score < bestScore)
+                {
+                    bestScore = score;
+                    best = c;
+                }
+            }
+            if (!double.IsPositiveInfinity(bestScore))
+                return best;
+
+            // Light section estimate + huge raw → grams (rod/plate)
+            if (estUse < 500 && raw >= 5000 && asG >= 0.5 && asG <= 5000)
+                return asG;
+        }
+
+        if (raw > 100_000) return asG;
+        if (raw < 0.05) return asT;
+        return raw;
     }
 
     private static string PickSurface(List<(string Key, object? Val)> psets, string profile, string remarks)

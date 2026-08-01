@@ -60,7 +60,7 @@ function groupIsWeldedAssembly(g) {
   ));
 }
 
-/** Best available GROUP TOTAL kg (all pcs / all pack units summed). */
+/** Best available GROUP TOTAL kg (members preferred; ignore inflated pack-unit stamps). */
 function groupTotalWeightKg(g) {
   if (!g) return 0;
   let kg = Math.max(0, Number(g.weightKg) || 0);
@@ -72,95 +72,339 @@ function groupTotalWeightKg(g) {
   }
   const pus = g.packUnits || [];
   if (pus.length) {
-    const puSum = pus.reduce((s, pu) =>
-      s + Math.max(0, Number(pu.total_weight) || Number(pu.weightKg) || 0), 0);
-    if (puSum > kg) kg = puSum;
+    let puSum = 0;
+    let maxPu = 0;
+    pus.forEach(pu => {
+      const w = Math.max(0, Number(pu.total_weight) || Number(pu.weightKg) || 0);
+      puSum += w;
+      if (w > maxPu) maxPu = w;
+    });
+    const card = Math.max(0, Number(g.weightKg) || 0);
+    // Skip sum when each unit was wrongly stamped with full group kg
+    const inflated = pus.length > 1 && card > 0 && maxPu >= card * 0.85;
+    if (!inflated && puSum > kg) kg = puSum;
   }
   return kg;
 }
 
-/**
- * Pack-order sort key (how cargo enters the container):
- *   Welded assembly → SINGLE PIECE kg (worker lifts one rafter)
- *   Z/C/L nest & other bundles → ONE pack-unit / bundle kg (not whole group)
- */
-function groupPackSortWeightKg(g) {
-  if (!g) return 0;
-  const total = groupTotalWeightKg(g);
-
-  if (groupIsWeldedAssembly(g)) {
-    const mem = g.memberItems || g.memberPieces || [];
-    let maxU = 0;
-    mem.forEach(p => {
-      const u = Math.max(0, Number(p.unitWeightKg) || 0);
-      if (u > maxU) maxU = u;
-    });
-    if (maxU > 0) {
-      g.packSortWeightKg = maxU;
-      g.sortWeightKg = maxU;
-      return maxU;
-    }
-    const pus = g.packUnits || [];
-    if (pus.length) {
-      let maxPu = 0;
-      pus.forEach(pu => {
-        const w = Math.max(0, Number(pu.total_weight) || Number(pu.weightKg) || 0);
-        if (w > maxPu) maxPu = w;
-      });
-      if (maxPu > 0) {
-        g.packSortWeightKg = maxPu;
-        g.sortWeightKg = maxPu;
-        return maxPu;
-      }
-    }
-    const qty = Math.max(1, Number(g.qty) || mem.length || 1);
-    const single = total / qty;
-    g.packSortWeightKg = single;
-    g.sortWeightKg = single;
-    return single;
-  }
-
-  // Cold-formed / beams / rods: one bundle unit weight
-  const pus = g.packUnits || [];
-  if (pus.length) {
-    let maxPu = 0;
-    pus.forEach(pu => {
-      const w = Math.max(0, Number(pu.total_weight) || Number(pu.weightKg) || 0);
-      if (w > maxPu) maxPu = w;
-    });
-    if (maxPu > 0) {
-      g.packSortWeightKg = maxPu;
-      g.sortWeightKg = maxPu;
-      return maxPu;
-    }
-  }
-  g.packSortWeightKg = total;
-  g.sortWeightKg = total;
-  return total;
+function groupIsNestFamily(g) {
+  return /^nest_[zcl]$/.test((g && g.groupKind) || '');
 }
 
-/** Alias → pack sort key (assemblies=piece, bundles=unit). */
+function groupIsFlatStackFamily(g) {
+  if (!g) return false;
+  if (g.groupKind === 'stack_plate') return true;
+  const m = (g.nestMethod && g.nestMethod.method) || g.nest_method || '';
+  return String(m).toUpperCase() === 'FLAT_STACK';
+}
+
+function groupQtyPcs(g) {
+  if (!g) return 1;
+  const mem = g.memberItems || g.memberPieces || [];
+  return Math.max(1, Number(g.qty) || mem.length || 1);
+}
+
+/** Sanitize a kg reading (grams→kg) using group / member geometry. */
+function groupSanitizeKg(g, raw) {
+  const w = Math.max(0, Number(raw) || 0);
+  if (!(w > 0)) return 0;
+  if (typeof normalizeMassToKg !== 'function') return w;
+  const mem0 = (g.memberItems || g.memberPieces || [])[0] || {};
+  const est = (typeof estimateBboxSteelKg === 'function')
+    ? estimateBboxSteelKg({
+      lengthMm: mem0.lengthMm || g.lengthMaxMm || g.virtualLmm,
+      widthMm: mem0.widthMm || g.virtualWmm || g.sectW,
+      heightMm: mem0.heightMm || g.virtualHmm || g.sectH,
+      sectT: mem0.sectT || g.sectT,
+      sectW: mem0.sectW || g.sectW,
+      sectH: mem0.sectH || g.sectH,
+      sectD: mem0.sectD || g.sectD,
+      pathDiamMm: mem0.pathDiamMm,
+      shapeKey: g.shapeKey || mem0.shapeKey,
+      profileShape: g.profileShape || mem0.profileShape,
+      profileDesc: g.profileDesc || mem0.profileDesc,
+      mark: g.mark || mem0.mark,
+      assemblyName: g.name || mem0.assemblyName,
+      isAssembly: g.isAssembly || mem0.isAssembly,
+      parts: mem0.parts || g.parts,
+    })
+    : 0;
+  return normalizeMassToKg(w, est) || w;
+}
+
+/** Raw (pre-sanitize) heaviest member unit kg, or card/qty. */
+function groupPieceWeightKg(g) {
+  if (!g) return 0;
+  const mem = g.memberItems || g.memberPieces || [];
+  let maxU = 0;
+  mem.forEach(p => {
+    const u = Math.max(0, Number(p.unitWeightKg) || 0);
+    if (u > maxU) maxU = u;
+  });
+  if (maxU > 0) return maxU;
+  const qty = groupQtyPcs(g);
+  const card = Math.max(0, Number(g.weightKg) || 0);
+  return card > 0 ? card / qty : 0;
+}
+
+function formatKgPill(kg) {
+  const v = Number(kg) || 0;
+  if (!(v > 0)) return '0';
+  if (v < 10) return v.toFixed(1);
+  if (v < 100) return v.toFixed(1);
+  return String(Math.round(v));
+}
+
+/**
+ * Stamp display + sort fields on a staging group:
+ *   unitWeightKg  = 1 piece (sanitized)
+ *   totalWeightKg = N × unit
+ *   sortWeightKg  = unit kg, OR real pack/set kg when already bundled
+ */
+function attachGroupWeightFields(g) {
+  if (!g) return g;
+  const qty = groupQtyPcs(g);
+  g.qty = qty;
+
+  let unit = groupSanitizeKg(g, groupPieceWeightKg(g));
+  // If card looks like qty×raw and unit still huge, try card/qty sanitize
+  const card = Math.max(0, Number(g.weightKg) || 0);
+  if (!(unit > 0) && card > 0)
+    unit = groupSanitizeKg(g, card / qty);
+
+  const total = unit * qty;
+  g.unitWeightKg = unit;
+  g.totalWeightKg = total;
+  g.weightKg = total; // keep legacy field = true group total
+
+  // Real placeable pack (nest/hex) — not "whole group total" fake PU
+  const pus = g.packUnits || [];
+  let maxPu = 0;
+  let puQty = 1;
+  pus.forEach(pu => {
+    const w = Math.max(0, Number(pu.total_weight) || Number(pu.weightKg) || 0);
+    if (w > maxPu) {
+      maxPu = w;
+      puQty = Math.max(1, Number(pu.qty) || (pu.nestPieces && pu.nestPieces.length) || 1);
+    }
+  });
+  const wholeGroupPu = qty > 1 && card > 0 && pus.length <= 1
+    && (maxPu <= 0 || maxPu >= card * 0.85);
+  const inflatedMulti = qty > 1 && pus.length > 1 && card > 0 && maxPu >= card * 0.85;
+
+  let sortKg = unit;
+  let sortLabel = 'pc';
+
+  if (groupIsNestFamily(g) && !wholeGroupPu && !inflatedMulti) {
+    if (maxPu > 0) {
+      sortKg = groupSanitizeKg(g, maxPu);
+      sortLabel = 'pack';
+    } else {
+      const setSize = Math.min(12, qty);
+      sortKg = unit * setSize;
+      sortLabel = 'pack';
+    }
+  } else if (!groupIsWeldedAssembly(g) && !groupIsFlatStackFamily(g)
+      && maxPu > 0 && !wholeGroupPu && !inflatedMulti) {
+    const puSan = groupSanitizeKg(g, maxPu);
+    // Genuine multi-piece pack (hex etc.): sort by that pack weight
+    if (puQty > 1 && unit > 0 && puSan > unit * 1.5 && puSan < unit * puQty * 1.15) {
+      sortKg = puSan;
+      sortLabel = 'pack';
+    } else if (puQty === 1) {
+      sortKg = puSan > 0 ? puSan : unit;
+      sortLabel = 'pc';
+    }
+  }
+
+  g.sortWeightKg = sortKg;
+  g.packSortWeightKg = sortKg;
+  g._packSortLabel = sortLabel;
+  return g;
+}
+
+/** Sort / optimise weight key — unit kg, or pack kg when bundled. */
+function groupPackSortWeightKg(g) {
+  attachGroupWeightFields(g);
+  return Math.max(0, Number(g.sortWeightKg) || 0);
+}
+
+/** Alias used across staging / grouping. */
 function groupSortWeightKg(g) {
   return groupPackSortWeightKg(g);
 }
 
+/** Container length hint for long-lane floor-anchor detection. */
+function stagingLmaxHint() {
+  try {
+    if (typeof getPackConfig === 'function') {
+      const L = Number((getPackConfig().container || {}).lengthMm) || 0;
+      if (L > 0) return L;
+    }
+  } catch (_) { /* ignore */ }
+  const c = (typeof containers !== 'undefined' && containers)
+    ? containers.find(x => x.id === activeContainerId) || containers[0]
+    : null;
+  return Math.max(1, Number(c && c.spec && c.spec.lengthMm) || 12192);
+}
+
+/** Proxy so staging groups share cs8ConstraintTier with the packer. */
+function groupToAnchorProxy(g) {
+  if (!g) return null;
+  const mem0 = (g.memberItems || g.memberPieces || [])[0] || {};
+  const L = Math.max(
+    Number(g.lengthMaxMm) || 0,
+    Number(g.lengthMm) || 0,
+    Number(g.virtualLmm) || 0,
+    Number(mem0.lengthMm) || 0,
+    0
+  );
+  const W = Math.max(
+    Number(g.virtualWmm) || 0,
+    Number(g.widthMm) || 0,
+    Number(mem0.widthMm) || 0,
+    Number(g.sectW) || 0,
+    0
+  );
+  const H = Math.max(
+    Number(g.virtualHmm) || 0,
+    Number(g.heightMm) || 0,
+    Number(mem0.heightMm) || 0,
+    Number(g.sectH) || 0,
+    0
+  );
+  attachGroupWeightFields(g);
+  return {
+    isAssembly: groupIsWeldedAssembly(g) || !!g.isAssembly,
+    parts: g.parts || mem0.parts,
+    groupKind: g.groupKind,
+    shapeKey: g.shapeKey || g.profileShape || mem0.shapeKey,
+    profileShape: g.profileShape || mem0.profileShape,
+    category: g.category || mem0.category,
+    mark: g.mark || mem0.mark,
+    assemblyName: g.name || g.assemblyName || mem0.assemblyName,
+    profileDesc: g.profileDesc || mem0.profileDesc,
+    l: L || 1,
+    w: W || 1,
+    h: H || 1,
+    lengthMm: L,
+    lengthMaxMm: L,
+    widthMm: W,
+    heightMm: H,
+    qty: groupQtyPcs(g),
+    unitWeightKg: Number(g.unitWeightKg) || 0,
+    weightKg: Number(g.totalWeightKg) || Number(g.weightKg) || 0,
+  };
+}
+
+/** Staging envelope opts for constraint tier (matches packer). */
+function stagingEnvOpts() {
+  const L = stagingLmaxHint();
+  let W = 2438;
+  let H = 2591;
+  try {
+    if (typeof getPackConfig === 'function') {
+      const c = getPackConfig().container || {};
+      if (c.widthMm > 0) W = +c.widthMm;
+      if (c.heightMm > 0) H = +c.heightMm;
+    }
+  } catch (_) { /* ignore */ }
+  let Hpack = H;
+  let floorClear = 0;
+  if (typeof getPackEnvelope === 'function') {
+    const env = getPackEnvelope({ lengthMm: L, widthMm: W, heightMm: H });
+    floorClear = env.clearanceFloorMm || 0;
+    Hpack = Math.max(1, H - (env.clearanceTopMm || 0) - floorClear);
+  } else if (typeof cs8WallGapTop === 'function') {
+    Hpack = Math.max(1, H - cs8WallGapTop());
+  }
+  return { Wmax: W, Hmax: Hpack, Houter: H, floorClearMm: floorClear };
+}
+
 /**
- * Staging list: pack-unit weight high → low.
- * Assemblies by piece kg; Z/C bundles by nest-set kg.
+ * Load tier matching packer Rule #1 Constraint-First:
+ *   0/1 = floor anchors, 2 = secondary, 3 = gap fillers
  */
+function groupLoadAnchorTier(g) {
+  if (!g) return 3;
+  const Lref = stagingLmaxHint();
+  const eo = stagingEnvOpts();
+  let tier;
+  const proxy = groupToAnchorProxy(g);
+  if (typeof cs8ConstraintTier === 'function') {
+    tier = cs8ConstraintTier(proxy, Lref, eo);
+  } else if (typeof cs8AnchorTier === 'function') {
+    tier = cs8AnchorTier(proxy, Lref, eo);
+  } else {
+    const gk = String(g.groupKind || '').toLowerCase();
+    if (groupIsWeldedAssembly(g) || gk === 'welded_assembly') tier = 0;
+    else if (gk === 'bundle_beam' || gk === 'stack_plate') tier = 1;
+    else if (gk === 'bundle_rhs' || /^nest_[zcl]$/.test(gk)) tier = 2;
+    else if (gk === 'bundle_rod' || gk === 'bundle_bent' || gk === 'loose_small') tier = 3;
+    else tier = 2;
+  }
+  g.loadTier = tier;
+  g.loadTierLabel = (tier <= 1) ? 'Floor' : (tier === 2 ? 'Secondary' : 'Filler');
+  return tier;
+}
+
+function groupLoadLengthMm(g) {
+  if (!g) return 0;
+  const mem0 = (g.memberItems || g.memberPieces || [])[0] || {};
+  return Math.max(
+    Number(g.lengthMaxMm) || 0,
+    Number(g.lengthMm) || 0,
+    Number(g.virtualLmm) || 0,
+    Number(mem0.lengthMm) || 0,
+    0
+  );
+}
+
+/**
+ * Staging / #1…n order — same hierarchy as cs8SortHeavyAnchor:
+ * assemblies first → floor tier → secondary → filler; within tier kg/pc
+ * (beams/plates: length then kg/pc).
+ */
+function compareStagingLoadOrder(a, b) {
+  attachGroupWeightFields(a);
+  attachGroupWeightFields(b);
+  const aAsm = groupIsWeldedAssembly(a) ? 0 : 1;
+  const bAsm = groupIsWeldedAssembly(b) ? 0 : 1;
+  if (aAsm !== bAsm) return aAsm - bAsm;
+  const ua = Number(a.unitWeightKg) || 0;
+  const ub = Number(b.unitWeightKg) || 0;
+  if (aAsm === 0) {
+    const dw = ub - ua;
+    if (Math.abs(dw) > 1e-6) return dw;
+    return groupLoadLengthMm(b) - groupLoadLengthMm(a);
+  }
+  const ta = groupLoadAnchorTier(a);
+  const tb = groupLoadAnchorTier(b);
+  if (ta !== tb) return ta - tb;
+  const dL = groupLoadLengthMm(b) - groupLoadLengthMm(a);
+  const dw = ub - ua;
+  if (ta === 1) {
+    if (Math.abs(dL) > 100) return dL;
+    if (Math.abs(dw) > 1e-6) return dw;
+    return 0;
+  }
+  if (Math.abs(dw) > 1e-6) return dw;
+  if (Math.abs(dL) > 1) return dL;
+  return 0;
+}
+
+/** Staging list: load order (floor → filler), kg/pc within tier. */
 function sortStagingGroupsByWeight(groups) {
   const list = groups || [];
-  list.sort((a, b) => {
-    const dw = groupPackSortWeightKg(b) - groupPackSortWeightKg(a);
-    if (Math.abs(dw) > 1e-6) return dw;
-    const aA = groupIsWeldedAssembly(a) ? 0 : 1;
-    const bA = groupIsWeldedAssembly(b) ? 0 : 1;
-    if (aA !== bA) return aA - bA;
-    return (b.lengthMaxMm || 0) - (a.lengthMaxMm || 0);
+  list.forEach(g => {
+    attachGroupWeightFields(g);
+    groupLoadAnchorTier(g);
   });
+  list.sort(compareStagingLoadOrder);
   list.forEach((g, i) => {
     g.id = g.id || `G${i + 1}`;
-    g.weightRank = i + 1; // 1 = heaviest pack unit
+    g.weightRank = i + 1;
+    g.loadRank = i + 1;
   });
   return list;
 }
@@ -171,7 +415,11 @@ function heaviestAssemblyGroups(groups, n) {
   return (groups || [])
     .filter(g => groupIsWeldedAssembly(g))
     .slice()
-    .sort((a, b) => groupPackSortWeightKg(b) - groupPackSortWeightKg(a))
+    .sort((a, b) => {
+      attachGroupWeightFields(a);
+      attachGroupWeightFields(b);
+      return (Number(b.unitWeightKg) || 0) - (Number(a.unitWeightKg) || 0);
+    })
     .slice(0, lim);
 }
 
@@ -184,22 +432,14 @@ function nextCheckOrder() {
 }
 
 /**
- * Pack-order numbers = weight rank among SELECTED groups.
- * #1 = heaviest, #2 = next, … (not click order).
- * Optimise tries insert in this same order.
+ * Pack-order numbers among SELECTED groups = same load order as staging / packer.
+ * #1 = first floor anchor (heaviest assembly / beam…), not click order.
  * @param {object[]} [groups] — defaults to staging assemblyGroups
  */
 function renumberCheckOrderByWeight(groups) {
   const list = groups || assemblyGroups;
   const checked = list.filter(g => g.checked && g.state !== 'oversized');
-  checked.sort((a, b) => {
-    const dw = groupPackSortWeightKg(b) - groupPackSortWeightKg(a);
-    if (Math.abs(dw) > 1e-6) return dw;
-    const aA = groupIsWeldedAssembly(a) ? 0 : 1;
-    const bA = groupIsWeldedAssembly(b) ? 0 : 1;
-    if (aA !== bA) return aA - bA;
-    return (b.lengthMaxMm || 0) - (a.lengthMaxMm || 0);
-  });
+  checked.sort(compareStagingLoadOrder);
   checked.forEach((g, i) => { g.checkOrder = i + 1; });
   list.forEach(g => { if (!g.checked) g.checkOrder = 0; });
   return checked;
@@ -226,7 +466,7 @@ function toggleSelectAll(checked) {
       showToast('Select all cleared — restored items before Group by Shape', 2800);
     }
   } else {
-    // Select all → number by weight (#1 heaviest)
+    // Select all → number by load order (#1 floor anchors first)
     filtered.forEach(g => { g.checked = true; });
     renumberCheckOrderByWeight();
   }
@@ -378,8 +618,8 @@ function updateSelectAllBox() {
       hint.textContent = 'Group by Shape first';
     } else {
       hint.textContent = nChecked
-        ? `${nChecked} selected · #1=heaviest → #${nChecked}`
-        : 'Select items — numbered heaviest=#1, then #2…';
+        ? `${nChecked} selected · #1=load order (floor→filler) → #${nChecked}`
+        : 'Select — #1 = floor anchors first, then kg/pc within tier';
     }
   }
 }
@@ -389,7 +629,7 @@ function renderStagingList() {
   const empty = document.getElementById('stagingEmpty');
   const count = document.getElementById('stagingCount');
 
-  // Always keep staging in weight high→low after Group by Shape
+  // Always keep staging in packer load order after Group by Shape
   if (assemblyGroups.length && typeof isGroupedReady === 'function' && isGroupedReady())
     sortStagingGroupsByWeight(assemblyGroups);
 
@@ -434,6 +674,13 @@ function renderStagingList() {
       ? `${(g.lengthMinMm / 1000).toFixed(1)}–${(g.lengthMaxMm / 1000).toFixed(1)} m`
       : (g.lengthMaxMm > 0 ? `${(g.lengthMaxMm / 1000).toFixed(1)} m` : '');
     const labelOnly = g.profileLabel || g.profileDesc || '';
+    attachGroupWeightFields(g);
+    groupLoadAnchorTier(g);
+    const qtyPcs = groupQtyPcs(g);
+    const unitKg = Number(g.unitWeightKg) || 0;
+    const totalKg = Number(g.totalWeightKg) || (unitKg * qtyPcs);
+    const tierLabel = g.loadTierLabel || 'Secondary';
+    const sortHint = `Load # by ${tierLabel} tier · ${formatKgPill(unitKg)} kg/pc`;
 
     card.innerHTML = `
       <div style="display:flex;align-items:flex-start;gap:8px">
@@ -441,8 +688,8 @@ function renderStagingList() {
               style="opacity:${canPick ? '1' : '0.4'}"
               title="${canPick
                 ? (g.checked
-                  ? 'Pack #' + orderNum + ' (weight rank) — click to deselect'
-                  : 'Click to select — numbers follow weight (#1 heaviest)')
+                  ? 'Pack #' + orderNum + ' — ' + sortHint + ' — click to deselect'
+                  : 'Click to select — #1 = floor anchors (load order)')
                 : 'Step 4 first: Group by Shape (signature)'}"
               onclick="event.stopPropagation();toggleCheck('${g.id}')">${canPick ? (orderLabel || '☐') : '—'}</span>
         <div class="ag-cs-thumb">${iconHtml}</div>
@@ -450,8 +697,10 @@ function renderStagingList() {
           <div class="ag-mark">${g.mark}${g.checked && orderNum ? ` <span style="color:var(--blue);font-weight:600;font-size:11px">#${orderNum}</span>` : ''}</div>
           <div class="ag-name">${g.name || ''}${labelOnly ? ` · <span class="ag-profile-label" title="IFC label only">${labelOnly}</span>` : ''}</div>
           <div class="ag-meta">
-            <span class="ag-pill">${g.qty || 1} pcs</span>
-            <span class="ag-pill">${Math.round(g.sortWeightKg || g.weightKg || 0)} kg</span>
+            <span class="ag-pill">${qtyPcs} pcs</span>
+            <span class="ag-pill" title="One piece (IFC, kg)">${formatKgPill(unitKg)} kg/pc</span>
+            <span class="ag-pill" title="All ${qtyPcs} pieces in this group">${formatKgPill(totalKg)} kg total</span>
+            <span class="ag-pill" title="Packer load tier (matches Optimise)">${tierLabel}</span>
             ${lenRange ? `<span class="ag-pill">${lenRange}</span>` : ''}
             <span class="ag-pill ${stratClass}">${g.nestMethodLabel || g.strategy || 'Single'}</span>
             ${g.nestingOffsetMm > 0 ? `<span class="ag-pill" title="Step6 nest offset">Δ ${Number(g.nestingOffsetMm).toFixed(1)} mm</span>` : ''}
@@ -718,7 +967,7 @@ function frameCameraOnMesh(mesh) {
   box.getCenter(center);
   box.getSize(size);
   const maxDim = Math.max(size.x, size.y, size.z, 0.5);
-  const dist = maxDim * 2.4;
+  const dist = maxDim * 3.2; // zoom out — full piece + context
   camera.position.set(center.x + dist * 0.7, center.y + dist * 0.45, center.z + dist * 0.55);
   controls.target.copy(center);
   controls.update();
@@ -840,11 +1089,11 @@ function syncSidebarContainersFromLayout() {
 }
 
 function toggleCheck(id) {
-  if (!requireGrouped('pick items (heaviest=#1)')) return;
+  if (!requireGrouped('pick items (load order #1)')) return;
   const g = assemblyGroups.find(x => x.id === id);
   if (!g || g.state === 'oversized') return;
   g.checked = !g.checked;
-  // Always re-rank selected by weight — #1 heaviest, not click order
+  // Always re-rank selected by load order — #1 floor first, not click order
   renumberCheckOrderByWeight();
   renderStagingList();
   updateStagingFooter();
@@ -1000,6 +1249,11 @@ function groupByShape() {
     });
   }
 
+  // Re-normalize weights (force) — catches grams still marked kg after fat-AABB miss
+  if (typeof normalizeItemWeightKg === 'function') {
+    (rawScene.items || []).forEach(it => normalizeItemWeightKg(it, true));
+  }
+
   // Ensure signatures + nest method + nest offset (read-only — no shape change)
   if (typeof attachCsSignaturesToItems === 'function')
     attachCsSignaturesToItems(rawScene.items);
@@ -1013,6 +1267,10 @@ function groupByShape() {
     if (!g.profileShape && g.shapeKey) g.profileShape = g.shapeKey;
     g.checked = false;
     g.checkOrder = 0;
+    const mem = g.memberPieces || g.memberItems || [];
+    mem.forEach(p => {
+      if (typeof normalizeItemWeightKg === 'function') normalizeItemWeightKg(p, true);
+    });
   });
 
   // STEP 7 — pack units (sort / SET_SIZE / metadata only — never morphs shapes)
@@ -1026,17 +1284,28 @@ function groupByShape() {
     });
   }
 
-  // Sync pack-unit weights from group; then HEAVIEST → lightest in staging list
+  // Sync pack-unit weights from unit kg — never stamp full group total onto every PU
   assemblyGroups.forEach(g => {
-    const gw = Math.max(0, Number(g.weightKg) || 0);
+    attachGroupWeightFields(g);
+    const piece = Math.max(0, Number(g.unitWeightKg) || 0);
+    const qty = groupQtyPcs(g);
+    const total = piece * qty;
+    const nPu = Math.max(1, (g.packUnits || []).length);
     (g.packUnits || []).forEach(pu => {
+      const puQty = Math.max(
+        1,
+        Number(pu.qty) || (pu.nestPieces && pu.nestPieces.length) || 1
+      );
+      const fair = piece * puQty;
       if (!(pu.total_weight > 0) && !(pu.weightKg > 0)) {
-        pu.total_weight = gw;
-        pu.weightKg = gw;
+        pu.total_weight = fair;
+        pu.weightKg = fair;
+      } else if (qty > 1 && nPu > 1 && (pu.total_weight || 0) >= total * 0.85) {
+        pu.total_weight = fair;
+        pu.weightKg = fair;
       }
-      // Prefer real pack-unit weight; keep group total as floor for single-unit assy
-      if (g.groupKind === 'welded_assembly' && (g.packUnits || []).length === 1) {
-        pu.total_weight = Math.max(pu.total_weight || 0, pu.weightKg || 0, gw);
+      if (g.groupKind === 'welded_assembly' && nPu === 1) {
+        pu.total_weight = Math.max(pu.total_weight || 0, pu.weightKg || 0, piece);
         pu.weightKg = pu.total_weight;
       }
     });
@@ -1056,7 +1325,12 @@ function groupByShape() {
   const welded = assemblyGroups.filter(g => g.groupKind === 'welded_assembly').length;
   const top3 = assemblyGroups.slice(0, 3);
   const topHint = top3.length
-    ? ` · #1–3: ${top3.map(g => `${(g.marks && g.marks[0]) || g.mark} ${Math.round(g.sortWeightKg || g.weightKg || 0)}kg`).join(', ')}`
+    ? ` · #1–3: ${top3.map(g => {
+      const m = (g.marks && g.marks[0]) || g.mark;
+      const kg = Math.round(g.unitWeightKg || g.sortWeightKg || 0);
+      const t = g.loadTierLabel || '';
+      return `${m} ${kg}kg/pc${t ? ` [${t}]` : ''}`;
+    }).join(', ')}`
     : '';
   if (audit && !audit.ok) {
     showToast(
@@ -1067,7 +1341,7 @@ function groupByShape() {
     );
   } else {
     showToast(
-      `✓ Grouped ${n} by weight high→low (${welded} assy)${topHint}`,
+      `✓ Grouped ${n} · load order floor→filler (${welded} assy)${topHint}`,
       5200
     );
   }

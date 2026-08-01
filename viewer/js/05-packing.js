@@ -37,9 +37,119 @@ const FILL_FACTORS = {
   rhs:       0.30    // rectangular hollow section
 };
 
+/** Max plausible single cargo unit (kg) — above this cannot be real kg for one placeable unit. */
+const WEIGHT_MAX_UNIT_KG = 26000;
+
+/**
+ * Prefer section formula over fat assembly AABB (AABB×0.08 often looks like tonnes
+ * and blocks grams→kg for rods/plates).
+ */
+function estimateBboxSteelKg(it) {
+  if (!it) return 0;
+  const L = Math.max(0, Number(it.lengthMm) || 0);
+  const sk = String(it.shapeKey || it.profileShape || '').toLowerCase();
+  const blob = `${it.profileDesc || ''} ${it.mark || ''} ${it.assemblyName || ''}`.toUpperCase();
+  const dens = 7850;
+
+  // Solid rod / hex bar
+  if (sk === 'rod' || sk === 'bent_sag_rod' || /\bROD\b|HEX|ROUND.?BAR/.test(blob)) {
+    const d = Math.max(
+      Number(it.pathDiamMm) || 0,
+      Number(it.sectD) || 0,
+      Number(it.sectW) || 0,
+      Number(it.sectH) || 0,
+      20
+    );
+    if (L > 0 && d > 0)
+      return Math.PI * Math.pow(d / 2000, 2) * (L / 1000) * dens;
+  }
+  // Plate / flat
+  if (sk === 'plate' || /\bPL(ATE)?\b|\bFLAT\b|PANEL/.test(blob)) {
+    const th = Math.max(Number(it.sectT) || 0, Math.min(Number(it.heightMm) || 0, Number(it.widthMm) || 0) || 0, 6);
+    const W = Math.max(Number(it.sectW) || 0, Number(it.widthMm) || 0, Number(it.heightMm) || 0, 1);
+    if (L > 0 && W > 0 && th > 0)
+      return (L / 1000) * (W / 1000) * (th / 1000) * dens;
+  }
+
+  const W = Math.max(0, Number(it.widthMm) || Number(it.sectW) || 0);
+  const H = Math.max(0, Number(it.heightMm) || Number(it.sectH) || 0);
+  if (!(L > 0 && W > 0 && H > 0)) return 0;
+  // Cap fill so huge assembly AABB cannot “prove” a 20t reading is kg
+  const fill = (it.isAssembly && it.parts && it.parts.length >= 2) ? 0.04 : 0.08;
+  return (L * W * H) / 1e9 * dens * fill;
+}
+
+/**
+ * IFC mass → kg. Explicit shipping rule: unit > 26t cannot be kg.
+ * e.g. 27900 / 16866 (grams) → 27.9 / 16.9 kg when estimate is light.
+ */
+function normalizeMassToKg(raw, estimateKg) {
+  const w = Number(raw);
+  if (!(w > 0) || !isFinite(w)) return 0;
+  const est = Math.max(0, Number(estimateKg) || 0);
+  const asG = w / 1000;
+  const asT = w * 1000;
+
+  // Hard: exceeds container payload as one unit → must be grams
+  if (w > WEIGHT_MAX_UNIT_KG && asG >= 0.05 && asG <= WEIGHT_MAX_UNIT_KG)
+    return asG;
+
+  // Estimate-guided (cap est so fat AABB cannot prefer raw tonnes)
+  const estUse = est >= 1 ? Math.min(est, 5000) : 0;
+  if (estUse >= 1) {
+    let best = w;
+    let bestScore = Infinity;
+    [w, asG, asT].forEach(c => {
+      if (c < 0.05 || c > WEIGHT_MAX_UNIT_KG) return;
+      const ratio = c / estUse;
+      if (ratio < 0.05 || ratio > 25) return;
+      const score = Math.abs(Math.log(ratio));
+      if (score < bestScore) { bestScore = score; best = c; }
+    });
+    if (bestScore < Infinity) return best;
+
+    // Light section (rod/plate est < 500 kg) + huge raw → grams
+    if (estUse < 500 && w >= 5000 && asG >= 0.5 && asG <= 5000)
+      return asG;
+  }
+
+  // No / weak estimate: only convert clear container-busting leftovers
+  if (w > 100000) return asG;
+  if (w < 0.05) return asT;
+  return w;
+}
+
+function normalizeItemWeightKg(it, force) {
+  if (!it) return it;
+  if (it._weightUnitNormalized && !force) {
+    // Re-fix if still impossible as kg
+    const cur = Number(it.unitWeightKg) || 0;
+    if (!(cur > WEIGHT_MAX_UNIT_KG)) return it;
+  }
+  const est = estimateBboxSteelKg(it);
+  const before = Number(it.unitWeightKg) || 0;
+  if (before > 0) {
+    const after = normalizeMassToKg(before, est);
+    if (after > 0 && Math.abs(after - before) > 1e-6) {
+      it.unitWeightKg = after;
+      if (it.weight != null) it.weight = after * Math.max(1, it.qty || 1);
+      it._weightWasScaled = true;
+      try {
+        console.info(
+          `[weight-unit] ${it.mark || '?'} ${Math.round(before)} → ${after.toFixed(2)} kg`
+          + ` (est≈${est.toFixed(1)} kg)`
+        );
+      } catch (_) { /* */ }
+    }
+  }
+  it._weightUnitNormalized = true;
+  return it;
+}
+
 function applyWeightCorrection(items) {
   items.forEach(it => {
-    if (!it.weightEstimated) return;             // real property-set weight → trust it
+    normalizeItemWeightKg(it);
+    if (!it.weightEstimated) return;             // real property-set weight → trust scale fix above
     if (it._weightCorrected) return;
     // C# EstimateSteelWeightKg already applied bbox×7850×0.08.
     // Do NOT multiply by FILL_FACTORS again (was crushing e.g. 3655kg → 731kg).

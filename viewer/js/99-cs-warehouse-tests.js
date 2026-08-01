@@ -304,45 +304,95 @@
     assert(u[4].mark === 'nest-heavy', `short nest last=${u[4].mark}`);
   });
 
-  t('W.12k', 'Staging sort: assembly=piece kg, nest=bundle kg', () => {
-    if (typeof sortStagingGroupsByWeight !== 'function') {
+  t('W.12n', 'Weight unit: grams→kg via normalizeMassToKg', () => {
+    if (typeof normalizeMassToKg !== 'function') {
       assert(true, 'skip');
       return;
     }
-    // qty=1 cards — piece weight == group weight
-    const g = [
-      { mark: 'Z1', groupKind: 'nest_z', weightKg: 500, lengthMaxMm: 400 },
-      { mark: 'A1', groupKind: 'welded_assembly', weightKg: 300, qty: 1, lengthMaxMm: 8000, isAssembly: true, parts: [{}, {}] },
-      { mark: 'A2', groupKind: 'welded_assembly', weightKg: 800, qty: 1, lengthMaxMm: 9000, isAssembly: true, parts: [{}, {}] },
-      { mark: 'B1', groupKind: 'bundle_beam', weightKg: 66, lengthMaxMm: 8400 },
-    ];
-    sortStagingGroupsByWeight(g);
-    assert(g[0].mark === 'A2', `first=${g[0].mark}`); // 800
-    assert(g[1].mark === 'Z1', `second=${g[1].mark}`); // 500 > 300 asm
-    assert(g[2].mark === 'A1', `third=${g[2].mark}`);
-    assert(g[3].mark === 'B1', `last=${g[3].mark}`);
+    // ROD20-like: IFC 47356 (g), bbox est ~40 kg → 47.356 kg
+    const rod = normalizeMassToKg(47356, 40);
+    assert(rod > 40 && rod < 60, `rod=${rod} (want ~47 kg from grams)`);
+    // PANEL: section-like light est (~20) → grams; fat AABB est capped in function
+    const panel = normalizeMassToKg(16866, 20);
+    assert(panel > 10 && panel < 30, `panel=${panel} (want ~17 kg)`);
+    // Fat AABB alone must not keep 16866 as kg when light est also passed via item normalize
+    const panelFat = normalizeMassToKg(16866, 50); // capped path still light
+    assert(panelFat > 10 && panelFat < 30, `panelFat=${panelFat}`);
+    // Screenshot: hex 27900 > container → 27.9 kg
+    const hex = normalizeMassToKg(27900, 8000);
+    assert(hex > 20 && hex < 40, `hex=${hex} (want ~27.9)`);
+    // Real heavy beam already in kg — keep
+    const beam = normalizeMassToKg(8000, 7500);
+    assert(Math.abs(beam - 8000) < 1, `beam=${beam} (keep kg)`);
+  });
 
-    // Multi-qty: C-1 3×3000=9000 → sort 3000; R-1 5×2000=10000 → 2000; Z nest set 540
+  t('W.12k', 'Staging: load order floor→filler; show N pcs + kg/pc + total', () => {
+    if (typeof sortStagingGroupsByWeight !== 'function'
+        || typeof attachGroupWeightFields !== 'function'
+        || typeof groupLoadAnchorTier !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    // Display fields: unit + total
+    const flat = {
+      mark: 'ANGLE', groupKind: 'stack_plate', weightKg: 28.4, qty: 4,
+      memberPieces: Array.from({ length: 4 }, () => ({
+        unitWeightKg: 7.1, qty: 1, lengthMm: 2500, widthMm: 50, heightMm: 1.5,
+        shapeKey: 'plate', profileDesc: 'FLAT PL1.5',
+      })),
+    };
+    attachGroupWeightFields(flat);
+    assert(Math.abs(flat.unitWeightKg - 7.1) < 0.2, `unit=${flat.unitWeightKg}`);
+    assert(Math.abs(flat.totalWeightKg - 28.4) < 1, `total=${flat.totalWeightKg}`);
+    assert(groupLoadAnchorTier(flat) === 1, `plate tier=${flat.loadTier} (floor)`);
+
+    // Load order: assemblies (kg/pc) → light beam floor → Z secondary → rod filler
+    // Even though Z pack total is heavy, beam (floor) beats Z (secondary)
     const g2 = [
       {
         mark: 'R1', groupKind: 'welded_assembly', weightKg: 10000, qty: 5,
-        isAssembly: true, parts: [{}, {}],
-        memberPieces: Array.from({ length: 5 }, () => ({ unitWeightKg: 2000, qty: 1 })),
+        isAssembly: true, parts: [{}, {}], lengthMaxMm: 11000,
+        memberPieces: Array.from({ length: 5 }, () => ({
+          unitWeightKg: 2000, qty: 1, lengthMm: 11000,
+        })),
       },
       {
         mark: 'C1', groupKind: 'welded_assembly', weightKg: 9000, qty: 3,
-        isAssembly: true, parts: [{}, {}],
-        memberPieces: Array.from({ length: 3 }, () => ({ unitWeightKg: 3000, qty: 1 })),
+        isAssembly: true, parts: [{}, {}], lengthMaxMm: 9000,
+        memberPieces: Array.from({ length: 3 }, () => ({
+          unitWeightKg: 3000, qty: 1, lengthMm: 9000,
+        })),
+      },
+      {
+        mark: 'B50', groupKind: 'bundle_beam', weightKg: 50, qty: 1,
+        shapeKey: 'i_beam', category: 'beam', lengthMaxMm: 8400,
+        memberPieces: [{ unitWeightKg: 50, qty: 1, lengthMm: 8400 }],
       },
       {
         mark: 'Z50', groupKind: 'nest_z', weightKg: 2250, qty: 50,
+        shapeKey: 'z_channel',
         packUnits: [{ total_weight: 540, weightKg: 540, qty: 12 }],
+        memberPieces: Array.from({ length: 50 }, () => ({
+          unitWeightKg: 45, qty: 1, lengthMm: 6000,
+        })),
+      },
+      {
+        mark: 'ROD', groupKind: 'bundle_rod', weightKg: 112, qty: 16,
+        shapeKey: 'rod',
+        memberPieces: Array.from({ length: 16 }, () => ({
+          unitWeightKg: 7, qty: 1, lengthMm: 6000,
+        })),
       },
     ];
     sortStagingGroupsByWeight(g2);
-    assert(g2[0].mark === 'C1', `g2 first=${g2[0].mark} (3000/pc)`);
-    assert(g2[1].mark === 'R1', `g2 second=${g2[1].mark} (2000/pc)`);
-    assert(g2[2].mark === 'Z50', `g2 third=${g2[2].mark} (540 bundle)`);
+    assert(g2.map(x => x.mark).join(',') === 'C1,R1,B50,Z50,ROD',
+      `order=${g2.map(x => x.mark).join(',')} (want C1,R1,B50,Z50,ROD)`);
+    assert(g2[0].loadTierLabel === 'Floor', 'C1 Floor');
+    assert(g2[2].loadTier === 1, `B50 tier=${g2[2].loadTier}`);
+    assert(g2[3].loadTier === 2, `Z50 tier=${g2[3].loadTier}`);
+    assert(g2[4].loadTier === 3, `ROD tier=${g2[4].loadTier}`);
+    assert(Math.abs(g2[0].totalWeightKg - 9000) < 1, 'C1 total');
+    assert(Math.abs(g2[0].unitWeightKg - 3000) < 1, 'C1 kg/pc');
   });
 
   t('W.12i', 'Pack smoke: long beam seats on empty floor before nest fills', () => {
@@ -414,15 +464,22 @@
     assert(wide.code === 'WIDTH_EXCEEDS_ENVELOPE', `code=${wide.code}`);
   });
 
-  t('W.12f', 'Floor Anchor Rule#1 — tier Weight-Down + yaw 0/180 only', () => {
-    if (typeof cs8AnchorTier !== 'function' || typeof cs8YawOrientsFloorAnchor !== 'function') {
+  t('W.12f', 'Rule#1 Constraint-First tiers + legacy yaw 0/180', () => {
+    if (typeof cs8ConstraintTier !== 'function' && typeof cs8AnchorTier !== 'function') {
       assert(true, 'skip');
       return;
     }
-    assert(cs8AnchorTier({ isAssembly: true, parts: [{}, {}], weight: 100 }) === 0, 'asm tier0');
-    assert(cs8AnchorTier({ shapeKey: 'i_beam', category: 'beam', weight: 500 }) === 1, 'beam tier1');
-    assert(cs8AnchorTier({ shapeKey: 'z_channel', weight: 50 }) === 2, 'loose tier2');
-    assert(cs8AnchorTier({ assemblyName: 'Portal Frame', weight: 900 }) === 0, 'portal');
+    const tier = typeof cs8ConstraintTier === 'function' ? cs8ConstraintTier : cs8AnchorTier;
+    assert(tier({ isAssembly: true, parts: [{}, {}], weight: 100 }) === 0, 'asm tier0');
+    assert(tier({ shapeKey: 'i_beam', category: 'beam', weight: 500 }) === 1, 'beam tier1');
+    assert(tier({ groupKind: 'stack_plate', shapeKey: 'plate' }) === 1, 'plate floor');
+    assert(tier({ shapeKey: 'z_channel', weight: 50, l: 400, w: 200, h: 200 }) === 2, 'nest secondary');
+    assert(tier({ groupKind: 'bundle_rod', shapeKey: 'rod', l: 3000, unitWeightKg: 7 }) === 3, 'rod filler');
+    assert(tier({ assemblyName: 'Portal Frame', weight: 900 }) === 0, 'portal');
+    // Length-ratio floor (≥70%) even if light
+    assert(tier({ l: 11608, w: 200, h: 300, unitWeightKg: 66, mark: 'LONG' }, 12192) === 1,
+      'long lane → floor');
+    if (typeof cs8YawOrientsFloorAnchor !== 'function') return;
     const orients = cs8YawOrientsFloorAnchor(
       { l: 10000, w: 400, h: 600 }, 12000, 2350, 2690);
     assert(orients.length === 2, `n=${orients.length}`);
@@ -450,6 +507,98 @@
     assert(o.some(x => x.tag === 'yaw0' || x.tag === 'yaw180'), 'has longitudinal');
     assert(o.some(x => /Rx|Rz|yaw90|yaw270/i.test(x.tag)), 'has roll or cross-yaw');
     assert((o[0].stabilityScore || 0) + 1e-6 >= (o[1].stabilityScore || 0), 'stable first');
+  });
+
+  t('W.18', 'Constraint Rule1: wide-flat rafter finds upright orient + packs', () => {
+    if (typeof cs8StableBaseOrients !== 'function'
+        || typeof layoutContainerPackStep8 !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    // Flat AABB: length × oversize width × thin height (won't fit without roll)
+    const u = {
+      mark: 'RF-WIDE', l: 11608, w: 2508, h: 200,
+      weight: 711, weightKg: 711, unitWeightKg: 711, qty: 1,
+      shapeKey: 'i_beam', profileShape: 'i_beam', category: 'beam',
+      groupKind: 'bundle_beam',
+    };
+    const Lmax = 12192, Wmax = 2438, Houter = 2591;
+    const Hpack = Houter - 50; // preferred top clearance
+    const orients = cs8StableBaseOrients(u, Lmax, Wmax, Hpack, {
+      Houter, floorClearMm: 0,
+    });
+    assert(orients.length >= 1, `orients=${orients.length}`);
+    // Flat yaw0 (w=2508) must NOT appear — only upright-class fits
+    assert(!orients.some(o => o.w > Wmax + 1),
+      `over-width orient leaked: ${orients.map(o => o.w).join(',')}`);
+    const upright = orients.find(o =>
+      o.l <= Lmax + 1 && o.w <= Wmax + 1 && o.h <= Houter + 1
+      && o.h >= 2400 && o.w <= 350 && o.l >= 11000);
+    assert(!!upright, `no upright among ${orients.map(o => `${o.tag}:${Math.round(o.l)}x${Math.round(o.w)}x${Math.round(o.h)}`).join('|')}`);
+    // tipPen must NOT bury sole/upright fit — first orient is upright-class
+    assert(orients[0].h >= 2400 && orients[0].w <= 350,
+      `first=${orients[0].tag} ${Math.round(orients[0].l)}x${Math.round(orients[0].w)}x${Math.round(orients[0].h)} (want upright first)`);
+    if (orients.length === 1) assert(orients[0].soleFit, 'soleFit flag');
+
+    const nOri = typeof cs8ValidOrientCount === 'function'
+      ? cs8ValidOrientCount(u, Lmax, Wmax, Hpack, { Houter, floorClearMm: 0 })
+      : orients.length;
+    assert(nOri >= 1 && nOri <= 4, `validOrients=${nOri} (highly constrained)`);
+
+    const res = layoutContainerPackStep8([], {
+      lengthMm: Lmax, widthMm: Wmax, heightMm: Houter, maxWeightKg: 26000,
+    }, null, {
+      packUnits: [{
+        mark: 'RF-WIDE', marks: ['RF-WIDE'],
+        groupKind: 'bundle_beam', shapeKey: 'i_beam', category: 'beam',
+        qty: 1, total_weight: 711, weightKg: 711, unitWeightKg: 711,
+        lengthMm: 11608, widthMm: 2508, heightMm: 200,
+        bundle_bbox: { l: 11608, w: 2508, h: 200 },
+        l: 11608, w: 2508, h: 200,
+      }],
+      maxContainers: 1, pass2: false, markOrder: null,
+    });
+    const placed = (res.containers[0] && res.containers[0].items) || [];
+    const over = res.oversized || [];
+    assert(placed.some(it => /RF-WIDE/.test(String(it.mark))),
+      `rafter placed; over=${(over[0] && over[0].fitReason) || 'none'} marks=${placed.map(p => p.mark).join(',')}`);
+    const it = placed.find(p => /RF-WIDE/.test(String(p.mark)));
+    if (it) {
+      const fh = it.packFootprintH || it.heightMm || 0;
+      const fw = it.packFootprintW || it.widthMm || 0;
+      assert(fh >= 2000 || fw <= 400, `upright-ish fh=${fh} fw=${fw}`);
+    }
+  });
+
+  t('W.18b', 'Constraint sort: long light beam before heavy short nest', () => {
+    if (typeof cs8SortHeavyAnchor !== 'function'
+        || typeof cs8ConstraintTier !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const Lmax = 12192, Wmax = 2438, Hpack = 2541;
+    const eo = { Wmax, Hmax: Hpack, Houter: 2591, floorClearMm: 0 };
+    const units = [
+      {
+        mark: 'NEST', groupKind: 'nest_z', shapeKey: 'z_channel',
+        l: 400, w: 200, h: 200, weight: 2250, weightKg: 2250,
+        unitWeightKg: 45, qty: 50,
+      },
+      {
+        mark: 'BEAM', groupKind: 'bundle_beam', shapeKey: 'i_beam', category: 'beam',
+        l: 8400, w: 200, h: 300, weight: 66, weightKg: 66, unitWeightKg: 66, qty: 1,
+      },
+      {
+        mark: 'ROD', groupKind: 'bundle_rod', shapeKey: 'rod',
+        l: 3000, w: 20, h: 20, weight: 112, weightKg: 112, unitWeightKg: 7, qty: 16,
+      },
+    ];
+    assert(cs8ConstraintTier(units[1], Lmax, eo) === 1, 'beam floor');
+    assert(cs8ConstraintTier(units[0], Lmax, eo) === 2, 'nest secondary');
+    assert(cs8ConstraintTier(units[2], Lmax, eo) === 3, 'rod filler');
+    cs8SortHeavyAnchor(units, Lmax, eo);
+    assert(units.map(u => u.mark).join(',') === 'BEAM,NEST,ROD',
+      `order=${units.map(u => u.mark).join(',')} (want BEAM,NEST,ROD)`);
   });
 
   t('W.13a', 'Rule1 gate: Z-geometry (opposite flange) — not mark/name', () => {
@@ -675,30 +824,39 @@
     assert(placed.length >= 2, `placed=${placed.length} (want ≥2 of 3)`);
   });
 
-  t('W.17', 'Pack numbers: #1 = heaviest pack unit (assy piece / nest bundle)', () => {
+  t('W.17', 'Pack numbers: #1 = load order (assy → beam floor → loose filler)', () => {
     if (typeof renumberCheckOrderByWeight !== 'function'
-        || typeof groupPackSortWeightKg !== 'function') {
+        || typeof compareStagingLoadOrder !== 'function') {
       assert(true, 'skip');
       return;
     }
     const fake = [
-      { id: 'A', checked: true, checkOrder: 1, weightKg: 100, groupKind: 'loose_small' },
+      {
+        id: 'A', checked: true, checkOrder: 1, weightKg: 100, qty: 1,
+        groupKind: 'loose_small',
+        memberPieces: [{ unitWeightKg: 100, qty: 1 }],
+      },
       {
         id: 'B', checked: true, checkOrder: 2, weightKg: 10000, qty: 5,
         groupKind: 'welded_assembly', isAssembly: true, parts: [{}, {}],
         memberPieces: Array.from({ length: 5 }, () => ({ unitWeightKg: 2000, qty: 1 })),
       },
-      { id: 'C', checked: true, checkOrder: 3, weightKg: 800, groupKind: 'bundle_beam' },
+      {
+        id: 'C', checked: true, checkOrder: 3, weightKg: 800, qty: 1,
+        groupKind: 'bundle_beam', shapeKey: 'i_beam', category: 'beam',
+        lengthMaxMm: 9000,
+        memberPieces: [{ unitWeightKg: 800, qty: 1, lengthMm: 9000 }],
+      },
       {
         id: 'D', checked: false, checkOrder: 99, weightKg: 9000, qty: 3,
         groupKind: 'welded_assembly', isAssembly: true, parts: [{}, {}],
       },
     ];
     renumberCheckOrderByWeight(fake);
-    // B pack key = 2000/pc; C bundle = 800; A = 100 → B #1, C #2, A #3
-    assert(fake.find(x => x.id === 'B').checkOrder === 1, 'B 2000/pc → #1');
-    assert(fake.find(x => x.id === 'C').checkOrder === 2, 'C 800 → #2');
-    assert(fake.find(x => x.id === 'A').checkOrder === 3, 'A 100 → #3');
+    // B assembly → #1; C floor beam → #2; A loose filler → #3
+    assert(fake.find(x => x.id === 'B').checkOrder === 1, 'B assy → #1');
+    assert(fake.find(x => x.id === 'C').checkOrder === 2, 'C beam floor → #2');
+    assert(fake.find(x => x.id === 'A').checkOrder === 3, 'A loose filler → #3');
     assert(fake.find(x => x.id === 'D').checkOrder === 0, 'unchecked → 0');
   });
 

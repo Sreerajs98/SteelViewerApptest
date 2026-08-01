@@ -162,15 +162,18 @@ function groupItemsByCsSignature(items) {
     list.push(csgBuildStageCard(pcs, key));
   });
 
-  // Pack-unit weight: assemblies = single piece; nests/bundles = unit total
+  // Pack-unit weight — never raw group total for multi-qty
   const packW = (g) => {
     if (typeof groupPackSortWeightKg === 'function') return groupPackSortWeightKg(g);
     const total = Math.max(0, Number(g.weightKg) || 0);
-    if (g.groupKind === 'welded_assembly' || g.isAssembly) {
-      const qty = Math.max(1, Number(g.qty) || 1);
-      return total / qty;
+    const qty = Math.max(1, Number(g.qty) || 1);
+    if (qty <= 1) return total;
+    if (g.groupKind === 'welded_assembly' || g.isAssembly) return total / qty;
+    if (/^nest_[zcl]$/.test(g.groupKind || '')) {
+      const setSize = Math.min(12, qty);
+      return total / Math.max(1, Math.ceil(qty / setSize));
     }
-    return total;
+    return total / qty;
   };
   list.sort((a, b) => {
     const dW = packW(b) - packW(a);
