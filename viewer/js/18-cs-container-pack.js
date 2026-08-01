@@ -1166,7 +1166,7 @@ function cs8UnitFromPackUnit(pu) {
   const h = Math.max(sb?.h || bb.h || constructH, 1);
   const weight = Math.max(0, pu.total_weight || pu.weightKg || pu.weight || 0);
   const volume = Math.max(l * w * h, 1);
-  return {
+  const u = {
     mark: pu.mark,
     marks: pu.marks ? [...pu.marks] : [pu.mark],
     assemblyName: pu.profileDesc || pu.mark,
@@ -1221,6 +1221,17 @@ function cs8UnitFromPackUnit(pu) {
     _groupWeightKg: pu._groupWeightKg || 0,
     _groupKind: pu._groupKind || pu.groupKind || null,
   };
+
+  // Nest types always lie flat — planar base, never two-point rails
+  const gk = String(u.groupKind || '').toLowerCase();
+  const sk = String(u.shapeKey || u.profileShape || '').toLowerCase();
+  if (gk === 'nest_z' || gk === 'nest_c' || gk === 'nest_l'
+      || sk === 'l_angle' || sk === 'z_channel' || sk === 'c_channel') {
+    u.two_point_base = false;
+    if (u.rule1_orientation)
+      u.rule1_orientation = { ...u.rule1_orientation, two_point_base: false };
+  }
+  return u;
 }
 
 function cs8UnitFromExpand(u) {
@@ -1615,8 +1626,12 @@ function cs8StableBaseOrients(u, Lmax, Wmax, Hmax, opts) {
 /** OPEN+concave (Z-style): two contact rails, not planar 80% bearing. */
 function cs8NeedsTwoPointBase(u) {
   if (!u) return false;
-  // L-angle / nest_l stacks sit on the horizontal leg — planar bearing, NOT Z rails
-  if (cs8IsNestPackUnit(u) || String(u.shapeKey || u.profileShape || '') === 'l_angle')
+  // Nest Z/C/L and flange braces lie flat — planar bearing, never two-point rails
+  const gk = String(u.groupKind || '').toLowerCase();
+  const sk = String(u.shapeKey || u.profileShape || '').toLowerCase();
+  if (cs8IsNestPackUnit(u)
+      || gk === 'nest_z' || gk === 'nest_c' || gk === 'nest_l'
+      || sk === 'l_angle' || sk === 'z_channel' || sk === 'c_channel')
     return false;
   if (u.two_point_base || (u.rule1_orientation && u.rule1_orientation.two_point_base))
     return true;

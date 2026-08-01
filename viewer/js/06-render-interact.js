@@ -2179,8 +2179,19 @@ function yardSettlePackedMeshes(entries, cont) {
     c.mesh.position.z = (it.z || 0) * sc;
     const asm = !!(it.isAssembly || it.groupKind === 'welded_assembly'
       || (it.parts && it.parts.length > 1));
-    if (asm && typeof alignMeshToPackFootprint === 'function')
+    const needFlat = typeof packItemNeedsFlatAlign === 'function'
+      ? packItemNeedsFlatAlign(it) : false;
+    if ((asm || needFlat) && typeof alignMeshToPackFootprint === 'function') {
       alignMeshToPackFootprint(c.mesh, it);
+      it._orientLocked = true;
+      if (typeof THREE !== 'undefined')
+        it._lockedQuaternion = c.mesh.quaternion.clone();
+    }
+    // Restore locked orient if render already froze it
+    if (it._orientLocked && it._lockedQuaternion && typeof THREE !== 'undefined') {
+      c.mesh.quaternion.copy(it._lockedQuaternion);
+      c.mesh.rotation.setFromQuaternion(c.mesh.quaternion);
+    }
     snapMeshToPackerFootY(c.mesh, it);
   });
 
@@ -2249,6 +2260,53 @@ function yardSettlePackedMeshes(entries, cont) {
     }
   });
 
+  // After ALL yard settle passes: restore packer orientation (do NOT re-snap to
+  // packer Y — that re-floats cargo gravity already seated on the floor/support).
+  function restoreLockedOrients(entries) {
+    (entries || []).forEach(c => {
+      const it = c.item;
+      if (!it || (!it.packOrientTag && !it._orientLocked)) return;
+      if (it._lockedQuaternion && typeof THREE !== 'undefined') {
+        c.mesh.quaternion.copy(it._lockedQuaternion);
+        c.mesh.rotation.setFromQuaternion(c.mesh.quaternion);
+      }
+      c.mesh.updateMatrixWorld(true);
+    });
+  }
+  const settled = list.filter(c => !c.outsideContainer);
+  restoreLockedOrients(settled);
+  if (settled.length) {
+    restackWithGravity(settled);
+    restoreLockedOrients(settled);
+    restackWithGravity(settled);
+    restoreLockedOrients(settled);
+  }
+  // Final nail: anything still mid-air with no support → floor
+  settled.forEach(c => {
+    if (c.outsideContainer) return;
+    c.mesh.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(c.mesh);
+    if (!(box.min.y > 0.03)) return;
+    let supported = false;
+    for (let i = 0; i < settled.length; i++) {
+      const o = settled[i];
+      if (o === c || o.outsideContainer) continue;
+      o.mesh.updateMatrixWorld(true);
+      const ob = new THREE.Box3().setFromObject(o.mesh);
+      const ox = Math.min(box.max.x, ob.max.x) - Math.max(box.min.x, ob.min.x);
+      const oz = Math.min(box.max.z, ob.max.z) - Math.max(box.min.z, ob.min.z);
+      if (ox > 0.01 && oz > 0.01 && Math.abs(ob.max.y - box.min.y) <= 0.04) {
+        supported = true;
+        break;
+      }
+    }
+    if (!supported) {
+      c.mesh.position.y -= box.min.y;
+      c.mesh.updateMatrixWorld(true);
+    }
+  });
+  restoreLockedOrients(settled);
+
   // Sync packer records to settled mesh (keeps later Optimise/seed honest)
   list.filter(c => !c.outsideContainer).forEach(c => {
     const it = c.item;
@@ -2258,15 +2316,15 @@ function yardSettlePackedMeshes(entries, cont) {
     const cx = (box.min.x + box.max.x) * 0.5 / sc;
     const cy = (box.min.y + box.max.y) * 0.5 / sc;
     const cz = (box.min.z + box.max.z) * 0.5 / sc;
-    const fl = (box.max.x - box.min.x) / sc;
-    const fh = (box.max.y - box.min.y) / sc;
-    const fw = (box.max.z - box.min.z) / sc;
     it.x = cx;
     it.y = cy;
     it.z = cz;
-    it.packFootprintL = fl;
-    it.packFootprintW = fw;
-    it.packFootprintH = fh;
+    // Do NOT overwrite packer footprints from pitched mesh AABB when orient-locked
+    if (!it._orientLocked && !it.packOrientTag) {
+      it.packFootprintL = (box.max.x - box.min.x) / sc;
+      it.packFootprintW = (box.max.z - box.min.z) / sc;
+      it.packFootprintH = (box.max.y - box.min.y) / sc;
+    }
     it.packPoseLock = true;
     it.yardSettled = true;
   });
@@ -2474,18 +2532,75 @@ function yardEjectChronicOverlaps(entries, cont) {
   }
 }
 
+/**
+ * Map packer packOrientTag → Euler. Rest-pose (X/Z) stays in makeShape;
+ * packer tags usually only change YAW. Rx/Rz tags used when packComposeRot.
+ */
+function packOrientTagToRot(it) {
+  const tag = String((it && it.packOrientTag) || '');
+  let x = 0;
+  let y = 0;
+  let z = 0;
+  if (tag === 'rule1_yaw180' || tag === 'yaw180' || /yaw180/i.test(tag)) {
+    y = Math.PI;
+  }
+  if (/Rx270/i.test(tag)) x = -Math.PI / 2;
+  else if (/Rx90/i.test(tag) || tag === 'upright') x = Math.PI / 2;
+  if (/Rz270/i.test(tag)) z = -Math.PI / 2;
+  else if (/Rz90/i.test(tag)) z = Math.PI / 2;
+  return { x, y, z };
+}
+
+/** Z / C / L nest packs — must lie flat after Optimise (not IFC pitch). */
+function packItemNeedsFlatAlign(it) {
+  if (!it) return false;
+  const gk = String(it.groupKind || '').toLowerCase();
+  const sk = String(it.shapeKey || it.profileShape || '').toLowerCase();
+  if (/^nest_[zcl]$/.test(gk)) return true;
+  if (sk === 'z_channel' || sk === 'c_channel' || sk === 'l_angle') return true;
+  if (/FLANGE[_\s-]*BRACE|ANGLE[_\s-]*BRACE|L[_\s-]*BRACE/i.test(
+    String(it.mark || '') + ' ' + ((it.marks || []).join(' '))))
+    return true;
+  return false;
+}
+
 /** Apply packer rotation onto a mesh that already has makeShape rest-pose. */
 function applyPackItemRotation(mesh, it) {
   if (!mesh || !it) return;
+
+  // If no user rotation was manually applied, derive from packOrientTag
+  if (!it.userRot && it.packOrientTag) {
+    it.userRot = packOrientTagToRot(it);
+  }
+
+  function lockOrient() {
+    it._orientLocked = true;
+    if (typeof THREE !== 'undefined')
+      it._lockedQuaternion = mesh.quaternion.clone();
+  }
+
+  // Nest / brace: footprint-align cancels IFC pitch (trials include packer userRot yaw)
+  if (packItemNeedsFlatAlign(it)
+      && it.packFootprintL > 0 && it.packFootprintW > 0 && it.packFootprintH > 0
+      && typeof alignMeshToPackFootprint === 'function') {
+    alignMeshToPackFootprint(mesh, it);
+    lockOrient();
+    return;
+  }
+
   if (!it.userRot) {
     if (typeof applyStoredRotation === 'function') applyStoredRotation(mesh, it);
+    if (it.packOrientTag) lockOrient();
     return;
   }
   const ur = it.userRot;
   if (it.packComposeRot) {
     // Prefer footprint-aligned face roll (avoids rest-pose × Rx90 cancellation)
     if (it.packFootprintL > 0 && it.packFootprintW > 0 && it.packFootprintH > 0) {
-      if (alignMeshToPackFootprint(mesh, it)) return;
+      if (alignMeshToPackFootprint(mesh, it)) {
+        lockOrient();
+        return;
+      }
     }
     if (typeof THREE !== 'undefined') {
       const e = new THREE.Euler(ur.x || 0, ur.y || 0, ur.z || 0, 'XYZ');
@@ -2502,6 +2617,8 @@ function applyPackItemRotation(mesh, it) {
   } else {
     mesh.rotation.set(ur.x || 0, ur.y || 0, ur.z || 0);
   }
+
+  if (it.packOrientTag || packItemNeedsFlatAlign(it)) lockOrient();
 }
 
 /**
