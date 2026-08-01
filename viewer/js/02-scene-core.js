@@ -523,11 +523,41 @@ function disposeTempMesh(mesh) {
 }
 
 /**
- * Build the item at its packed pose and check real mesh AABB vs container.
- * Must compose rotation like renderContainer: packYawOnly adds Y on rest-pose.
+ * Packer footprint (mm) vs container — authoritative for face-roll poses.
+ * Returns true/false, or null if footprint unknown.
+ */
+function packFootprintFitsInContainer(it, cont) {
+  if (!it || !cont) return null;
+  const fl = Number(it.packFootprintL) || 0;
+  const fw = Number(it.packFootprintW) || 0;
+  const fh = Number(it.packFootprintH) || 0;
+  if (!(fl > 0 && fw > 0 && fh > 0)) return null;
+  const L = Math.max(1, Number(cont.lengthMm) || 0);
+  const W = Math.max(1, Number(cont.widthMm) || 0);
+  const H = Math.max(1, Number(cont.heightMm) || 0);
+  const eps = 5; // mm
+  if (fl > L + eps || fw > W + eps || fh > H + eps) return false;
+  const x = Number(it.x) || 0;
+  const y = Number(it.y) || 0;
+  const z = Number(it.z) || 0;
+  if (x - fl / 2 < -eps || x + fl / 2 > L + eps) return false;
+  if (z - fw / 2 < -W / 2 - eps || z + fw / 2 > W / 2 + eps) return false;
+  if (y - fh / 2 < -eps || y + fh / 2 > H + eps) return false;
+  return true;
+}
+
+/**
+ * Build the item at its packed pose and check vs container.
+ * Face-roll: trust packer footprint (compose can disagree with makeShape rest-pose).
+ * Yaw-only: real mesh AABB check.
  */
 function itemPoseFitsInContainer(it, cont) {
   if (!it || !cont) return false;
+  // Face-roll / sole upright: packer AABB is the contract — don't reject on mesh compose quirks
+  if (it.packComposeRot || it.packOrientTag && /Rx|Rz/i.test(String(it.packOrientTag))) {
+    const fp = packFootprintFitsInContainer(it, cont);
+    if (fp != null) return fp;
+  }
   const mesh = makeShape({
     ...it,
     lengthMm: it.lengthMm || it.l || 500,

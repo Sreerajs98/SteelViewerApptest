@@ -24,6 +24,8 @@ static class Program
     public static bool RunWarehouseTests { get; private set; }
     /// <summary>Set when launched with --z-ground-tests (Z MOVE-to-ground measure).</summary>
     public static bool RunZGroundTests { get; private set; }
+    /// <summary>Optional IFC path from CLI (auto-load all phases after WebView ready).</summary>
+    public static string? StartupIfcPath { get; private set; }
 
     [STAThread]
     static void Main(string[] args)
@@ -50,6 +52,23 @@ static class Program
             string.Equals(a, "--warehouse-tests", StringComparison.OrdinalIgnoreCase));
         RunZGroundTests = args.Any(a =>
             string.Equals(a, "--z-ground-tests", StringComparison.OrdinalIgnoreCase));
+
+        // First .ifc path arg, or --ifc <path>
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (string.Equals(args[i], "--ifc", StringComparison.OrdinalIgnoreCase)
+                && i + 1 < args.Length)
+            {
+                StartupIfcPath = args[i + 1];
+                break;
+            }
+            if (args[i].EndsWith(".ifc", StringComparison.OrdinalIgnoreCase)
+                && File.Exists(args[i]))
+            {
+                StartupIfcPath = args[i];
+                break;
+            }
+        }
 
         Application.SetHighDpiMode(HighDpiMode.SystemAware);
         Application.EnableVisualStyles();

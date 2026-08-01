@@ -17,13 +17,13 @@
 var PACK_CONFIG = {
   clearance: {
     nesting_mm: 3.0,
-    parallel_bundle_mm: 5.0,
+    parallel_bundle_mm: 2.5,
     // Safe-zone (see 00-loading-rules.js) — internal volume inset
     bundle_to_bundle_mm: 20,
-    bundle_to_wall_mm: 50,          // legacy single-value → side
-    bundle_to_wall_side_mm: 50,
-    bundle_to_wall_end_mm: 100,
-    bundle_to_wall_top_mm: 50,
+    bundle_to_wall_mm: 2.5,         // legacy single-value → side
+    bundle_to_wall_side_mm: 2.5,
+    bundle_to_wall_end_mm: 2.5,
+    bundle_to_wall_top_mm: 2.5,
     floor_clearance_mm: 0,
     skid_height_mm: 100,            // pack-unit bbox vertical enclosure
     dunnage_mm: 75,
@@ -157,7 +157,7 @@ function cfgMaxSetForMethod(method) {
 
 function cfgNestClearanceMm(method) {
   if (method === 'PARALLEL_BUNDLE')
-    return cfgClearance('parallel_bundle_mm', 5.0);
+    return cfgClearance('parallel_bundle_mm', 2.5);
   return cfgClearance('nesting_mm', 3.0);
 }
 
@@ -650,11 +650,11 @@ function cs9ClampConfig(cfg) {
     c.nesting_mm = clamp(c.nesting_mm, 0, 10);
     c.parallel_bundle_mm = clamp(c.parallel_bundle_mm, 0, 20);
     c.bundle_to_bundle_mm = clamp(c.bundle_to_bundle_mm, 10, 100);
-    c.bundle_to_wall_mm = clamp(c.bundle_to_wall_mm, 20, 200);
+    c.bundle_to_wall_mm = clamp(c.bundle_to_wall_mm, 0, 200);
     if (c.bundle_to_wall_side_mm != null)
-      c.bundle_to_wall_side_mm = clamp(c.bundle_to_wall_side_mm, 20, 200);
+      c.bundle_to_wall_side_mm = clamp(c.bundle_to_wall_side_mm, 0, 200);
     if (c.bundle_to_wall_end_mm != null)
-      c.bundle_to_wall_end_mm = clamp(c.bundle_to_wall_end_mm, 20, 300);
+      c.bundle_to_wall_end_mm = clamp(c.bundle_to_wall_end_mm, 0, 300);
     if (c.bundle_to_wall_top_mm != null)
       c.bundle_to_wall_top_mm = clamp(c.bundle_to_wall_top_mm, 0, 200);
     if (c.floor_clearance_mm != null)

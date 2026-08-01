@@ -619,6 +619,255 @@
     assert(bPen < 1e5, `I-beam upright tipPen=${bPen} (want tipRatio×100)`);
   });
 
+  t('W.18d', 'Upright rafter: pack places + footprint fit accepts (no mesh reject)', () => {
+    if (typeof layoutContainerPackStep8 !== 'function'
+        || typeof packFootprintFitsInContainer !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const spec = {
+      lengthMm: 12192, widthMm: 2438, heightMm: 2591, maxWeightKg: 26000,
+    };
+    const res = layoutContainerPackStep8([], spec, null, {
+      packUnits: [{
+        mark: 'RF-WIDE', marks: ['RF-WIDE'],
+        groupKind: 'bundle_beam', shapeKey: 'i_beam', category: 'beam',
+        isAssembly: true, parts: [{ name: 'web' }, { name: 'flange' }],
+        qty: 1, total_weight: 711, weightKg: 711, unitWeightKg: 711,
+        lengthMm: 11608, widthMm: 2508, heightMm: 200,
+        bundle_bbox: { l: 11608, w: 2508, h: 200 },
+        // Pin rest-pose AABB — skip bogus measureStableBundleMm on stub parts
+        stableBundleMm: { l: 11608, w: 2508, h: 200 },
+        l: 11608, w: 2508, h: 200,
+      }],
+      maxContainers: 1, pass2: false, markOrder: null,
+    });
+    const placed = (res.containers[0] && res.containers[0].items) || [];
+    const over = res.oversized || [];
+    assert(placed.some(it => /RF-WIDE/.test(String(it.mark))),
+      `placed; over=${(over[0] && (over[0].fitReason || over[0].fitReasonMsg)) || 'none'}`);
+    const it = placed.find(p => /RF-WIDE/.test(String(p.mark)));
+    assert(it.packFootprintH >= 2400 && it.packFootprintW <= 350,
+      `footprint ${it.packFootprintL}x${it.packFootprintW}x${it.packFootprintH}`);
+    assert(packFootprintFitsInContainer(it, spec) === true, 'pack footprint fits');
+    if (typeof itemPoseFitsInContainer === 'function')
+      assert(itemPoseFitsInContainer(it, spec), 'itemPoseFits accepts face-roll');
+    if (typeof cs8IsStructuralFaceRoll === 'function') {
+      assert(cs8IsStructuralFaceRoll(
+        { groupKind: 'bundle_beam', shapeKey: 'i_beam' },
+        { packYawOnly: false, packComposeRot: true }
+      ), 'structural face-roll');
+    }
+  });
+
+  t('W.19', 'Dense pack: upright rafter + narrow beam snug adjacent (Z gap≈bundle)', () => {
+    if (typeof layoutContainerPackStep8 !== 'function'
+        || typeof cs8MaxFloorStripMm !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const spec = {
+      lengthMm: 12192, widthMm: 2438, heightMm: 2591, maxWeightKg: 26000,
+    };
+    const packUnits = [
+      {
+        mark: 'RF1', marks: ['RF1'],
+        groupKind: 'bundle_beam', shapeKey: 'i_beam', category: 'beam',
+        qty: 1, total_weight: 711, weightKg: 711, unitWeightKg: 711,
+        lengthMm: 11608, widthMm: 2508, heightMm: 200,
+        bundle_bbox: { l: 11608, w: 2508, h: 200 },
+        stableBundleMm: { l: 11608, w: 2508, h: 200 },
+        l: 11608, w: 2508, h: 200,
+      },
+      {
+        mark: 'B2', marks: ['B2'],
+        groupKind: 'bundle_beam', shapeKey: 'i_beam', category: 'beam',
+        qty: 1, total_weight: 400, weightKg: 400, unitWeightKg: 400,
+        lengthMm: 9000, widthMm: 200, heightMm: 300,
+        bundle_bbox: { l: 9000, w: 200, h: 300 },
+        stableBundleMm: { l: 9000, w: 200, h: 300 },
+        l: 9000, w: 200, h: 300,
+      },
+    ];
+    const res = layoutContainerPackStep8([], spec, null, {
+      packUnits, maxContainers: 1, pass2: true, markOrder: null,
+    });
+    const placed = (res.containers[0] && res.containers[0].items) || [];
+    assert(placed.length >= 2, `placed=${placed.length}`);
+    const rf = placed.find(it => /RF1/.test(String(it.mark)));
+    const b2 = placed.find(it => /B2/.test(String(it.mark)));
+    assert(rf && b2, 'both marks');
+    // Upright rafter footprint narrow in W
+    assert((rf.packFootprintW || 999) <= 350 || (rf.packFootprintH || 0) >= 2400,
+      `rf foot W=${rf.packFootprintW} H=${rf.packFootprintH}`);
+    // Side-by-side gap in packer Z (render z + W/2)
+    const Wmax = spec.widthMm;
+    const rfZ0 = (rf.z || 0) + Wmax / 2 - (rf.packFootprintW || 200) / 2;
+    const rfZ1 = rfZ0 + (rf.packFootprintW || 200);
+    const b2Z0 = (b2.z || 0) + Wmax / 2 - (b2.packFootprintW || 200) / 2;
+    const b2Z1 = b2Z0 + (b2.packFootprintW || 200);
+    const gapZ = Math.max(0, Math.max(rfZ0, b2Z0) - Math.min(rfZ1, b2Z1));
+    // If overlapping in Z projection they are stacked or same lane — allow;
+    // if side-by-side, gap should be near bundle gap (20) not a huge corridor
+    const sideBySide = !(rfZ1 <= b2Z0 + 1 || b2Z1 <= rfZ0 + 1)
+      ? false
+      : true;
+    if (sideBySide || gapZ > 0) {
+      const clearGap = rfZ1 <= b2Z0 ? (b2Z0 - rfZ1) : (rfZ0 - b2Z1);
+      if (clearGap > 0) {
+        assert(clearGap <= 120,
+          `Z corridor ${Math.round(clearGap)}mm (want ≤120 snug, not empty lane)`);
+      }
+    }
+    const strip = cs8MaxFloorStripMm(res.containers[0], spec.lengthMm, spec.widthMm);
+    // Full empty legal W ≈ W − 2×inner (2.5); two ~200mm feet + gap must shrink strip
+    const sideClr = (typeof cs8WallGapSide === 'function') ? cs8WallGapSide() : 2.5;
+    const emptyW = spec.widthMm - 2 * sideClr;
+    assert(strip < emptyW - 350,
+      `max floor strip ${Math.round(strip)}mm (want occupied, empty≈${emptyW})`);
+  });
+
+  t('W.21', 'Inner load line clearance is 2.5mm', () => {
+    if (typeof getLoadingRules !== 'function' && typeof getPackEnvelope !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const r = (typeof getLoadingRules === 'function') ? getLoadingRules() : null;
+    if (r) {
+      assert(Math.abs(r.WALL_CLEARANCE_SIDE_MM - 2.5) < 0.05, `side=${r.WALL_CLEARANCE_SIDE_MM}`);
+      assert(Math.abs(r.WALL_CLEARANCE_END_MM - 2.5) < 0.05, `end=${r.WALL_CLEARANCE_END_MM}`);
+      assert(Math.abs(r.WALL_CLEARANCE_TOP_MM - 2.5) < 0.05, `top=${r.WALL_CLEARANCE_TOP_MM}`);
+    }
+    const env = getPackEnvelope({ lengthMm: 12192, widthMm: 2438, heightMm: 2591 });
+    assert(Math.abs(env.clearanceSideMm - 2.5) < 0.05, `env.side=${env.clearanceSideMm}`);
+  });
+
+  t('W.21b', 'Human seat: first floor piece hugs back inner line (low packer X)', () => {
+    if (typeof layoutContainerPackStep8 !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const spec = {
+      lengthMm: 12192, widthMm: 2438, heightMm: 2591, maxWeightKg: 26000,
+    };
+    const packUnits = [{
+      mark: 'RF1', marks: ['RF1'],
+      groupKind: 'bundle_beam', shapeKey: 'i_beam', category: 'beam',
+      qty: 1, total_weight: 711, weightKg: 711, unitWeightKg: 711,
+      lengthMm: 11608, widthMm: 2508, heightMm: 200,
+      bundle_bbox: { l: 11608, w: 2508, h: 200 },
+      stableBundleMm: { l: 11608, w: 2508, h: 200 },
+      l: 11608, w: 2508, h: 200,
+    }];
+    const res = layoutContainerPackStep8([], spec, null, {
+      packUnits, maxContainers: 1, pass2: true, markOrder: null,
+    });
+    const it = (res.containers[0] && res.containers[0].items || [])[0];
+    assert(it, 'placed');
+    const fl = it.packFootprintL || 11608;
+    // Result x is render (mirrored): packer back ≈ high render X near door? 
+    // clean.x = Lmax - packerCx; packerCx ≈ gL + fl/2 when snug back
+    // → render x ≈ Lmax - gL - fl/2
+    const gL = (typeof cs8WallGapEnd === 'function') ? cs8WallGapEnd() : 2.5;
+    const expectRenderX = spec.lengthMm - gL - fl / 2;
+    const dx = Math.abs((it.x || 0) - expectRenderX);
+    assert(dx <= 80,
+      `back-hug dx=${Math.round(dx)}mm (x=${Math.round(it.x)} want≈${Math.round(expectRenderX)})`);
+  });
+
+  t('W.22', 'Inch-by-inch: 3 narrow beams fill Z from home wall (no mid corridor)', () => {
+    if (typeof layoutContainerPackStep8 !== 'function'
+        || typeof cs8InchByInchPlace !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const spec = {
+      lengthMm: 12192, widthMm: 2438, heightMm: 2591, maxWeightKg: 26000,
+    };
+    const mk = (i) => ({
+      mark: `NB${i}`, marks: [`NB${i}`],
+      groupKind: 'bundle_beam', shapeKey: 'i_beam', category: 'beam',
+      qty: 1, total_weight: 400, weightKg: 400, unitWeightKg: 400,
+      lengthMm: 9000, widthMm: 200, heightMm: 300,
+      bundle_bbox: { l: 9000, w: 200, h: 300 },
+      stableBundleMm: { l: 9000, w: 200, h: 300 },
+      l: 9000, w: 200, h: 300,
+    });
+    const res = layoutContainerPackStep8([], spec, null, {
+      packUnits: [mk(1), mk(2), mk(3)],
+      maxContainers: 1, pass2: true, markOrder: null,
+    });
+    const placed = (res.containers[0] && res.containers[0].items) || [];
+    assert(placed.length >= 3, `placed=${placed.length}`);
+    const Wmax = spec.widthMm;
+    const zSpans = placed.map(it => {
+      const fw = it.packFootprintW || 200;
+      const z0 = (it.z || 0) + Wmax / 2 - fw / 2;
+      return { z0, z1: z0 + fw, fw };
+    }).sort((a, b) => a.z0 - b.z0);
+    // Home wall: first span starts near side clearance
+    const gW = (typeof cs8WallGapSide === 'function') ? cs8WallGapSide() : 2.5;
+    assert(zSpans[0].z0 <= gW + 40,
+      `home Z0=${Math.round(zSpans[0].z0)} (want ≤${gW + 40})`);
+    // Adjacent gaps ≈ bundle gap, not empty lane
+    const gap = (typeof cs8BundleGap === 'function') ? cs8BundleGap() : 20;
+    for (let i = 1; i < zSpans.length; i++) {
+      const clear = zSpans[i].z0 - zSpans[i - 1].z1;
+      assert(clear >= -1 && clear <= gap + 40,
+        `Z gap[${i}]=${Math.round(clear)}mm (want ~${gap}, not corridor)`);
+    }
+  });
+
+  t('W.19b', 'Fine scan: narrow foot uses 50mm step', () => {
+    if (typeof cs8BuildScanAxes !== 'function') {
+      assert(true, 'skip');
+      return;
+    }
+    const Lmax = 12192, Wmax = 2438;
+    const fl = 11608, fw = 200;
+    const gL = 50, gW = 50, gap = 20;
+    const axes = cs8BuildScanAxes({ boxes: [] }, fl, fw, Lmax, Wmax, gL, gW, gap);
+    assert(axes.stepZm === 50, `stepZm=${axes.stepZm} (narrow → 50)`);
+    assert(axes.zs.indexOf(gW) >= 0, 'wall-edge Z seeded');
+  });
+
+  t('W.20', 'Pack render: foot-snap kills float (center Y → mesh minY=y0)', () => {
+    if (typeof snapMeshToPackerFootY !== 'function'
+        || typeof makeShape !== 'function'
+        || typeof THREE === 'undefined') {
+      assert(true, 'skip');
+      return;
+    }
+    const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.001;
+    // Floor-sat rest pose (origin near bottom) — packing used to float these
+    const it = {
+      mark: 'FLOAT1',
+      category: 'beam',
+      shapeKey: 'i_beam',
+      lengthMm: 4000, widthMm: 200, heightMm: 600,
+      sectH: 600, sectW: 200, sectT: 10, sectTf: 12, sectTw: 8,
+      x: 2000, y: 300, z: 0, // AABB center (y0=0, h=600)
+      packFootprintL: 4000, packFootprintW: 200, packFootprintH: 600,
+      packPoseLock: true,
+      userRot: { x: 0, y: 0, z: 0 },
+      packYawOnly: true,
+    };
+    const mesh = makeShape(it, 0x4488ff, 1);
+    mesh.position.set(it.x * sc, it.y * sc, it.z * sc);
+    // Simulate float: origin treated as center without snap
+    mesh.updateMatrixWorld(true);
+    const before = new THREE.Box3().setFromObject(mesh);
+    const floated = before.min.y > 0.02; // >20mm in scene units if SCALE=0.001 → 20mm
+    snapMeshToPackerFootY(mesh, it);
+    mesh.updateMatrixWorld(true);
+    const after = new THREE.Box3().setFromObject(mesh);
+    assert(Math.abs(after.min.y) < 0.002,
+      `minY=${after.min.y.toFixed(4)} (want ~0 ground, before=${before.min.y.toFixed(4)})`);
+    if (floated) {
+      assert(after.min.y < before.min.y - 0.01, 'snap must lower floated mesh');
+    }
+  });
+
   t('W.18b', 'Constraint sort: long light beam before heavy short nest', () => {
     if (typeof cs8SortHeavyAnchor !== 'function'
         || typeof cs8ConstraintTier !== 'function') {
@@ -856,6 +1105,8 @@
       isAssembly: true, parts: [{}, {}],
       sectH: 450, sectW: 280, sectT: 10,
       groupKind: 'welded_assembly',
+      // Pin envelope — stub parts must not invent a non-fitting bbox
+      stableBundleMm: { l: 9000, w: 280, h: 450 },
     });
     const g = {
       id: 'G-CL', groupKind: 'welded_assembly',
@@ -865,6 +1116,14 @@
     };
     const packUnits = buildPackUnitsStep7(g);
     assert(packUnits.length === 3, `pu=${packUnits.length}`);
+    // Bypass fragile measureStableBundleMm on stub parts {} 
+    packUnits.forEach(u => {
+      u.stableBundleMm = { l: 9000, w: 280, h: 450 };
+      u.bundle_bbox = { l: 9000, w: 280, h: 450, skidMm: 0 };
+      u.l = 9000; u.w = 280; u.h = 450;
+      u.lengthMm = 9000; u.widthMm = 280; u.heightMm = 450;
+      u.skidMm = 0;
+    });
     const spec = { lengthMm: 12000, widthMm: 2350, heightMm: 2690, maxWeightKg: 26000 };
     const res = layoutContainerPackStep8([], spec, null, {
       packUnits, maxContainers: 1, pass2: true, markOrder: null,
@@ -918,9 +1177,9 @@
     const fl = 12000, fw = 300;
     const gL = 50, gW = 50;
     const gap = 50;
-    // Empty: narrow Z → 100mm step (not 200)
+    // Empty: narrow Z → 50mm fine step (or leftover strip <400)
     const empty = cs8BuildScanAxes({ boxes: [] }, fl, fw, Lmax, Wmax, gL, gW, gap);
-    assert(empty.stepZm === 100, `stepZm=${empty.stepZm} (narrow → 100)`);
+    assert(empty.stepZm === 50, `stepZm=${empty.stepZm} (narrow → 50)`);
     // One rafter at Z=50 → next seed exactly at maxZ+gap
     const placed = {
       boxes: [{

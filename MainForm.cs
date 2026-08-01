@@ -147,6 +147,11 @@ public class MainForm : Form
                         "runGroupingTestSuite",
                         "_grouping_test_results.json",
                         "Grouping");
+                else if (!string.IsNullOrWhiteSpace(Program.StartupIfcPath)
+                    && File.Exists(Program.StartupIfcPath))
+                {
+                    await LoadIfcPathAsync(Program.StartupIfcPath, skipPhasePicker: true);
+                }
             };
             webView.CoreWebView2.Navigate(new Uri(htmlPath).AbsoluteUri);
         }
@@ -262,8 +267,12 @@ public class MainForm : Form
         };
 
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
-        string ifcPath = dialog.FileName;
+        await LoadIfcPathAsync(dialog.FileName, skipPhasePicker: false);
+    }
 
+    /// <summary>Load IFC into the viewer. CLI uses skipPhasePicker=true (all phases).</summary>
+    private async Task LoadIfcPathAsync(string ifcPath, bool skipPhasePicker)
+    {
         btnUploadIfc.Enabled = false;
         btnLoadJson.Enabled = false;
         Cursor = Cursors.WaitCursor;
@@ -273,16 +282,19 @@ public class MainForm : Form
             var scan = await Task.Run(() => XbimIfcIngest.ScanForPickerWithFallback(ifcPath));
             double? phaseFilter = null;
 
-            var counts = scan.HasPhaseTags
-                ? scan.PhaseCounts
-                : new List<(double Phase, int Count)> { (0, Math.Max(scan.TotalCandidates, 0)) };
-
-            Cursor = Cursors.Default;
-            using (var picker = new PhasePickerForm(counts, !scan.HasPhaseTags))
+            if (!skipPhasePicker)
             {
-                if (picker.ShowDialog(this) != DialogResult.OK) return;
-                Cursor = Cursors.WaitCursor;
-                if (!picker.AllPhasesChosen) phaseFilter = picker.SelectedPhase;
+                var counts = scan.HasPhaseTags
+                    ? scan.PhaseCounts
+                    : new List<(double Phase, int Count)> { (0, Math.Max(scan.TotalCandidates, 0)) };
+
+                Cursor = Cursors.Default;
+                using (var picker = new PhasePickerForm(counts, !scan.HasPhaseTags))
+                {
+                    if (picker.ShowDialog(this) != DialogResult.OK) return;
+                    Cursor = Cursors.WaitCursor;
+                    if (!picker.AllPhasesChosen) phaseFilter = picker.SelectedPhase;
+                }
             }
 
             lblStatus.Text = phaseFilter.HasValue
@@ -325,6 +337,39 @@ public class MainForm : Form
             string warnText = warnCount > 0 ? $", {warnCount} unusable items" : "";
             lblStatus.Text = $"{job.JobNo}  |  {phaseText}  |  {items.Count} assemblies " +
                               $"({skipped} skipped - no usable part), {Math.Round(totalWeight, 1)} kg total{warnText}";
+
+            // CLI --ifc: Group → select all → Optimise so upright floor anchors are visible
+            if (skipPhasePicker && webView.CoreWebView2 != null)
+            {
+                lblStatus.Text += "  |  Auto Optimise…";
+                await Task.Delay(2800);
+                await webView.CoreWebView2.ExecuteScriptAsync(
+                    """
+                    (async function () {
+                      try {
+                        if (typeof groupByShape === 'function') groupByShape();
+                        await new Promise(r => setTimeout(r, 900));
+                        if (typeof assemblyGroups !== 'undefined' && assemblyGroups.length) {
+                          assemblyGroups.forEach(g => {
+                            if (g.state !== 'oversized') g.checked = true;
+                          });
+                          if (typeof renumberCheckOrderByWeight === 'function')
+                            renumberCheckOrderByWeight();
+                          if (typeof renderStagingList === 'function') renderStagingList();
+                          if (typeof updateSelectAllBox === 'function') updateSelectAllBox();
+                        }
+                        await new Promise(r => setTimeout(r, 500));
+                        if (typeof layoutPlaceSelected === 'function')
+                          await layoutPlaceSelected();
+                        console.info('[CLI] Group + Optimise done');
+                      } catch (e) {
+                        console.error('[CLI] auto pack failed', e);
+                      }
+                    })()
+                    """);
+                lblStatus.Text = $"{job.JobNo}  |  {phaseText}  |  {items.Count} assemblies " +
+                                  $"({skipped} skipped), {Math.Round(totalWeight, 1)} kg  |  Optimised";
+            }
         }
         catch (Exception ex)
         {

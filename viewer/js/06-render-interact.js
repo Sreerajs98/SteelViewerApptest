@@ -151,9 +151,9 @@ function updateSafeZoneLegend(cont) {
     + `<span style="width:14px;height:10px;background:rgba(27,158,117,0.35);border:1.5px solid #1b9e75;border-radius:2px;flex:0 0 auto"></span>`
     + `<span><b style="color:var(--text)">Green floor</b> — load zone (keep cargo inside)</span></div>`
     + `<div style="margin-top:5px;font-size:10.5px;color:var(--text3)">`
-    + `Clearance: ${Math.round(env.clearanceSideMm)} mm sides · `
-    + `${Math.round(env.clearanceEndMm)} mm ends · `
-    + `${Math.round(env.clearanceTopMm)} mm top</div>`;
+    + `Clearance: ${(+env.clearanceSideMm).toFixed(1)} mm sides · `
+    + `${(+env.clearanceEndMm).toFixed(1)} mm ends · `
+    + `${(+env.clearanceTopMm).toFixed(1)} mm top</div>`;
 }
 
 // ------------------------------------------------------------------
@@ -194,6 +194,8 @@ function renderContainer(idx) {
     box.position.set(it.x*SCALE, it.y*SCALE, it.z*SCALE);
     // Keep packer / user orientation (yaw-only, face-roll compose, or absolute).
     applyPackItemRotation(box, it);
+    // Packer Y is AABB center; rest-pose mesh origin is often floor-sat → foot-snap
+    snapMeshToPackerFootY(box, it);
     scene.add(box);
     const sid = it.stagingGroupId || findStagingIdForUnit(it);
     if (sid && !it.stagingGroupId) it.stagingGroupId = sid;
@@ -215,7 +217,7 @@ function renderContainer(idx) {
     clampMeshesInsideContainer(unlocked.map(c => c.mesh), cont);
     clampMeshesInsideContainer(unlocked.map(c => c.mesh), cont);
   }
-  // Locked packed items: sync item.x/y/z from mesh only if missing — never move mesh
+  // Locked packed items: keep packer X/Z + existing rot; foot-snap Y (no float)
   inside.forEach(c => {
     if (!c.item?.packPoseLock || !c.mesh) return;
     c.mesh.position.set(
@@ -223,6 +225,7 @@ function renderContainer(idx) {
       (c.item.y || 0) * SCALE,
       (c.item.z || 0) * SCALE
     );
+    snapMeshToPackerFootY(c.mesh, c.item);
   });
 
   if (idx === 0 && currentLayout.oversized && currentLayout.oversized.length) {
@@ -2057,6 +2060,81 @@ function csPackSleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/**
+ * Align rest-pose mesh AABB to packer footprint (fixes double-rotation:
+ * rest-pose already rolled + blind Rx90 compose → flat again / wall poke).
+ */
+function alignMeshToPackFootprint(mesh, it) {
+  if (!mesh || !it || typeof THREE === 'undefined') return false;
+  const tL = Number(it.packFootprintL) || 0;
+  const tW = Number(it.packFootprintW) || 0;
+  const tH = Number(it.packFootprintH) || 0;
+  if (!(tL > 0 && tW > 0 && tH > 0)) return false;
+  const target = [tL, tH, tW]; // world X,Y,Z mm
+  const tol = Math.max(80, Math.min(tL, tW, tH) * 0.08);
+
+  const measure = () => {
+    mesh.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(mesh);
+    const s = new THREE.Vector3();
+    box.getSize(s);
+    const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.001;
+    return [s.x / sc, s.y / sc, s.z / sc];
+  };
+  const errOf = (d) =>
+    Math.abs(d[0] - target[0]) + Math.abs(d[1] - target[1]) + Math.abs(d[2] - target[2]);
+
+  const qRest = mesh.quaternion.clone();
+  let best = { err: errOf(measure()), q: qRest.clone() };
+  if (best.err <= tol * 3) return true; // already matches footprint
+
+  const ur = it.userRot || {};
+  const trials = [
+    { x: ur.x || 0, y: ur.y || 0, z: ur.z || 0 },
+    { x: Math.PI / 2, y: 0, z: 0 },
+    { x: -Math.PI / 2, y: 0, z: 0 },
+    { x: 0, y: 0, z: Math.PI / 2 },
+    { x: 0, y: 0, z: -Math.PI / 2 },
+    { x: Math.PI / 2, y: Math.PI, z: 0 },
+    { x: Math.PI / 2, y: Math.PI / 2, z: 0 },
+    { x: -Math.PI / 2, y: Math.PI / 2, z: 0 },
+    { x: 0, y: Math.PI / 2, z: Math.PI / 2 },
+  ];
+  for (let i = 0; i < trials.length; i++) {
+    const t = trials[i];
+    mesh.quaternion.copy(qRest);
+    const e = new THREE.Euler(t.x, t.y, t.z, 'XYZ');
+    mesh.quaternion.premultiply(new THREE.Quaternion().setFromEuler(e));
+    mesh.rotation.setFromQuaternion(mesh.quaternion);
+    const err = errOf(measure());
+    if (err < best.err) best = { err, q: mesh.quaternion.clone() };
+    if (err <= tol) break;
+  }
+  mesh.quaternion.copy(best.q);
+  mesh.rotation.setFromQuaternion(mesh.quaternion);
+  return best.err <= tol * 4;
+}
+
+/**
+ * Seat mesh so world min.y matches packer foot Y (support surface).
+ * Packer stores item.y as AABB center; makeShape rest-pose is often floor-sat
+ * (origin ≠ center). Without this, packPoseLock items float by ~H/2.
+ * X/Z untouched (wall clearances stay).
+ */
+function snapMeshToPackerFootY(mesh, it) {
+  if (!mesh || !it || typeof THREE === 'undefined') return 0;
+  const fh = it.packFootprintH || it.heightMm || it.h || 0;
+  const yCenter = it.y != null ? it.y : fh / 2;
+  const y0mm = yCenter - fh / 2; // packer support / floor (or shelf)
+  const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.001;
+  mesh.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(mesh);
+  if (!isFinite(box.min.y) || !isFinite(box.max.y)) return 0;
+  const dy = y0mm * sc - box.min.y;
+  if (Math.abs(dy) > 1e-5) mesh.position.y += dy;
+  return dy;
+}
+
 /** Apply packer rotation onto a mesh that already has makeShape rest-pose. */
 function applyPackItemRotation(mesh, it) {
   if (!mesh || !it) return;
@@ -2066,7 +2144,10 @@ function applyPackItemRotation(mesh, it) {
   }
   const ur = it.userRot;
   if (it.packComposeRot) {
-    // Face-roll / tip delta composed on top of rest-pose (yard trial)
+    // Prefer footprint-aligned face roll (avoids rest-pose × Rx90 cancellation)
+    if (it.packFootprintL > 0 && it.packFootprintW > 0 && it.packFootprintH > 0) {
+      if (alignMeshToPackFootprint(mesh, it)) return;
+    }
     if (typeof THREE !== 'undefined') {
       const e = new THREE.Euler(ur.x || 0, ur.y || 0, ur.z || 0, 'XYZ');
       const qAdd = new THREE.Quaternion().setFromEuler(e);
@@ -2085,8 +2166,8 @@ function applyPackItemRotation(mesh, it) {
 }
 
 /**
- * Live Pack theatre: for each heaviest-first unit, show every orient + slot
- * try (rotate / move ghost), then commit or reject.
+ * Pack place theatre: show only final seats (commit) one-by-one.
+ * No orient / rotate / slot-try ghost — user only sees placed pieces.
  */
 async function animatePackPlacementReveal(packedContainers, keepOutside, placementSteps) {
   const finalCont = (packedContainers && packedContainers[0])
@@ -2101,12 +2182,6 @@ async function animatePackPlacementReveal(packedContainers, keepOutside, placeme
     const marks = it.marks && it.marks.length ? it.marks : [it.mark];
     marks.forEach(m => { if (m) byMark.set(m, it); });
     if (it.mark) byMark.set(it.mark, it);
-  });
-  const outsideByMark = new Map();
-  (keepOutside || []).forEach(it => {
-    const marks = it.marks && it.marks.length ? it.marks : [it.mark];
-    marks.forEach(m => { if (m) outsideByMark.set(m, it); });
-    if (it.mark) outsideByMark.set(it.mark, it);
   });
 
   const live = {
@@ -2127,9 +2202,7 @@ async function animatePackPlacementReveal(packedContainers, keepOutside, placeme
   const cv = Lmax * Wmax * (finalCont.heightMm || 2690);
   let wSum = 0;
   let vSum = 0;
-  let unitIdx = 0;
-  let ghost = null;
-  let unitSrc = null;
+  let seatIdx = 0;
 
   function syncLive(extraOutside) {
     const outs = extraOutside != null ? extraOutside : remainingOutside;
@@ -2137,141 +2210,19 @@ async function animatePackPlacementReveal(packedContainers, keepOutside, placeme
     renderContainer(0);
   }
 
-  function ghostItemFrom(step, src) {
-    const fl = step.l || src.packFootprintL || src.l || src.lengthMm || 1000;
-    const fw = step.w || src.packFootprintW || src.w || src.widthMm || 200;
-    const fh = step.h || src.packFootprintH || src.h || src.heightMm || 200;
-    const x0 = (step.x != null) ? step.x + fl / 2 : Lmax / 2;
-    const z0 = (step.z != null)
-      ? (step.z + fw / 2 - Wmax / 2)
-      : 0;
-    const y0 = (step.y0 != null) ? step.y0 + fh / 2 : fh / 2;
-    return {
-      ...src,
-      mark: (src.mark || step.mark || '?') + ' · TRY',
-      x: x0,
-      y: y0,
-      z: z0,
-      packFootprintL: fl,
-      packFootprintW: fw,
-      packFootprintH: fh,
-      userRot: step.rot
-        ? { x: step.rot.x || 0, y: step.rot.y || 0, z: step.rot.z || 0 }
-        : { x: 0, y: 0, z: 0 },
-      packYawOnly: step.packComposeRot ? false : (step.packYawOnly !== false),
-      packComposeRot: !!step.packComposeRot,
-      packPoseLock: true,
-      isPackGhost: true,
-      category: src.category || 'other',
-    };
-  }
+  // Place-only: ignore orient / slot / accept / unit_start theatre noise
+  const placeSteps = steps.filter(s =>
+    s && (s.type === 'commit' || s.type === 'reject'
+      || (!s.type && s.mark && byMark.has(s.mark))));
 
-  function setGhost(step) {
-    if (!unitSrc) return;
-    ghost = ghostItemFrom(step, unitSrc);
-    // Ghost sits in live.items temporarily (amber toast only — same mesh path)
-    const committed = live.items.filter(it => !it.isPackGhost);
-    live.items = [...committed, ghost];
-    syncLive(remainingOutside.filter(o => o.mark !== unitSrc.mark
-      && !(unitSrc.marks || []).includes(o.mark)));
-  }
-
-  function clearGhost() {
-    ghost = null;
-    live.items = live.items.filter(it => !it.isPackGhost);
-  }
-
-  for (let si = 0; si < steps.length; si++) {
-    const s = steps[si];
+  for (let si = 0; si < placeSteps.length; si++) {
+    const s = placeSteps[si];
     const typ = s.type || (s.mark ? 'commit' : '');
-
-    if (typ === 'unit_start') {
-      unitIdx++;
-      clearGhost();
-      unitSrc = byMark.get(s.mark)
-        || outsideByMark.get(s.mark)
-        || {
-          mark: s.mark,
-          marks: s.marks,
-          l: s.l, w: s.w, h: s.h,
-          lengthMm: s.l, widthMm: s.w, heightMm: s.h,
-          packFootprintL: s.l, packFootprintW: s.w, packFootprintH: s.h,
-          unitWeightKg: s.weight || 0,
-          isAssembly: !!s.isAssembly,
-          category: 'beam',
-        };
-      try {
-        showToast(
-          `① #${unitIdx} · ${Math.round(s.weight || 0)} kg · ${s.mark}`
-          + (s.isAssembly || s.floorAnchor ? ' · BASE try' : ''),
-          900
-        );
-      } catch (_) { /* */ }
-      // Preview at door-centre before first orient
-      setGhost({
-        mark: s.mark, l: s.l, w: s.w, h: s.h,
-        x: 100, z: 100, y0: 0,
-        rot: { x: 0, y: 0, z: 0 },
-        packYawOnly: true,
-      });
-      await csPackSleep(380);
-      continue;
-    }
-
-    if (typ === 'orient') {
-      try {
-        showToast(
-          `↻ rotate ${s.tag} · base ${Math.round((s.baseArea || 0) / 1e4) / 100} m²`
-          + ` · ${Math.round(s.l)}×${Math.round(s.w)}×${Math.round(s.h)}`,
-          700
-        );
-      } catch (_) { /* */ }
-      setGhost({
-        ...s,
-        x: (Lmax - (s.l || 1000)) / 2,
-        z: (Wmax - (s.w || 200)) / 2,
-        y0: 0,
-      });
-      await csPackSleep(s.packComposeRot ? 520 : 400);
-      continue;
-    }
-
-    if (typ === 'slot') {
-      setGhost(s);
-      try {
-        showToast(
-          s.ok
-            ? `✓ slot ${s.tag} · bearing ${Math.round((s.supportFrac || 0) * 100)}%`
-            : `✗ ${s.tag} · ${s.reason || 'no'}`,
-          280
-        );
-      } catch (_) { /* */ }
-      await csPackSleep(s.ok ? 220 : 160);
-      continue;
-    }
-
-    if (typ === 'orient_fail') {
-      try {
-        showToast(`↻ ${s.tag || '?'} fail · ${s.reason || ''}`, 260);
-      } catch (_) { /* */ }
-      await csPackSleep(140);
-      continue;
-    }
-
-    if (typ === 'accept') {
-      // Preview chosen pose before commit step adds the real item
-      setGhost(s);
-      try {
-        showToast(`★ best ${s.tag} · bearing ${Math.round((s.supportFrac || 0) * 100)}%`, 400);
-      } catch (_) { /* */ }
-      await csPackSleep(360);
-      continue;
-    }
 
     if (typ === 'commit') {
       const finalIt = byMark.get(s.mark);
-      clearGhost();
       if (finalIt && !live.items.some(it => it.mark === finalIt.mark)) {
+        seatIdx++;
         live.items.push(finalIt);
         wSum += (finalIt.unitWeightKg || finalIt.weight || 0);
         vSum += (finalIt.packFootprintL || finalIt.lengthMm || finalIt.l || 1)
@@ -2290,18 +2241,14 @@ async function animatePackPlacementReveal(packedContainers, keepOutside, placeme
         }
         syncLive();
         try {
-          showToast(
-            `✔ SEAT ${s.tag || finalIt.packOrientTag || ''} · ${s.mark}`,
-            500
-          );
+          showToast(`✔ #${seatIdx} · ${s.mark}`, 450);
         } catch (_) { /* */ }
-        await csPackSleep(480);
+        await csPackSleep(420);
       }
       continue;
     }
 
     if (typ === 'reject') {
-      clearGhost();
       syncLive();
       try {
         showToast(`✘ OUT · ${s.mark} · ${s.reason || 'no fit'}`, 700);
@@ -2321,7 +2268,6 @@ async function animatePackPlacementReveal(packedContainers, keepOutside, placeme
     }
   }
 
-  clearGhost();
   currentLayout = {
     containers: packedContainers,
     oversized: keepOutside || [],
@@ -2639,8 +2585,9 @@ async function layoutPlaceSelected() {
 
   try {
     const steps = packedLayout.placementSteps || [];
-    const hasTrials = steps.some(s => s && (s.type === 'unit_start' || s.type === 'orient'));
-    if (animate && packedContainers.length && (hasTrials || (packedContainers[0].items || []).length)) {
+    const hasPlaces = steps.some(s => s && s.type === 'commit')
+      || ((packedContainers[0] && packedContainers[0].items) || []).length > 0;
+    if (animate && packedContainers.length && hasPlaces) {
       await animatePackPlacementReveal(
         packedContainers,
         keepOutside,

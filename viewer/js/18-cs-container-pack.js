@@ -82,22 +82,22 @@ function cs8WallGapSide() {
   if (typeof getLoadingRules === 'function')
     return getLoadingRules().WALL_CLEARANCE_SIDE_MM;
   return (typeof cfgClearance === 'function')
-    ? cfgClearance('bundle_to_wall_side_mm', cfgClearance('bundle_to_wall_mm', 50))
-    : 50;
+    ? cfgClearance('bundle_to_wall_side_mm', cfgClearance('bundle_to_wall_mm', 2.5))
+    : 2.5;
 }
 function cs8WallGapEnd() {
   if (typeof getLoadingRules === 'function')
     return getLoadingRules().WALL_CLEARANCE_END_MM;
   return (typeof cfgClearance === 'function')
-    ? cfgClearance('bundle_to_wall_end_mm', 100)
-    : 100;
+    ? cfgClearance('bundle_to_wall_end_mm', 2.5)
+    : 2.5;
 }
 function cs8WallGapTop() {
   if (typeof getLoadingRules === 'function')
     return getLoadingRules().WALL_CLEARANCE_TOP_MM;
   return (typeof cfgClearance === 'function')
-    ? cfgClearance('bundle_to_wall_top_mm', 50)
-    : 50;
+    ? cfgClearance('bundle_to_wall_top_mm', 2.5)
+    : 2.5;
 }
 /** @deprecated use cs8WallGapSide — kept for older callers */
 function cs8WallGap() {
@@ -112,7 +112,8 @@ function cs8WallGap() {
 function cs8EffectiveWallGaps(fl, fw, Lmax, Wmax) {
   const wantL = cs8WallGapEnd();
   const wantW = cs8WallGapSide();
-  const minPrefer = 20; // keep a little end gap when slack exists
+  // Keep at least the configured inner-line gap when slack allows; else shrink to fit
+  const minPrefer = Math.max(wantL, wantW, 2.5);
   function axisGap(span, limit, want) {
     if (!(span > 0) || !(limit > 0)) return want;
     if (span + 2 * want <= limit + CS8_EPS) return want;
@@ -131,33 +132,45 @@ function cs8Dunnage() {
   return (typeof cfgClearance === 'function') ? cfgClearance('dunnage_mm', 75) : 75;
 }
 
+/** Fine scan step (mm) — used for narrow feet / tight leftover strips. */
+const CS8_FINE_STEP_MM = 50;
+
 /**
  * Build X/Z scan axes for a footprint.
- * - Narrow items (foot < 30% of container axis) → 100mm step (not 200)
- * - Seed exact adjacent slots beside/after every placed box (yard snug-fit)
+ * - Narrow foot (<30% axis) OR leftover strip <400mm → 50mm step
+ * - Else 100–200mm step
+ * - Seed wall edges + exact adjacent slots (yard snug-fit)
  */
-function cs8BuildScanAxes(c, fl, fw, Lmax, Wmax, gL, gW, bundleGap) {
+function cs8BuildScanAxes(c, fl, fw, Lmax, Wmax, gL, gW, bundleGap, scanExtra) {
   const xMax0 = Lmax - gL - fl;
   const zMax0 = Wmax - gW - fw;
   const gap = bundleGap != null ? bundleGap : cs8BundleGap();
+  const freeL = Math.max(0, xMax0 - gL + fl); // span available along L for this foot
+  const freeW = Math.max(0, zMax0 - gW + fw);
+  const leftoverL = Math.max(0, Lmax - 2 * gL - fl);
+  const leftoverW = Math.max(0, Wmax - 2 * gW - fw);
+  const extra = scanExtra || {};
 
-  // Narrow / short footprints need finer grid so 300mm rafters don't miss Z=350
-  const stepXm = (fl < Lmax * 0.3)
-    ? CS8_CELL_MM
+  const fineX = fl < Lmax * 0.3 || leftoverL < 800
+    || !!(extra.forceFine);
+  const fineZ = fw < Wmax * 0.3 || leftoverW < 400
+    || !!(extra.forceFine);
+  const stepXm = fineX
+    ? CS8_FINE_STEP_MM
     : Math.max(CS8_CELL_MM, Math.min(fl, CS8_CELL_MM * 2));
-  const stepZm = (fw < Wmax * 0.3)
-    ? CS8_CELL_MM
+  const stepZm = fineZ
+    ? CS8_FINE_STEP_MM
     : Math.max(CS8_CELL_MM, Math.min(fw, CS8_CELL_MM * 2));
 
   const xs = [];
   const zs = [];
   if (xMax0 >= gL - CS8_EPS) {
     for (let x = gL; x <= xMax0 + CS8_EPS; x += stepXm) xs.push(x);
-    if (!xs.length || Math.abs(xs[xs.length - 1] - xMax0) > CS8_EPS) xs.push(xMax0);
+    xs.push(gL, xMax0); // wall-edge snug
   }
   if (zMax0 >= gW - CS8_EPS) {
     for (let z = gW; z <= zMax0 + CS8_EPS; z += stepZm) zs.push(z);
-    if (!zs.length || Math.abs(zs[zs.length - 1] - zMax0) > CS8_EPS) zs.push(zMax0);
+    zs.push(gW, zMax0); // side-wall snug
   }
 
   // Exact adjacent seeds from already-placed cargo (worker: "next to #1")
@@ -173,6 +186,21 @@ function cs8BuildScanAxes(c, fl, fw, Lmax, Wmax, gL, gW, bundleGap) {
     if (xBefore >= gL - CS8_EPS && xBefore <= xMax0 + CS8_EPS) xs.push(xBefore);
     if (zAfter >= gW - CS8_EPS && zAfter <= zMax0 + CS8_EPS) zs.push(zAfter);
     if (zBefore >= gW - CS8_EPS && zBefore <= zMax0 + CS8_EPS) zs.push(zBefore);
+    // Align starts with neighbour along the other axis (maximize contact)
+    if (b.minX >= gL - CS8_EPS && b.minX <= xMax0 + CS8_EPS) xs.push(b.minX);
+    if (b.minZ >= gW - CS8_EPS && b.minZ <= zMax0 + CS8_EPS) zs.push(b.minZ);
+  }
+
+  // Free-rect corridor seeds (Pass2 densifier)
+  const exZs = extra.zs || [];
+  for (let i = 0; i < exZs.length; i++) {
+    const z = exZs[i];
+    if (z >= gW - CS8_EPS && z <= zMax0 + CS8_EPS) zs.push(z);
+  }
+  const exXs = extra.xs || [];
+  for (let i = 0; i < exXs.length; i++) {
+    const x = exXs[i];
+    if (x >= gL - CS8_EPS && x <= xMax0 + CS8_EPS) xs.push(x);
   }
 
   const uniqSort = (arr) => {
@@ -195,7 +223,48 @@ function cs8BuildScanAxes(c, fl, fw, Lmax, Wmax, gL, gW, bundleGap) {
     stepZm,
     xMax0,
     zMax0,
+    fineX,
+    fineZ,
+    freeL,
+    freeW,
   };
+}
+
+/**
+ * Contact length (mm) with walls / neighbours — higher = snugger yard seat.
+ * Used as negative cost so corridors lose to wall/adjacent seats.
+ */
+function cs8SnugContactMm(c, x, z, fl, fw, Lmax, Wmax, gL, gW, bundleGap) {
+  const gap = bundleGap != null ? bundleGap : cs8BundleGap();
+  const tol = Math.max(gap, CS8_FINE_STEP_MM) + 2;
+  let contact = 0;
+  // Human fill: one home side (−Z / gW) first, then neighbours — not opposite wall
+  if (Math.abs(z - gW) <= tol) contact += fl * 2.0;
+  if (Math.abs((z + fw) - (Wmax - gW)) <= tol) contact += fl * 0.2;
+  // Back wall (closed end) preferred over door end
+  if (Math.abs(x - gL) <= tol) contact += fw * 2.5;
+  if (Math.abs((x + fl) - (Lmax - gL)) <= tol) contact += fw * 0.25;
+
+  const boxes = (c && c.boxes) || [];
+  for (let i = 0; i < boxes.length; i++) {
+    const b = boxes[i];
+    if (!b) continue;
+    // Adjacent in Z (side-by-side) — strongest human cue (“next to #1”)
+    const zAdj = Math.abs(z - (b.maxZ + gap)) <= tol
+      || Math.abs(b.minZ - (z + fw + gap)) <= tol;
+    if (zAdj) {
+      const ov = Math.max(0, Math.min(x + fl, b.maxX) - Math.max(x, b.minX));
+      contact += ov * 4;
+    }
+    // Adjacent in X (end-to-end)
+    const xAdj = Math.abs(x - (b.maxX + gap)) <= tol
+      || Math.abs(b.minX - (x + fl + gap)) <= tol;
+    if (xAdj) {
+      const ov = Math.max(0, Math.min(z + fw, b.maxZ) - Math.max(z, b.minZ));
+      contact += ov * 2;
+    }
+  }
+  return contact;
 }
 
 /** Welded / multi-part assembly = container BASE cargo. */
@@ -543,10 +612,17 @@ function layoutContainerPackStep8(items, spec, rotMap, opts) {
       floorClearMm: floorClear,
     });
     let placed = false;
+    function placeWithInchThenFallback(c) {
+      // Inch-by-inch primary (yard: closed-end → Z fill → next bay); scored scan fallback
+      return cs8InchByInchPlace(
+        c, u, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm, optsWithLog
+      ) || cs8FindPlacement(
+        c, u, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm, optsWithLog
+      );
+    }
     for (const c of containers) {
       if (c.weightUsed + u.weight > maxKg + 1e-6) continue;
-      const pose = cs8FindPlacement(
-        c, u, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm, optsWithLog);
+      const pose = placeWithInchThenFallback(c);
       if (!pose) continue;
       cs8Commit(c, u, pose, Lmax, Wmax);
       const last = c.items[c.items.length - 1];
@@ -573,8 +649,7 @@ function layoutContainerPackStep8(items, spec, rotMap, opts) {
       const c = newContainer();
       containers.push(c);
       if (c.weightUsed + u.weight <= maxKg + 1e-6) {
-        const pose = cs8FindPlacement(
-          c, u, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm, optsWithLog);
+        const pose = placeWithInchThenFallback(c);
         if (pose) {
           cs8Commit(c, u, pose, Lmax, Wmax);
           const last = c.items[c.items.length - 1];
@@ -1498,11 +1573,33 @@ function cs8EvalFootprint(c, x, z, fl, fw, u, o) {
   };
 }
 
-/** Support gate: planar 80% OR two-point rails for OPEN+concave. */
+/** Face-roll upright structural (I-beam/assy on flange) — not yaw-only. */
+function cs8IsStructuralFaceRoll(u, o) {
+  if (!o || o.packYawOnly || !o.packComposeRot) return false;
+  if (cs8IsAssemblyUnit(u)) return true;
+  const gk = String((u && u.groupKind) || '').toLowerCase();
+  const sk = String((u && (u.shapeKey || u.profileShape)) || '').toLowerCase();
+  const cat = String((u && u.category) || '').toLowerCase();
+  const blob = `${(u && u.assemblyName) || ''} ${(u && u.mark) || ''}`;
+  return gk === 'bundle_beam' || gk === 'welded_assembly'
+    || sk === 'i_beam' || sk === 'built_up' || cat === 'beam'
+    || /RAFTER|COLUMN|PORTAL|FRAME|BUILT[\s-]?UP/i.test(blob);
+}
+
+/**
+ * Support gate: planar 80% OR two-point rails for OPEN+concave.
+ * Face-roll structural uprights: AABB "bearing" ≠ flange contact — on floor
+ * accept any real contact (empty hm already ~100%; station masks can drop %).
+ */
 function cs8SupportAccepted(ev, u, o, supportMin, floorAnchor) {
   if (!ev) return false;
   const twoPt = !!(o && o.two_point_base) || (floorAnchor && cs8NeedsTwoPointBase(u));
   if (twoPt) return !!ev.twoPointOk;
+  if (floorAnchor && cs8IsStructuralFaceRoll(u, o)) {
+    // I-beam on flange: need ground contact, not 80% of fat AABB
+    return ev.supportFrac + 1e-9 >= 0.02
+      && (ev.hangFrac == null || ev.hangFrac <= cs8OverhangMax() + 1e-9);
+  }
   return ev.supportFrac + 1e-9 >= supportMin;
 }
 
@@ -1513,6 +1610,261 @@ function cs8YawTagFromRad(y) {
   if (Math.abs(a - Math.PI / 2) < 0.15 || Math.abs(a - 3 * Math.PI / 2) < 0.15)
     return 'yaw90';
   return 'yaw';
+}
+
+/**
+ * Validate one packer-space seat (x,z). Same gates as findPlacement slots.
+ * Returns pose { x,z,y0,o,box,fl,fw,... } or null.
+ */
+function cs8TrySeatAt(
+  c, u, o, x, z, Lmax, Wmax, wallGap, bundleGap, dunnageMm,
+  floorAnchor, supportMin, Houter, floorClearMm
+) {
+  const fl = o.l, fw = o.w, fh = o.h;
+  const gap = bundleGap != null ? bundleGap : cs8BundleGap();
+  const ev = cs8EvalFootprint(c, x, z, fl, fw, u, o);
+  if (!ev) return null;
+  if (!cs8SupportAccepted(ev, u, o, supportMin, floorAnchor)) return null;
+  if (ev.overhangFrac - 1e-9 > cs8OverhangMax()) return null;
+
+  let y0 = ev.supportY;
+  if (y0 > CS8_EPS) {
+    const belowFam = cs8FamilyUnder(c, x, z, fl, fw, y0);
+    const myFam = u.groupKind || u.category || null;
+    if (belowFam && myFam && belowFam !== myFam)
+      y0 += (dunnageMm != null ? dunnageMm : cs8Dunnage());
+  }
+  if (floorAnchor && !cs8IsFloorOrSkidY(y0)) return null;
+
+  const Hceil = cs8AbsolutePackHeightMm(Houter, floorClearMm);
+  if (y0 + fh > Hceil + CS8_EPS) return null;
+
+  const box = {
+    minX: x, maxX: x + fl,
+    minY: y0, maxY: y0 + fh,
+    minZ: z, maxZ: z + fw,
+    family: u.groupKind || u.category || null,
+  };
+  const boxInfl = {
+    minX: box.minX - gap * 0.5, maxX: box.maxX + gap * 0.5,
+    minY: box.minY, maxY: box.maxY,
+    minZ: box.minZ - gap * 0.5, maxZ: box.maxZ + gap * 0.5,
+  };
+  if ((c.boxes || []).some(b => {
+    const bi = {
+      minX: b.minX - gap * 0.5, maxX: b.maxX + gap * 0.5,
+      minY: b.minY, maxY: b.maxY,
+      minZ: b.minZ - gap * 0.5, maxZ: b.maxZ + gap * 0.5,
+    };
+    return cs8AabbCollide(boxInfl, bi);
+  })) return null;
+
+  if (fl > Lmax + CS8_EPS || fw > Wmax + CS8_EPS) return null;
+
+  return {
+    x, z, y0, o, box, fl, fw,
+    supportFrac: ev.supportFrac,
+    overhangFrac: ev.overhangFrac,
+    snugMm: 0,
+  };
+}
+
+/** Resolve tryOrients list (shared by inch-by-inch + scored find). */
+function cs8ResolvePlaceOrients(u, Lmax, Wmax, Hmax, floorAnchor, orientOpts, po) {
+  const resolved = cs8ResolveTryOrients(
+    u, Lmax, Wmax, Hmax, floorAnchor, true, orientOpts
+  );
+  let tryOrients;
+  if (resolved.primary.length) {
+    const fb = (resolved.fallback || []).filter(o => !o.rule1Primary);
+    tryOrients = resolved.primary.concat(fb);
+  } else {
+    tryOrients = (resolved.fallback || []).slice();
+  }
+  if (po.lockedOrient && po.lockedOrient.l > 0) {
+    tryOrients = [po.lockedOrient];
+  } else if (po.lockedYaw != null && isFinite(po.lockedYaw)) {
+    const fl = Math.max(u.packFootprintL || 0, 0);
+    const fw = Math.max(u.packFootprintW || 0, 0);
+    const fh = Math.max(u.packFootprintH || u.h || 0, 0);
+    if (fl > 0 && fw > 0 && fh > 0) {
+      const tag = cs8YawTagFromRad(po.lockedYaw);
+      tryOrients = [{
+        l: fl, w: fw, h: fh,
+        rot: {
+          x: (u.userRot && u.userRot.x) || 0,
+          y: po.lockedYaw,
+          z: (u.userRot && u.userRot.z) || 0,
+        },
+        tag,
+        shipPreferred: tag === 'yaw0' || tag === 'yaw180',
+        floorAnchor: true,
+        packYawOnly: !!(u.packYawOnly !== false && !(u.packComposeRot)),
+        packComposeRot: !!u.packComposeRot,
+        baseArea: fl * fw,
+        stabilityScore: fl * fw,
+      }];
+    } else {
+      const locked = tryOrients.filter(o =>
+        Math.abs((o.rot.y || 0) - po.lockedYaw) < 0.15);
+      if (locked.length) tryOrients = locked;
+    }
+  }
+  return tryOrients;
+}
+
+/**
+ * Real-warehouse inch-by-inch place:
+ * closed-end bay (X=gL) → fill Z from home wall → next bay toward door → tier-up.
+ * First valid seat wins (deterministic). Rule-4 = next orient only if blocked.
+ */
+function cs8InchByInchPlace(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm, placeOpts) {
+  const po = placeOpts || {};
+  const floorAnchor = !!po.floorAnchor;
+  const log = Array.isArray(po.trialLog) ? po.trialLog : null;
+  const mark = u.mark || (u.marks && u.marks[0]) || '?';
+  const orientOpts = {
+    Houter: po.Houter != null ? po.Houter : (u._Houter != null ? u._Houter : Hmax),
+    floorClearMm: po.floorClearMm != null ? po.floorClearMm
+      : (u._floorClearMm != null ? u._floorClearMm : 0),
+  };
+  const tryOrients = cs8ResolvePlaceOrients(
+    u, Lmax, Wmax, Hmax, floorAnchor, orientOpts, po
+  );
+  if (!tryOrients.length) {
+    if (log) log.push({ type: 'orient_fail', mark, tag: '-', reason: 'no_orient_fits' });
+    return null;
+  }
+
+  const supportMin = floorAnchor ? cs8FloorAnchorSupportMin() : cs8SupportMin();
+  const gap = bundleGap != null ? bundleGap : cs8BundleGap();
+  const Houter = orientOpts.Houter;
+  const floorClearMm = orientOpts.floorClearMm;
+
+  // Prefer Rule1 primary orients when any exist
+  const primary = tryOrients.filter(o => o.rule1Primary);
+  const orientOrder = primary.length ? primary.concat(
+    tryOrients.filter(o => !o.rule1Primary)
+  ) : tryOrients;
+
+  for (let oi = 0; oi < orientOrder.length; oi++) {
+    const o = orientOrder[oi];
+    const fl = o.l, fw = o.w, fh = o.h;
+    if (log) {
+      log.push({
+        type: 'orient', mark, tag: o.tag || 'inch',
+        l: fl, w: fw, h: fh,
+        rot: { x: o.rot.x || 0, y: o.rot.y || 0, z: o.rot.z || 0 },
+        inchByInch: true,
+        packYawOnly: !!o.packYawOnly,
+        packComposeRot: !!o.packComposeRot,
+      });
+    }
+    const gaps = cs8EffectiveWallGaps(fl, fw, Lmax, Wmax);
+    const gL = gaps.gL;
+    const gW = gaps.gW;
+    const xMax0 = Lmax - gL - fl;
+    const zMax0 = Wmax - gW - fw;
+    if (xMax0 < gL - CS8_EPS || zMax0 < gW - CS8_EPS) {
+      if (log) log.push({ type: 'orient_fail', mark, tag: o.tag, reason: 'envelope' });
+      continue;
+    }
+
+    const stepZ = (fw < Wmax * 0.3 || (zMax0 - gW) < 400)
+      ? 10
+      : CS8_FINE_STEP_MM;
+
+    // X bays: closed end first, then after each placed box, then fl+gap steps
+    const xSet = new Set();
+    xSet.add(Math.round(gL));
+    const boxes = (c && c.boxes) || [];
+    for (let bi = 0; bi < boxes.length; bi++) {
+      const b = boxes[bi];
+      if (!b) continue;
+      const xa = b.maxX + gap;
+      if (xa >= gL - CS8_EPS && xa <= xMax0 + CS8_EPS) xSet.add(Math.round(xa));
+      if (b.minX >= gL - CS8_EPS && b.minX <= xMax0 + CS8_EPS)
+        xSet.add(Math.round(b.minX));
+    }
+    for (let x = gL; x <= xMax0 + CS8_EPS; x += Math.max(fl + gap, stepZ)) {
+      xSet.add(Math.round(x));
+    }
+    const xs = Array.from(xSet).filter(x => x >= gL - CS8_EPS && x <= xMax0 + CS8_EPS)
+      .sort((a, b) => a - b);
+
+    let stackFallback = null;
+
+    for (let xi = 0; xi < xs.length; xi++) {
+      const x = xs[xi];
+      // Z from home wall: wall, then neighbour.maxZ+gap, then fine slide
+      const zSet = new Set();
+      zSet.add(Math.round(gW));
+      for (let bi = 0; bi < boxes.length; bi++) {
+        const b = boxes[bi];
+        if (!b) continue;
+        // Same bay-ish: X overlap with this footprint
+        const xOv = !(b.maxX <= x + CS8_EPS || b.minX >= x + fl - CS8_EPS);
+        if (!xOv && Math.abs(b.minX - x) > fl + gap) continue;
+        const zAfter = b.maxZ + gap;
+        if (zAfter >= gW - CS8_EPS && zAfter <= zMax0 + CS8_EPS)
+          zSet.add(Math.round(zAfter));
+      }
+      for (let z = gW; z <= zMax0 + CS8_EPS; z += stepZ) {
+        zSet.add(Math.round(z));
+      }
+      const zs = Array.from(zSet)
+        .filter(z => z >= gW - CS8_EPS && z <= zMax0 + CS8_EPS)
+        .sort((a, b) => a - b);
+
+      for (let zi = 0; zi < zs.length; zi++) {
+        const z = zs[zi];
+        const pose = cs8TrySeatAt(
+          c, u, o, x, z, Lmax, Wmax, wallGap, bundleGap, dunnageMm,
+          floorAnchor, supportMin, Houter, floorClearMm
+        );
+        if (!pose) continue;
+        pose.snugMm = cs8SnugContactMm(
+          c, x, z, fl, fw, Lmax, Wmax, gL, gW, gap
+        );
+        if (cs8IsFloorOrSkidY(pose.y0)) {
+          if (log) {
+            log.push({
+              type: 'accept', mark, tag: o.tag, x, z, y0: pose.y0,
+              l: fl, w: fw, h: fh, inchByInch: true,
+              rot: {
+                x: o.rot.x || 0, y: o.rot.y || 0, z: o.rot.z || 0,
+              },
+              supportFrac: pose.supportFrac,
+              packYawOnly: !!o.packYawOnly,
+              packComposeRot: !!o.packComposeRot,
+            });
+          }
+          return pose;
+        }
+        if (!floorAnchor && !stackFallback) stackFallback = pose;
+      }
+    }
+
+    if (stackFallback) {
+      if (log) {
+        log.push({
+          type: 'accept', mark, tag: o.tag,
+          x: stackFallback.x, z: stackFallback.z, y0: stackFallback.y0,
+          l: fl, w: fw, h: fh, inchByInch: true, tier: true,
+          rot: {
+            x: o.rot.x || 0, y: o.rot.y || 0, z: o.rot.z || 0,
+          },
+          supportFrac: stackFallback.supportFrac,
+          packYawOnly: !!o.packYawOnly,
+          packComposeRot: !!o.packComposeRot,
+        });
+      }
+      return stackFallback;
+    }
+    if (log) log.push({ type: 'orient_fail', mark, tag: o.tag, reason: 'no_inch_slot' });
+  }
+  if (log) log.push({ type: 'orient_fail', mark, tag: '*', reason: 'no_inch_candidate' });
+  return null;
 }
 
 function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm, placeOpts) {
@@ -1598,7 +1950,9 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
     const gL = gaps.gL;
     const gW = gaps.gW;
     const gap = bundleGap != null ? bundleGap : cs8BundleGap();
-    const scan = cs8BuildScanAxes(c, fl, fw, Lmax, Wmax, gL, gW, gap);
+    const scan = cs8BuildScanAxes(
+      c, fl, fw, Lmax, Wmax, gL, gW, gap, po.scanExtra || null
+    );
     const xMax0 = scan.xMax0;
     const zMax0 = scan.zMax0;
     if (xMax0 < gL - CS8_EPS || zMax0 < gW - CS8_EPS) {
@@ -1716,11 +2070,15 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
         const cx = x + fl / 2;
         const zFromLeft = z + fw / 2;
         const cog = cs8PredictCog(c, u.weight, cx, zFromLeft, Lmax, Wmax);
+        const snugMm = cs8SnugContactMm(
+          c, x, z, fl, fw, Lmax, Wmax, gL, gW, gap
+        );
         orientHits++;
         if (log && slotsLogged < 8) {
           log.push({
             type: 'slot', mark, tag: o.tag, x, z, y0, ok: true,
             supportFrac: ev.supportFrac,
+            snugMm,
             rot: o.rot, l: fl, w: fw, h: fh,
             packYawOnly: !!o.packYawOnly, packComposeRot: !!o.packComposeRot,
           });
@@ -1730,6 +2088,7 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
           x, z, y0, o, box, cog, fl, fw,
           supportFrac: ev.supportFrac,
           overhangFrac: ev.overhangFrac,
+          snugMm,
         });
       }
     }
@@ -1771,7 +2130,6 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
   }
 
   // If Rule1 gravity pose found ANY valid seat — never override with face-roll
-  // UNLESS that seat is the only class… already filtered by envelope above.
   const rule1Pool = pool.filter(p => p.o && p.o.rule1Primary);
   if (rule1Pool.length) pool = rule1Pool;
 
@@ -1779,15 +2137,19 @@ function cs8FindPlacement(c, u, Lmax, Wmax, Hmax, wallGap, bundleGap, dunnageMm,
   const anyShip = pool.some(p => p.o && p.o.shipPreferred);
   const anySole = pool.some(p => p.o && p.o.soleFit);
 
-  // Select: lowest Y → sole-fit / stable → ship-preferred (if any) → CoG → X/Z
+  // Human yard seat: floor → push to back inner line → side/neighbour → then CoG
+  // (CoG used to dominate at 1e9 and parked pieces mid-box — anti-human.)
   let best = null;
   for (const p of pool) {
     const stabCost = -((p.o && p.o.stabilityScore) || (p.fl * p.fw) || 0);
     const yawCost = (anyShip && !anySole && p.o && p.o.shipPreferred === false) ? 1e8 : 0;
     const yaw180Cost = (p.o && (p.o.tag === 'yaw180' || p.o.tag === 'rule1_yaw180')) ? 1e5 : 0;
     const soleBonus = (p.o && p.o.soleFit) ? -1e11 : 0;
-    const score = p.y0 * 1e12 + stabCost * 1e0 + yawCost + yaw180Cost + soleBonus
-      + p.cog.penalty * 1e9 + p.x * 1e3 + p.z;
+    const snugBonus = -((p.snugMm || 0) * 1e6); // touch inner line / neighbour
+    const backPush = (p.x || 0) * 1e5; // lower packer-X = closed end (push back)
+    const score = p.y0 * 1e12 + snugBonus + backPush + stabCost * 1e0
+      + yawCost + yaw180Cost + soleBonus
+      + p.cog.penalty * 1e2 + (p.z || 0) * 0.01;
     if (!best || score < best.score) best = { score, ...p };
   }
   if (log && best) {
@@ -1976,8 +2338,148 @@ function cs8ForceCommitPackedItem(c, it, Lmax, Wmax) {
 }
 
 /**
+ * Rebuild floor AABBs from packed items (result containers omit .boxes).
+ * When renderMirrored, item.x is UI/render (door-relative) = Lmax − packerCx.
+ */
+function cs8DeriveFloorBoxesFromItems(items, Lmax, Wmax, opts) {
+  const mirrored = !!(opts && opts.renderMirrored);
+  const out = [];
+  (items || []).forEach(it => {
+    const fl = it.packFootprintL || it.lengthMm || it.l || 0;
+    const fw = it.packFootprintW || it.widthMm || it.w || 0;
+    const fh = it.packFootprintH || it.heightMm || it.h || 0;
+    if (!(fl > 0 && fw > 0 && fh > 0)) return;
+    const cy = it.y != null ? it.y : fh / 2;
+    const minY = cy - fh / 2;
+    if (minY > CS8_CELL_MM + CS8_EPS) return;
+    const packerCx = mirrored ? (Lmax - (it.x || 0)) : (it.x || 0);
+    const minX = packerCx - fl / 2;
+    const minZ = (it.z || 0) + Wmax / 2 - fw / 2;
+    out.push({
+      minX, maxX: minX + fl,
+      minY: Math.max(0, minY), maxY: Math.max(0, minY) + fh,
+      minZ, maxZ: minZ + fw,
+    });
+  });
+  return out;
+}
+
+/**
+ * Floor free rectangles (packer X/Z): gaps beside floor boxes along full L.
+ * Used to seed denser Pass2 fill into leftover corridors.
+ */
+function cs8FloorFreeRects(c, Lmax, Wmax, gL, gW, gap) {
+  let floorBoxes = ((c && c.boxes) || [])
+    .filter(b => (b.minY || 0) <= CS8_CELL_MM + CS8_EPS);
+  if (!floorBoxes.length && c && c.items && c.items.length) {
+    floorBoxes = cs8DeriveFloorBoxesFromItems(
+      c.items, Lmax, Wmax, { renderMirrored: true }
+    );
+  }
+  floorBoxes = floorBoxes.slice().sort((a, b) => a.minZ - b.minZ);
+  const zLo = gW;
+  const zHi = Wmax - gW;
+  const xLo = gL;
+  const xHi = Lmax - gL;
+  const rects = [];
+  let cursor = zLo;
+  for (let i = 0; i < floorBoxes.length; i++) {
+    const b = floorBoxes[i];
+    if (b.minZ - gap > cursor + CS8_EPS) {
+      rects.push({
+        minX: xLo, maxX: xHi,
+        minZ: cursor, maxZ: b.minZ - gap,
+        w: (b.minZ - gap) - cursor,
+        l: xHi - xLo,
+      });
+    }
+    cursor = Math.max(cursor, b.maxZ + gap);
+  }
+  if (zHi > cursor + CS8_EPS) {
+    rects.push({
+      minX: xLo, maxX: xHi,
+      minZ: cursor, maxZ: zHi,
+      w: zHi - cursor,
+      l: xHi - xLo,
+    });
+  }
+  return rects.filter(r => r.w >= 50 && r.l >= 200);
+}
+
+/** Max leftover floor strip width (mm) — for density tests. */
+function cs8MaxFloorStripMm(c, Lmax, Wmax) {
+  const gaps = cs8EffectiveWallGaps(1, 1, Lmax, Wmax);
+  const rects = cs8FloorFreeRects(c, Lmax, Wmax, gaps.gL, gaps.gW, cs8BundleGap());
+  let maxW = 0;
+  rects.forEach(r => { if (r.w > maxW) maxW = r.w; });
+  return maxW;
+}
+
+/**
+ * Second compact pass: re-seat all non-seed items with snug scoring
+ * (walls / neighbours) while keeping locked Pass1 orients.
+ */
+function cs8CompactReseatAll(c, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm) {
+  let moved = 0;
+  const seeds = (c.items || []).filter(it => it._seeded);
+  const movable = (c.items || []).filter(it => !it._seeded);
+  if (!movable.length) return 0;
+  movable.sort((a, b) => {
+    const ta = a.anchorTier != null ? a.anchorTier : cs8AnchorTier(a);
+    const tb = b.anchorTier != null ? b.anchorTier : cs8AnchorTier(b);
+    if (ta !== tb) return ta - tb;
+    return (b.weight || 0) - (a.weight || 0);
+  });
+  cs8ResetContainerForCompact(c, seeds, Lmax, Wmax);
+  movable.forEach(it => {
+    const u = cs8UnitFromPackedItem(it);
+    const isAnchor = !!(it.baseLayerLock || it.floorAnchor || cs8IsFloorAnchorCargo(it));
+    const fl = it.packFootprintL || u.l;
+    const fw = it.packFootprintW || u.w;
+    const fh = it.packFootprintH || u.h;
+    const lockedOrient = {
+      l: fl, w: fw, h: fh,
+      rot: {
+        x: (it.userRot && it.userRot.x) || 0,
+        y: (it.userRot && it.userRot.y) || 0,
+        z: (it.userRot && it.userRot.z) || 0,
+      },
+      tag: it.packOrientTag || 'locked',
+      shipPreferred: true,
+      floorAnchor: isAnchor,
+      packYawOnly: !!it.packYawOnly,
+      packComposeRot: !!it.packComposeRot,
+      baseArea: fl * fw,
+      stabilityScore: fl * fw,
+    };
+    const prevX = it.x;
+    const prevZ = it.z;
+    const p2opts = { lockedOrient, pass: 2, floorAnchor: isAnchor };
+    const pose = cs8InchByInchPlace(
+      c, u, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm, p2opts
+    ) || cs8FindPlacement(
+      c, u, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm, p2opts
+    );
+    if (pose) {
+      cs8Commit(c, u, pose, Lmax, Wmax);
+      const last = c.items[c.items.length - 1];
+      last.baseLayerLock = isAnchor;
+      last.floorAnchor = isAnchor;
+      last.anchorTier = it.anchorTier != null ? it.anchorTier : cs8AnchorTier(it);
+      if (Math.abs((last.x || 0) - (prevX || 0)) > CS8_FINE_STEP_MM * 0.5
+          || Math.abs((last.z || 0) - (prevZ || 0)) > CS8_FINE_STEP_MM * 0.5) {
+        moved++;
+      }
+    } else {
+      cs8ForceCommitPackedItem(c, it, Lmax, Wmax);
+    }
+  });
+  return moved;
+}
+
+/**
  * Pass2: re-seat with locked Pass1 yaw (assemblies base-locked),
- * then retry leftovers into freed gaps. Positions only — no tip.
+ * snug compact, free-rect residual fill. Positions only — no tip.
  */
 function cs8Pass2CompactAndFill(
   containers, oversized, Lmax, Wmax, Hpack,
@@ -1985,6 +2487,7 @@ function cs8Pass2CompactAndFill(
 ) {
   let compacted = 0;
   let filled = 0;
+  const gap = bundleGap != null ? bundleGap : cs8BundleGap();
 
   (containers || []).forEach(c => {
     const prev = (c.items || []).slice();
@@ -2025,42 +2528,69 @@ function cs8Pass2CompactAndFill(
         baseArea: fl * fw,
         stabilityScore: fl * fw,
       };
-      // Shipping: keep Pass1 face/yaw; only slide position
-      const pose = cs8FindPlacement(
-        c, u, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm,
-        { lockedOrient, pass: 2, floorAnchor: isAnchor }
+      const p2opts = { lockedOrient, pass: 2, floorAnchor: isAnchor };
+      const pose = cs8InchByInchPlace(
+        c, u, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm, p2opts
+      ) || cs8FindPlacement(
+        c, u, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm, p2opts
       );
       if (pose) {
         const prevX = it.x;
+        const prevZ = it.z;
         cs8Commit(c, u, pose, Lmax, Wmax);
         const last = c.items[c.items.length - 1];
         last.baseLayerLock = isAnchor;
         last.floorAnchor = isAnchor;
         last.anchorTier = cs8AnchorTier(it);
-        if (Math.abs((last.x || 0) - (prevX || 0)) > CS8_CELL_MM * 0.5) compacted++;
+        if (Math.abs((last.x || 0) - (prevX || 0)) > CS8_FINE_STEP_MM * 0.5
+            || Math.abs((last.z || 0) - (prevZ || 0)) > CS8_FINE_STEP_MM * 0.5) {
+          compacted++;
+        }
       } else {
         cs8ForceCommitPackedItem(c, it, Lmax, Wmax);
       }
     });
+
+    // Second inch reseat — close corridors after neighbour order settles
+    compacted += cs8CompactReseatAll(
+      c, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm
+    );
   });
 
-  // Residual fill: floor-anchor leftovers still Rule #1; loose may stack (40%)
+  // Sort leftovers: secondary then filler (constraint tier), heaviest first
+  const leftovers = [];
   for (let i = oversized.length - 1; i >= 0; i--) {
     const u0 = oversized[i];
-    // Hard envelope / weight fails cannot be fixed by gap fill
     if (/LENGTH_EXCEEDS|WIDTH_EXCEEDS|HEIGHT_EXCEEDS|ORIENT_INCOMPATIBLE|WEIGHT_LIMIT|needs_human_review/i
         .test(String(u0.fitReason || ''))) continue;
-    const u = cs8UnitFromPackedItem(u0) || u0;
-    if (!u || !(u.weight >= 0)) continue;
-    const isAnchor = cs8IsFloorAnchorCargo(u);
+    leftovers.push({ idx: i, u0 });
+  }
+  leftovers.sort((a, b) => {
+    const ua = cs8UnitFromPackedItem(a.u0) || a.u0;
+    const ub = cs8UnitFromPackedItem(b.u0) || b.u0;
+    const ta = cs8ConstraintTier(ua, Lmax, { Wmax, Hmax: Hpack });
+    const tb = cs8ConstraintTier(ub, Lmax, { Wmax, Hmax: Hpack });
+    if (ta !== tb) return ta - tb;
+    return (ub.weight || 0) - (ua.weight || 0);
+  });
 
+  leftovers.forEach(({ idx, u0 }) => {
+    const u = cs8UnitFromPackedItem(u0) || u0;
+    if (!u || !(u.weight >= 0)) return;
+    const isAnchor = cs8IsFloorAnchorCargo(u);
     let placed = false;
     for (const c of containers) {
       if (c.weightUsed + (u.weight || 0) > maxKg + 1e-6) continue;
-      const pose = cs8FindPlacement(
-        c, u, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm,
-        { pass: 2, floorAnchor: isAnchor }
+
+      const fillOpts = { pass: 2, floorAnchor: isAnchor };
+      let pose = cs8InchByInchPlace(
+        c, u, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm, fillOpts
       );
+      if (!pose) {
+        pose = cs8FindPlacement(
+          c, u, Lmax, Wmax, Hpack, wallGap, bundleGap, dunnageMm, fillOpts
+        );
+      }
       if (!pose) continue;
       cs8Commit(c, u, pose, Lmax, Wmax);
       const last = c.items[c.items.length - 1];
@@ -2079,10 +2609,12 @@ function cs8Pass2CompactAndFill(
       }
       placed = true;
       filled++;
+      // splice by mark — idx may be stale after prior removals
+      const oi = oversized.indexOf(u0);
+      if (oi >= 0) oversized.splice(oi, 1);
       break;
     }
-    if (placed) oversized.splice(i, 1);
-  }
+  });
 
   return { compacted, filled };
 }

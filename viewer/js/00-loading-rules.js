@@ -3,13 +3,13 @@
  * Spec dims (e.g. 12000×2350×2690) = INTERNAL usable volume (blue box).
  * Pack / drag / collide against an inset envelope — do NOT thicken the mesh.
  *
- * Side 50mm · End 100mm · Top 50mm · Bundle gap 20mm · CoG ≤10%
+ * Inner load line: 2.5mm from shell (side / end / top) · Bundle gap 20mm · CoG ≤10%
  */
 
 const LOADING_RULES = {
-  WALL_CLEARANCE_SIDE_MM: 50,   // left / right (forklift + corrugation)
-  WALL_CLEARANCE_END_MM: 100,   // door + closed end
-  WALL_CLEARANCE_TOP_MM: 50,    // ceiling / header
+  WALL_CLEARANCE_SIDE_MM: 2.5,  // left / right — green inner line
+  WALL_CLEARANCE_END_MM: 2.5,   // door + closed end
+  WALL_CLEARANCE_TOP_MM: 2.5,   // ceiling / header
   FLOOR_CLEARANCE_MM: 0,        // steel on floor / dunnage modeled separately
   MIN_BUNDLE_GAP_MM: 20,        // between separate pack units (not nest offset)
   SKID_HEIGHT_MM: 100,          // timber skid under pack-unit bbox (metadata)

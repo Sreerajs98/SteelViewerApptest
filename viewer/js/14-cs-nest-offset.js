@@ -21,7 +21,7 @@
  */
 
 const CSOFF_CLEARANCE_MM = 3.0;           // INTERLOCK / STACK nest clearance
-const CSOFF_PARALLEL_CLEARANCE_MM = 5.0;  // PARALLEL guide
+const CSOFF_PARALLEL_CLEARANCE_MM = 2.5;  // PARALLEL guide
 const CSOFF_OVERLAP_EPS = 0.02;
 
 // ── public API ──────────────────────────────────────────────────────────────
