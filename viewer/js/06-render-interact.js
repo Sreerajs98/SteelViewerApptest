@@ -240,65 +240,65 @@ function renderContainer(idx) {
       };
     }
 
-    // Welded assemblies (rafters, etc.): makeShape needs IFC parts + original
-    // geometry dims — not packFootprintW/H (those are packing AABBs → box look).
-    {
-      const isAsm = it.groupKind === 'welded_assembly'
-        || !!it.isAssembly
-        || !!(it.parts && it.parts.length > 1);
-      if (isAsm) {
-        let parts = it.parts;
-        if ((!parts || !parts.length) && Array.isArray(it.memberItems)) {
-          const mem = it.memberItems.find(m => m && m.parts && m.parts.length);
-          if (mem) parts = mem.parts;
-        }
-        if ((!parts || !parts.length)
-            && typeof rawScene !== 'undefined' && rawScene && rawScene.items) {
-          try {
-            const marks = new Set(
-              [it.mark, ...((it.marks) || [])].filter(Boolean).map(String));
-            const src = rawScene.items.find(r =>
-              r && r.parts && r.parts.length
-              && (marks.has(String(r.mark || ''))
-                || ((r.marks) || []).some(m => marks.has(String(m)))));
-            if (src) {
-              parts = src.parts;
-              if (it._origLengthMm == null && +src.lengthMm > 0)
-                it._origLengthMm = +src.lengthMm;
-              if (it._origWidthMm == null
-                  && (+src.widthMm > 0 || +src.unitWidth > 0 || +src.sectW > 0))
-                it._origWidthMm = +src.widthMm || +src.unitWidth || +src.sectW;
-              if (it._origHeightMm == null
-                  && (+src.heightMm > 0 || +src.unitHeight > 0 || +src.sectH > 0))
-                it._origHeightMm = +src.heightMm || +src.unitHeight || +src.sectH;
-              if (!it.pathPointsMm && src.pathPointsMm)
-                it.pathPointsMm = src.pathPointsMm;
-            }
-          } catch (_) { /* */ }
-        }
-        if (parts && parts.length) {
-          shapeIt = {
-            ...it,
-            ...shapeIt,
-            lengthMm: it._origLengthMm || it.shippingLengthMm || it.lengthMm,
-            widthMm: it._origWidthMm || it.shippingWidthMm || it.flangeWidthMm
-              || it.sectW || it.unitWidth || it.widthMm,
-            heightMm: it._origHeightMm || it.shippingHeightMm || it.sectH
-              || it.unitHeight || it.heightMm,
-            unitHeight: it.sectH || it.unitHeight || it._origHeightMm || it.heightMm,
-            unitWidth: it.sectW || it.unitWidth || it._origWidthMm || it.widthMm,
-            parts,
-            pathPointsMm: it.pathPointsMm || shapeIt.pathPointsMm || null,
-            isAssembly: true,
-            // Keep pack pose; skip remorph so IFC mesh stays Group-By shape
-            _keepGroupByBundle: false,
-            _skipStability: true,
-            _freezeGroupByPose: true,
-            assemblyShipPose: true,
-          };
-        }
+      // Welded assemblies (rafters, etc.): makeShape needs IFC parts + original
+      // geometry dims — not packFootprintW/H (those are packing AABBs → box look).
+      {
+          const isAsm = it.groupKind === 'welded_assembly'
+              || !!it.isAssembly
+              || !!(it.parts && it.parts.length > 1);
+          if (isAsm) {
+              let parts = it.parts;
+              if ((!parts || !parts.length) && Array.isArray(it.memberItems)) {
+                  const mem = it.memberItems.find(m => m && m.parts && m.parts.length);
+                  if (mem) parts = mem.parts;
+              }
+              if ((!parts || !parts.length)
+                  && typeof rawScene !== 'undefined' && rawScene && rawScene.items) {
+                  try {
+                      const marks = new Set(
+                          [it.mark, ...((it.marks) || [])].filter(Boolean).map(String));
+                      const src = rawScene.items.find(r =>
+                          r && r.parts && r.parts.length
+                          && (marks.has(String(r.mark || ''))
+                              || ((r.marks) || []).some(m => marks.has(String(m)))));
+                      if (src) {
+                          parts = src.parts;
+                          if (it._origLengthMm == null && +src.lengthMm > 0)
+                              it._origLengthMm = +src.lengthMm;
+                          if (it._origWidthMm == null
+                              && (+src.widthMm > 0 || +src.unitWidth > 0 || +src.sectW > 0))
+                              it._origWidthMm = +src.widthMm || +src.unitWidth || +src.sectW;
+                          if (it._origHeightMm == null
+                              && (+src.heightMm > 0 || +src.unitHeight > 0 || +src.sectH > 0))
+                              it._origHeightMm = +src.heightMm || +src.unitHeight || +src.sectH;
+                          if (!it.pathPointsMm && src.pathPointsMm)
+                              it.pathPointsMm = src.pathPointsMm;
+                      }
+                  } catch (_) { /* */ }
+              }
+              if (parts && parts.length) {
+                  shapeIt = {
+                      ...it,
+                      ...shapeIt,
+                      lengthMm: it._origLengthMm || it.shippingLengthMm || it.lengthMm,
+                      widthMm: it._origWidthMm || it.shippingWidthMm || it.flangeWidthMm
+                          || it.sectW || it.unitWidth || it.widthMm,
+                      heightMm: it._origHeightMm || it.shippingHeightMm || it.sectH
+                          || it.unitHeight || it.heightMm,
+                      unitHeight: it.sectH || it.unitHeight || it._origHeightMm || it.heightMm,
+                      unitWidth: it.sectW || it.unitWidth || it._origWidthMm || it.widthMm,
+                      parts,
+                      pathPointsMm: it.pathPointsMm || shapeIt.pathPointsMm || null,
+                      isAssembly: true,
+                      // Keep pack pose; skip remorph so IFC mesh stays Group-By shape
+                      _keepGroupByBundle: false,
+                      _skipStability: true,
+                      _freezeGroupByPose: true,
+                      assemblyShipPose: true,
+                  };
+              }
+          }
       }
-    }
 
     // Twin rafters: real IFC mesh, forced upright to pack footprint (L×H×W).
     // Proxy box only if align cannot reach steel W×H (pitched IFC leftover).
