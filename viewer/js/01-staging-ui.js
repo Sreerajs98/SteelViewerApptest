@@ -759,8 +759,14 @@ function updateStagingFooter() {
   const total   = assemblyGroups.length;
   const placed  = assemblyGroups.filter(g => g.state === 'placed').length;
   const unplaced = total - placed;
-  document.getElementById('stagingStats').textContent =
-    `${placed}/${total} placed · ${unplaced} remaining`;
+  let text = `${placed}/${total} placed · ${unplaced} remaining`;
+  try {
+    const r = (typeof window !== 'undefined') ? window.__lastPackV2Report : null;
+    if (r && r.summary)
+      text += ` · ${r.summary}`;
+  } catch (_) { /* */ }
+  const el = document.getElementById('stagingStats');
+  if (el) el.textContent = text;
 }
 
 // ── Drag onto viewport ─────────────────────────────────────────────────

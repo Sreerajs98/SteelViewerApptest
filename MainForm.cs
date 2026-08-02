@@ -6,15 +6,8 @@ using SteelPackingApp.Services;
 namespace SteelViewerApp;
 
 /// <summary>
-/// Native WinForms shell. Everything is driven from here:
-///   - "Upload Shipping List Excel..." reads the file (ExcelReader), builds the
-///     raw scene (SceneBuilder), and pushes it into the embedded 3D view.
-///   - "Quick view" / "Optimize packing" just click the matching buttons
-///     inside the embedded page - the packing algorithms themselves live in
-///     Viewer3D.html's JavaScript (that is genuinely where 3D rendering has
-///     to happen; WinForms has no built-in 3D surface), but the whole
-///     workflow - pick file, load it, switch modes - is controlled from this
-///     native C# window.
+/// Native WinForms shell. IFC / JSON load + Group By in the embedded viewer.
+/// Container Optimise / packing has been removed — Group By is unchanged.
 /// </summary>
 public class MainForm : Form
 {
@@ -55,7 +48,6 @@ public class MainForm : Form
         topPanel.Controls.Add(btnLoadJson);
         topPanel.Controls.Add(lblStatus);
 
-        // simple horizontal layout without a designer file
         Load += (s, e) => LayoutTopPanel(topPanel);
         Resize += (s, e) => LayoutTopPanel(topPanel);
 
@@ -92,12 +84,7 @@ public class MainForm : Form
             {
                 webViewReady = true;
                 if (!e2.IsSuccess) return;
-                if (Program.RunWarehouseTests)
-                    await RunJsTestSuiteAndExitAsync(
-                        "runWarehouseGroundTestSuite",
-                        "_warehouse_test_results.json",
-                        "Warehouse ground");
-                else if (Program.RunZGroundTests)
+                if (Program.RunZGroundTests)
                     await RunJsTestSuiteAndExitAsync(
                         "runZGroundMeasureSuite",
                         "_z_ground_measure.json",
@@ -151,9 +138,7 @@ public class MainForm : Form
                     && File.Exists(Program.StartupIfcPath))
                 {
                     await LoadIfcPathAsync(Program.StartupIfcPath, skipPhasePicker: true);
-                    // CLI --ifc: exit after pack report is written (do not leave UI open)
                     Close();
-                    return;
                 }
             };
             webView.CoreWebView2.Navigate(new Uri(htmlPath).AbsoluteUri);
@@ -163,12 +148,10 @@ public class MainForm : Form
             if (Program.RunGroupingTests || Program.RunStep1Tests || Program.RunStep2Tests
                 || Program.RunStep3Tests || Program.RunStep4Tests || Program.RunStep5Tests
                 || Program.RunStep6Tests || Program.RunGroundTests || Program.RunStep7Tests
-                || Program.RunWarehouseTests || Program.RunZGroundTests)
+                || Program.RunZGroundTests)
             {
                 string failFile = Program.RunZGroundTests
                     ? "_z_ground_measure.json"
-                    : Program.RunWarehouseTests
-                    ? "_warehouse_test_results.json"
                     : Program.RunStep7Tests
                     ? "_step7_test_results.json"
                     : Program.RunGroundTests
@@ -273,7 +256,10 @@ public class MainForm : Form
         await LoadIfcPathAsync(dialog.FileName, skipPhasePicker: false);
     }
 
-    /// <summary>Load IFC into the viewer. CLI uses skipPhasePicker=true (all phases).</summary>
+    /// <summary>
+    /// Load IFC into the viewer. CLI (--ifc) skips the phase picker (all phases)
+    /// then runs Group By only — Optimise/packing is disabled.
+    /// </summary>
     private async Task LoadIfcPathAsync(string ifcPath, bool skipPhasePicker)
     {
         btnUploadIfc.Enabled = false;
@@ -281,12 +267,11 @@ public class MainForm : Form
         Cursor = Cursors.WaitCursor;
         try
         {
-            lblStatus.Text = "Scanning IFC phases…";
-            var scan = await Task.Run(() => XbimIfcIngest.ScanForPickerWithFallback(ifcPath));
             double? phaseFilter = null;
-
             if (!skipPhasePicker)
             {
+                lblStatus.Text = "Scanning IFC phases…";
+                var scan = await Task.Run(() => XbimIfcIngest.ScanForPickerWithFallback(ifcPath));
                 var counts = scan.HasPhaseTags
                     ? scan.PhaseCounts
                     : new List<(double Phase, int Count)> { (0, Math.Max(scan.TotalCandidates, 0)) };
@@ -341,478 +326,1884 @@ public class MainForm : Form
             lblStatus.Text = $"{job.JobNo}  |  {phaseText}  |  {items.Count} assemblies " +
                               $"({skipped} skipped - no usable part), {Math.Round(totalWeight, 1)} kg total{warnText}";
 
-            // CLI --ifc: Group → select all → Optimise; write pack report for RF012 verify
+            // CLI --ifc: Group By + yard quality probe (gravity / overlap / nest footprint)
             if (skipPhasePicker && webView.CoreWebView2 != null)
             {
-                lblStatus.Text += "  |  Auto Optimise…";
-                await Task.Delay(2800);
-                // Fire async pack into window.__cliPackReport (ExecuteScript may not await Promise)
+                lblStatus.Text += "  |  Auto Group…";
+                await Task.Delay(2500);
+                // Fire async so a hung groupByShape cannot block ExecuteScript forever
                 await webView.CoreWebView2.ExecuteScriptAsync(
                     """
                     (function () {
-                      window.__cliPackReport = null;
-                      window.__cliPackBusy = true;
+                      window.__cliGroupReport = null;
+                      window.__cliGroupBusy = true;
                       (async function () {
                         try {
                           if (typeof groupByShape === 'function') groupByShape();
-                          await new Promise(r => setTimeout(r, 900));
-                          if (typeof assemblyGroups !== 'undefined' && assemblyGroups.length) {
-                            assemblyGroups.forEach(g => {
-                              if (g.state !== 'oversized') g.checked = true;
-                            });
-                            if (typeof renumberCheckOrderByWeight === 'function')
-                              renumberCheckOrderByWeight();
-                            if (typeof renderStagingList === 'function') renderStagingList();
-                            if (typeof updateSelectAllBox === 'function') updateSelectAllBox();
-                          }
-                          await new Promise(r => setTimeout(r, 500));
-                          if (typeof layoutPlaceSelected === 'function')
-                            await layoutPlaceSelected();
-                          await new Promise(r => setTimeout(r, 2500));
-                          const all = [];
-                          const list = (typeof clickable !== 'undefined' && clickable) ? clickable : [];
-                          for (const c of list) {
-                            const it = c.item || {};
-                            const mark = String(it.mark || c.mark || '');
-                            const sb = it.stableBundleMm || it.packEnvelopeMm || null;
-                            const marks = (it.marks && it.marks.length) ? it.marks : [mark];
-                            all.push({
-                              mark: mark,
-                              marks: marks,
-                              outside: !!(c.outsideContainer || it.outsideContainer),
-                              fitReason: it.fitReason || c.fitReason || null,
-                              fitReasonMsg: it.fitReasonMsg || null,
-                              needsRotate: !!(it.needsRotate || c.needsRotate),
-                              l: it.l || it.lengthMm || (sb && sb.l) || null,
-                              w: it.w || it.widthMm || (sb && sb.w) || null,
-                              h: it.h || it.heightMm || (sb && sb.h) || null,
-                              sbSource: (sb && sb.source) || null,
-                              pitchedFrom: (sb && sb.pitchedFrom) || null,
-                              sb: sb ? { l: sb.l, w: sb.w, h: sb.h, source: sb.source || null } : null,
-                            });
-                          }
-                          const isRf012 = (s) => /RF012/i.test(String(s || ''));
+                          // Allow layoutInspection + mesh nail / deconflict to finish
+                          await new Promise(r => setTimeout(r, 1800));
                           const groups = (typeof assemblyGroups !== 'undefined' && assemblyGroups)
-                            ? assemblyGroups.filter(g =>
-                                isRf012(g.mark) || (g.marks || []).some(isRf012))
-                              .map(g => ({
-                                mark: g.mark,
-                                marks: g.marks || [],
-                                state: g.state,
-                                fitReason: g.fitReason || null,
-                                fitReasonMsg: g.fitReasonMsg || null,
-                                needsRotate: !!g.needsRotate,
-                                qty: g.qty,
-                                weightKg: g.weightKg,
-                                isAssembly: !!g.isAssembly,
-                                packUnit: g.packUnit ? {
-                                  mark: g.packUnit.mark,
-                                  l: g.packUnit.l || g.packUnit.lengthMm,
-                                  w: g.packUnit.w || g.packUnit.widthMm,
-                                  h: g.packUnit.h || g.packUnit.heightMm,
-                                  sb: g.packUnit.stableBundleMm || null,
-                                } : null,
-                              }))
-                            : [];
-                          const sceneRf = ((typeof rawScene !== 'undefined' && rawScene && rawScene.items) || [])
-                            .filter(it => isRf012(it.mark) || (it.marks || []).some(isRf012))
-                            .map(it => ({
-                              mark: it.mark,
-                              lengthMm: it.lengthMm,
-                              widthMm: it.widthMm,
-                              heightMm: it.heightMm,
-                              sectH: it.sectH, sectW: it.sectW,
-                              isAssembly: !!it.isAssembly,
-                              sb: it.stableBundleMm || null,
-                            }));
-                          const layout = (typeof currentLayout !== 'undefined' && currentLayout) ? currentLayout : null;
-                          const placedRf = [];
-                          ((layout && layout.containers) || []).forEach(c => {
-                            (c.items || []).forEach(it => {
-                              if (isRf012(it.mark) || (it.marks || []).some(isRf012)) {
-                                placedRf.push({
-                                  mark: it.mark, marks: it.marks || [],
-                                  container: c.containerNumber,
-                                  x: it.x, y: it.y, z: it.z,
-                                  l: it.l, w: it.w, h: it.h,
-                                  footL: it.packFootprintL || null,
-                                  footW: it.packFootprintW || null,
-                                  footH: it.packFootprintH || null,
-                                  sb: it.stableBundleMm || null,
-                                  tag: it.packOrientTag || null,
-                                  weight: it.weight || it.unitWeightKg || null,
-                                });
-                              }
+                            ? assemblyGroups : [];
+                          const selfTest = (typeof csPackNormalizeSelfTest === 'function')
+                            ? csPackNormalizeSelfTest()
+                            : { ok: false, error: 'selfTest missing' };
+                          const nestUnits = [];
+                          const fatNests = [];
+                          const shortLen = [];
+                          const Wcap = 2438;
+                          groups.forEach(g => {
+                            (g.packUnits || []).forEach(pu => {
+                              const gk = String(pu.groupKind || g.groupKind || '').toLowerCase();
+                              const sk = String(pu.shapeKey || pu.profileShape || '').toLowerCase();
+                              const nest = /^nest_[zcl]$/.test(gk)
+                                || sk === 'z_channel' || sk === 'c_channel' || sk === 'l_angle';
+                              if (!nest) return;
+                              const pw = Math.round(+pu.packWidthMm || +pu.widthMm
+                                || (pu.stableBundleMm && +pu.stableBundleMm.w) || 0);
+                              const pl = Math.round(+pu.packLengthMm || +pu.lengthMm || 0);
+                              const ph = Math.round(+pu.packHeightMm || +pu.heightMm || 0);
+                              const src = (pu.stableBundleMm && pu.stableBundleMm.source) || null;
+                              const row = {
+                                mark: pu.mark || g.mark || null,
+                                groupKind: gk || null,
+                                pl, pw, ph, src,
+                                qty: pu.qty || 0,
+                                normalized: !!pu._packFootprintNormalized,
+                              };
+                              nestUnits.push(row);
+                              if (pw > Wcap * 0.42) fatNests.push(row);
+                              if (pl > 0 && pl < 500) shortLen.push(row);
                             });
                           });
-                          const overRf = ((layout && layout.oversized) || [])
-                            .filter(it => isRf012(it.mark) || (it.marks || []).some(isRf012))
-                            .map(it => ({
-                              mark: it.mark, marks: it.marks || [],
-                              fitReason: it.fitReason || null,
-                              fitReasonMsg: it.fitReasonMsg || null,
-                              l: it.l, w: it.w, h: it.h,
-                              sb: it.stableBundleMm || null,
-                            }));
-                          // Live pack-unit probe from RF012 staging group
-                          let unitProbe = null;
-                          try {
-                            const g0 = (typeof assemblyGroups !== 'undefined' && assemblyGroups || [])
-                              .find(g => isRf012(g.mark) || (g.marks || []).some(isRf012));
-                            if (g0 && typeof createPackUnits === 'function') {
-                              const pus = createPackUnits(g0);
-                              const pu = pus && pus[0];
-                              let u = null;
-                              if (pu && typeof cs8UnitFromPackUnit === 'function')
-                                u = cs8UnitFromPackUnit(pu);
-                              let diag = null;
-                              if (u && typeof cs8DiagnoseUnfit === 'function' && rawScene) {
-                                const sp = rawScene.containerSpec || {};
-                                diag = cs8DiagnoseUnfit(
-                                  u,
-                                  sp.lengthMm || 12000,
-                                  sp.widthMm || 2350,
-                                  (sp.heightMm || 2690) - 2.5,
-                                  [],
-                                  sp.maxWeightKg || 26000
-                                );
-                              }
-                              unitProbe = {
-                                puMark: pu && pu.mark || null,
-                                puLWH: pu ? {
-                                  l: pu.lengthMm, w: pu.widthMm, h: pu.heightMm,
-                                } : null,
-                                puSb: pu && pu.stableBundleMm || null,
-                                puBb: pu && pu.bundle_bbox || null,
-                                unit: u ? {
-                                  mark: u.mark, l: u.l, w: u.w, h: u.h,
-                                  lengthMm: u.lengthMm, widthMm: u.widthMm, heightMm: u.heightMm,
-                                  isAssembly: !!u.isAssembly, weight: u.weight,
-                                } : null,
-                                diagnose: diag,
-                              };
-                            } else {
-                              unitProbe = { error: 'RF012 group or createPackUnits missing' };
-                            }
-                          } catch (pe) {
-                            unitProbe = { error: String(pe && pe.message || pe) };
+
+                          // Yard mesh metrics: float, tip gap, AABB overlaps
+                          const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.01;
+                          const list = (typeof clickable !== 'undefined' && clickable) ? clickable : [];
+                          const outs = list.filter(c => c && c.outsideContainer && c.mesh && c.item);
+                          const floats = [];
+                          // Tip-gap policy (does NOT remorph Group By poses):
+                          // Tip sampling on IFC nests/tapers is noisy and often
+                          // expected (taper depth, nest mesh bins). Report as WARN
+                          // only. Hard yard fail = float + nest dig-in only.
+                          const tipWarnNest = [];
+                          const tipWarnAsm = [];
+                          function isNestItem(it) {
+                            if (!it) return false;
+                            const gk = String(it.groupKind || '').toLowerCase();
+                            const sk = String(it.shapeKey || it.profileShape || '').toLowerCase();
+                            return /^nest_[zcl]$/.test(gk)
+                              || sk === 'z_channel' || sk === 'c_channel' || sk === 'l_angle';
                           }
-                          // L / flange-brace nest pack-unit probe (why unplaced?)
-                          let braceProbe = null;
-                          try {
-                            const gL = (typeof assemblyGroups !== 'undefined' && assemblyGroups || [])
-                              .filter(g => g && (g.shapeKey === 'l_angle' || g.groupKind === 'nest_l'))
-                              .sort((a, b) => (b.qty || 0) - (a.qty || 0))[0];
-                            if (gL) {
-                              const pus = (gL.packUnits && gL.packUnits.length)
-                                ? gL.packUnits
-                                : (typeof createPackUnits === 'function' ? createPackUnits(gL) : []);
-                              const pu = pus && pus[0];
-                              let u = null;
-                              if (pu && typeof cs8UnitFromPackUnit === 'function')
-                                u = cs8UnitFromPackUnit(pu);
-                              let diag = null;
-                              if (u && typeof cs8DiagnoseUnfit === 'function' && rawScene) {
-                                const sp = rawScene.containerSpec || {};
-                                diag = cs8DiagnoseUnfit(
-                                  u,
-                                  sp.lengthMm || 12000,
-                                  sp.widthMm || 2350,
-                                  (sp.heightMm || 2690) - 2.5,
-                                  [],
-                                  sp.maxWeightKg || 26000
-                                );
-                              }
-                              const overL = ((layout && layout.oversized) || [])
-                                .filter(it => {
-                                  const blob = String(it.shapeKey || '') + ' '
-                                    + String(it.groupKind || '') + ' ' + String(it.mark || '');
-                                  return /l_angle|nest_l|STACK|40.|50./i.test(blob);
-                                })
-                                .slice(0, 8)
-                                .map(it => ({
-                                  mark: it.mark, fitReason: it.fitReason,
-                                  l: it.l || it.lengthMm, w: it.w || it.widthMm, h: it.h || it.heightMm,
-                                }));
-                              const ni = gL.nestingInfo || null;
-                              const placedL = ((layout && layout.containers) || [])
-                                .reduce((n, c) => n + ((c.items || []).filter(it => {
-                                  const blob = String(it.groupKind || '') + ' ' + String(it.shapeKey || '');
-                                  return /nest_l|l_angle/i.test(blob);
-                                }).length), 0);
-                              braceProbe = {
-                                groupMark: gL.mark, qty: gL.qty, setCount: (pus || []).length,
-                                sect: { H: gL.sectH, W: gL.sectW, T: gL.sectT },
-                                nestMethod: (gL.nestMethod && gL.nestMethod.method) || null,
-                                nestOff: (ni && ni.nesting_offset) || gL.nestingOffsetMm || null,
-                                puLWH: pu ? { l: pu.lengthMm, w: pu.widthMm, h: pu.heightMm } : null,
-                                puBb: pu && pu.bundle_bbox || null,
-                                unit: u ? { l: u.l, w: u.w, h: u.h, weight: u.weight } : null,
-                                diagnose: diag,
-                                placedNestL: placedL,
-                                oversizedL: overL,
-                              };
-                            } else {
-                              braceProbe = { error: 'no nest_l group' };
-                            }
-                          } catch (be) {
-                            braceProbe = { error: String(be && be.message || be) };
-                          }
-                          const rf012 = all.filter(r =>
-                            isRf012(r.mark) || (r.marks || []).some(isRf012));
-                          const outside = all.filter(r => r.outside);
-                          const widthExceeds = []
-                            .concat(overRf, groups, rf012)
-                            .filter(r => /WIDTH_EXCEEDS/i.test(
-                              String(r.fitReason || '') + String(r.fitReasonMsg || '')));
-                          // Pack quality: unsupported mid-air + mesh AABB dig-in
-                          let floatCount = 0;
-                          let overlapCount = 0;
-                          let maxMeshMinY = 0, maxMeshCy = 0, tallNestTip = 0;
-                          let tipGapMmMax = 0;
-                          let tipGapMark = null;
-                          const meshBoxes = [];
-                          for (const c of list) {
-                            if (!c || c.outsideContainer || !c.mesh) continue;
+                          outs.forEach(c => {
                             try {
                               c.mesh.updateMatrixWorld(true);
                               const box = new THREE.Box3().setFromObject(c.mesh);
-                              if (!isFinite(box.min.y)) continue;
-                              const gk = String((c.item && c.item.groupKind) || '');
-                              const sk = String((c.item && (c.item.shapeKey || c.item.profileShape)) || '');
-                              meshBoxes.push({
-                                box: box,
-                                mark: (c.item && c.item.mark) || '',
-                                nest: /^nest_/.test(gk) || sk === 'z_channel'
-                                  || sk === 'c_channel' || sk === 'l_angle',
-                                y0: (c.item && c.item.y) || 0,
-                                fh: (c.item && c.item.packFootprintH) || 0,
-                                lock: !!(c.item && (c.item.packPoseLock
-                                  || c.item._orientLocked || c.item.floorAnchor)),
-                                gk: gk || sk || null,
-                              });
-                            } catch (_) { /* */ }
-                          }
-                          const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.01;
-                          const eps = 1e-3;
-                          const floorEps = 30 * sc;   // 30mm
-                          const supportTol = 40 * sc; // 40mm
-                          const xzTol = 10 * sc;      // 10mm
-                          for (let i = 0; i < meshBoxes.length; i++) {
-                            const a = meshBoxes[i].box;
-                            const nestLike = !!meshBoxes[i].nest;
-                            const h = a.max.y - a.min.y;
-                            const cy = (a.min.y + a.max.y) * 0.5;
-                            if (a.min.y > maxMeshMinY) maxMeshMinY = a.min.y;
-                            if (cy > maxMeshCy) maxMeshCy = cy;
-                            // Stacked on another mesh = OK; mid-air with no support = float
-                            if (a.min.y > floorEps) {
-                              let supported = false;
-                              for (let j = 0; j < meshBoxes.length; j++) {
-                                if (i === j) continue;
-                                const b = meshBoxes[j].box;
-                                const ox = Math.min(a.max.x, b.max.x) - Math.max(a.min.x, b.min.x);
-                                const oz = Math.min(a.max.z, b.max.z) - Math.max(a.min.z, b.min.z);
-                                if (ox <= xzTol || oz <= xzTol) continue;
-                                if (Math.abs(b.max.y - a.min.y) <= supportTol) { supported = true; break; }
+                              const minYmm = (box.min.y / sc);
+                              if (minYmm > 3) {
+                                floats.push({
+                                  mark: String(c.item.mark || ''),
+                                  gk: c.item.groupKind || null,
+                                  minYmm: +minYmm.toFixed(1),
+                                });
                               }
-                              if (!supported) floatCount++;
-                            } else if (nestLike) {
-                              // Tip-sit: nest taller than ~550mm with centroid high vs footprint
-                              const fh = Math.max(meshBoxes[i].fh || 0, 1) * sc;
-                              if (h > Math.max(550 * sc, fh * 1.8) && cy > h * 0.4) {
-                                floatCount++; tallNestTip++;
-                              }
-                            }
-                          }
-                          // Ship Prep tip-gap: long FLOOR assemblies only (see-saw gate).
-                          // Skip nests, stacked tiers, and footprint/mesh mismatches
-                          // (tall towers nail minY=0 but are not pad-float cases).
-                          for (const c of list) {
-                            if (!c || c.outsideContainer || !c.mesh || !c.item) continue;
-                            const it = c.item;
-                            const floorAsm = !!(it.floorAnchor || it._shipPrepped || it.isAssembly
-                              || it.groupKind === 'welded_assembly');
-                            if (!floorAsm) continue;
-                            if (/^nest_/i.test(String(it.groupKind || ''))) continue;
-                            const lenMm = Math.max(+it.packFootprintL || 0, +it.lengthMm || 0,
-                              +it.l || 0, 0);
-                            if (lenMm < 4000) continue;
-                            const fh = Math.max(+it.packFootprintH || 0, +it.heightMm || 0, +it.h || 0, 0);
-                            const y0 = (it.y != null && fh > 0)
-                              ? (Number(it.y) - fh / 2) : 0;
-                            if (y0 > 80) continue; // stacked — not floor pad
-                            try {
-                              c.mesh.updateMatrixWorld(true);
-                              const mb = new THREE.Box3().setFromObject(c.mesh);
-                              const meshHmm = ((mb.max.y - mb.min.y) / sc);
-                              // Standing tower / mismatch — not a face-down pad check
-                              if (fh > 0 && meshHmm > fh * 2.5) continue;
-                              if (meshHmm > 3500) continue;
+                              let tip = null;
+                              if (typeof csShipPrepTipGapMm === 'function')
+                                tip = csShipPrepTipGapMm(c.mesh);
+                              if (tip == null || !(tip > 8)) return;
+                              const nest = isNestItem(c.item);
+                              const row = {
+                                mark: String(c.item.mark || ''),
+                                gk: c.item.groupKind || null,
+                                tipGapMm: +Number(tip).toFixed(1),
+                                nest: nest,
+                              };
+                              if (nest) tipWarnNest.push(row);
+                              else tipWarnAsm.push(row);
                             } catch (_) { /* */ }
-                            if (typeof csShipPrepTipGapMm === 'function') {
+                          });
+                          const overlaps = [];
+                          for (let i = 0; i < outs.length; i++) {
+                            for (let j = i + 1; j < outs.length; j++) {
                               try {
-                                const tg = csShipPrepTipGapMm(c.mesh);
-                                if (tg > tipGapMmMax) {
-                                  tipGapMmMax = tg;
-                                  tipGapMark = String(it.mark || '');
+                                outs[i].mesh.updateMatrixWorld(true);
+                                outs[j].mesh.updateMatrixWorld(true);
+                                const a = new THREE.Box3().setFromObject(outs[i].mesh);
+                                const b = new THREE.Box3().setFromObject(outs[j].mesh);
+                                const ox = Math.min(a.max.x, b.max.x) - Math.max(a.min.x, b.min.x);
+                                const oy = Math.min(a.max.y, b.max.y) - Math.max(a.min.y, b.min.y);
+                                const oz = Math.min(a.max.z, b.max.z) - Math.max(a.min.z, b.min.z);
+                                if (ox > 0.02 && oy > 0.02 && oz > 0.02) {
+                                  overlaps.push({
+                                    a: String(outs[i].item.mark || ''),
+                                    b: String(outs[j].item.mark || ''),
+                                    oxMm: Math.round(ox / sc),
+                                    oyMm: Math.round(oy / sc),
+                                    ozMm: Math.round(oz / sc),
+                                    nest: !!(outs[i].item.groupKind || '').toString().startsWith('nest_')
+                                      || !!(outs[j].item.groupKind || '').toString().startsWith('nest_'),
+                                  });
                                 }
                               } catch (_) { /* */ }
                             }
                           }
-                          for (let i = 0; i < meshBoxes.length; i++) {
-                            for (let j = i + 1; j < meshBoxes.length; j++) {
-                              const a = meshBoxes[i].box, b = meshBoxes[j].box;
-                              const ox = Math.min(a.max.x, b.max.x) - Math.max(a.min.x, b.min.x);
-                              const oy = Math.min(a.max.y, b.max.y) - Math.max(a.min.y, b.min.y);
-                              const oz = Math.min(a.max.z, b.max.z) - Math.max(a.min.z, b.min.z);
-                              // 80mm — ignore nest flush / hairline; count real dig-in only
-                              if (ox > 0.08 && oy > 0.08 && oz > 0.08) {
-                                const vol = ox * oy * oz;
-                                const volA = Math.max((a.max.x-a.min.x)*(a.max.y-a.min.y)*(a.max.z-a.min.z), 1e-9);
-                                const volB = Math.max((b.max.x-b.min.x)*(b.max.y-b.min.y)*(b.max.z-b.min.z), 1e-9);
-                                if (vol / Math.min(volA, volB) >= 0.15) overlapCount++;
+                          const nestOverlaps = overlaps.filter(o => o.nest);
+                          // Hard yard fail: float + nest dig-in only
+                          const yardOk = floats.length === 0
+                            && nestOverlaps.length === 0;
+
+                          // Step 2a — packer unit list (no placement)
+                          let step2a = { ok: false, error: 'csPackV2BuildUnits missing' };
+                          if (typeof csPackV2BuildUnits === 'function') {
+                            groups.forEach(g => {
+                              if (g && g.state !== 'oversized') g.checked = true;
+                            });
+                            const built = csPackV2BuildUnits(groups, {
+                              containerSpec: (typeof rawScene !== 'undefined' && rawScene)
+                                ? rawScene.containerSpec : { widthMm: 2438 },
+                            });
+                            const uids = built.map(u => u._fmUid);
+                            const uidUnique = uids.length === new Set(uids).size;
+                            const dimsOk = built.every(u =>
+                              +u.packLengthMm > 0 && +u.packWidthMm > 0 && +u.packHeightMm > 0);
+                            const self2a = (typeof csPackV2Step2aSelfTest === 'function')
+                              ? csPackV2Step2aSelfTest() : { ok: true, skipped: true };
+                            step2a = {
+                              ok: uidUnique && dimsOk && self2a.ok !== false,
+                              unitCount: built.length,
+                              uidUnique: uidUnique,
+                              dimsOk: dimsOk,
+                              selfTest: self2a,
+                              sample: built.slice(0, 12).map(u => ({
+                                mark: u.mark || null,
+                                uid: u._fmUid || null,
+                                order: u._checkOrder || 0,
+                                pl: Math.round(+u.packLengthMm || 0),
+                                pw: Math.round(+u.packWidthMm || 0),
+                                ph: Math.round(+u.packHeightMm || 0),
+                                kg: Math.round(+u.weightKg || 0),
+                                gk: u.groupKind || null,
+                              })),
+                            };
+                          }
+
+                          // Step 2b — one safe floor free-rect (no placement)
+                          let step2b = { ok: false, error: 'csPackV2InitialFreeRects missing' };
+                          if (typeof csPackV2InitialFreeRects === 'function') {
+                            const spec = (typeof rawScene !== 'undefined' && rawScene
+                              && rawScene.containerSpec)
+                              ? rawScene.containerSpec
+                              : { lengthMm: 12000, widthMm: 2438, heightMm: 2690 };
+                            const init = csPackV2InitialFreeRects(spec);
+                            const rects = (init && init.freeRects) || [];
+                            const env = (init && init.envelope) || {};
+                            const r0 = rects[0] || null;
+                            const oneFloor = rects.length === 1
+                              && r0 && r0.y === 0 && r0.supportedBy === 'floor';
+                            const inset = !!(r0 && r0.x > 0 && r0.z > 0
+                              && r0.x + r0.length < (+spec.lengthMm || 12000)
+                              && r0.z + r0.width < (+spec.widthMm || 2438));
+                            const self2b = (typeof csPackV2Step2bSelfTest === 'function')
+                              ? csPackV2Step2bSelfTest() : { ok: true, skipped: true };
+                            step2b = {
+                              ok: oneFloor && inset && self2b.ok !== false,
+                              rectCount: rects.length,
+                              oneFloor: oneFloor,
+                              inset: inset,
+                              selfTest: self2b,
+                              rect: r0 ? {
+                                x: +r0.x, z: +r0.z,
+                                length: +r0.length, width: +r0.width,
+                                y: +r0.y, heightAvailable: +r0.heightAvailable,
+                              } : null,
+                              envelope: {
+                                outerL: env.outerLengthMm || null,
+                                outerW: env.outerWidthMm || null,
+                                outerH: env.outerHeightMm || null,
+                                length: env.lengthMm || null,
+                                width: env.widthMm || null,
+                                height: env.heightMm || null,
+                                sideGap: env.clearanceSideMm || null,
+                                endGap: env.clearanceEndMm || null,
+                                source: env.source || null,
+                              },
+                            };
+                          }
+
+                          // Step 2c — try one floor seat (AABB + overlap), no loop
+                          let step2c = { ok: false, error: 'csPackV2TryFloorSeat missing' };
+                          if (typeof csPackV2TryFloorSeat === 'function'
+                              && step2b && step2b.ok && step2a && step2a.ok) {
+                            const spec = (typeof rawScene !== 'undefined' && rawScene
+                              && rawScene.containerSpec)
+                              ? rawScene.containerSpec
+                              : { lengthMm: 12000, widthMm: 2438, heightMm: 2690 };
+                            const init = (typeof csPackV2InitialFreeRects === 'function')
+                              ? csPackV2InitialFreeRects(spec) : null;
+                            const floor = init && init.freeRects && init.freeRects[0];
+                            const env = init && init.envelope;
+                            const built = (typeof csPackV2BuildUnits === 'function')
+                              ? csPackV2BuildUnits(
+                                (typeof assemblyGroups !== 'undefined' && assemblyGroups) || [],
+                                { containerSpec: spec })
+                              : [];
+                            // Prefer a floor-fitting unit that still leaves room for a
+                            // second seat (Z or X). Fat almost-full-width nests skip
+                            // the second-seat check — OVERLAP alone proves 2c.
+                            const gap = 20;
+                            const fitsFloor = (u) =>
+                              +u.packLengthMm <= (floor && floor.length)
+                              && +u.packWidthMm <= (floor && floor.width)
+                              && +u.packHeightMm <= (floor && floor.heightAvailable);
+                            const roomForSecond = (u) =>
+                              (+u.packWidthMm * 2 + gap) <= (floor && floor.width)
+                              || (+u.packLengthMm * 2 + gap) <= (floor && floor.length);
+                            let probeU = built.find(u => fitsFloor(u) && roomForSecond(u));
+                            if (!probeU) probeU = built.find(u => fitsFloor(u));
+                            if (!probeU && built.length) probeU = built[0];
+                            const self2c = (typeof csPackV2Step2cSelfTest === 'function')
+                              ? csPackV2Step2cSelfTest() : { ok: true, skipped: true };
+                            let corner = null;
+                            let overlap = null;
+                            let beside = null;
+                            let secondAxis = null;
+                            if (probeU && floor && env) {
+                              corner = csPackV2TryFloorSeat(
+                                probeU, floor.x, floor.z,
+                                { envelope: env, rect: floor, placedBoxes: [] });
+                              if (corner && corner.ok && corner.box) {
+                                overlap = csPackV2TryFloorSeat(
+                                  probeU, floor.x, floor.z,
+                                  { envelope: env, rect: floor, placedBoxes: [corner.box] });
+                                const alongZ = floor.z + corner.pw + gap;
+                                const alongX = floor.x + corner.pl + gap;
+                                if ((corner.pw * 2 + gap) <= floor.width) {
+                                  secondAxis = 'z';
+                                  beside = csPackV2TryFloorSeat(
+                                    probeU, floor.x, alongZ,
+                                    { envelope: env, rect: floor, placedBoxes: [corner.box] });
+                                } else if ((corner.pl * 2 + gap) <= floor.length) {
+                                  secondAxis = 'x';
+                                  beside = csPackV2TryFloorSeat(
+                                    probeU, alongX, floor.z,
+                                    { envelope: env, rect: floor, placedBoxes: [corner.box] });
+                                }
                               }
                             }
+                            const coreOk = !!(corner && corner.ok
+                              && overlap && !overlap.ok && overlap.reason === 'OVERLAP');
+                            const secondNeeded = secondAxis != null;
+                            const secondOk = !secondNeeded || !!(beside && beside.ok);
+                            const logicOk = coreOk && secondOk;
+                            step2c = {
+                              ok: self2c.ok !== false && logicOk,
+                              selfTest: self2c,
+                              probeMark: probeU ? (probeU.mark || null) : null,
+                              probeDims: probeU ? {
+                                pl: Math.round(+probeU.packLengthMm || 0),
+                                pw: Math.round(+probeU.packWidthMm || 0),
+                                ph: Math.round(+probeU.packHeightMm || 0),
+                              } : null,
+                              cornerOk: !!(corner && corner.ok),
+                              overlapRejected: !!(overlap && !overlap.ok
+                                && overlap.reason === 'OVERLAP'),
+                              besideOk: !!(beside && beside.ok),
+                              secondAxis: secondAxis,
+                              secondNeeded: secondNeeded,
+                              cornerReason: corner ? corner.reason : null,
+                              overlapReason: overlap ? overlap.reason : null,
+                            };
                           }
-                          const placedOk = placedRf.length > 0;
-                          const widthOk = widthExceeds.length === 0;
-                          // Float must be zero; allow a few residual AABB dig-ins after settle
-                          // (nest flush / plate faces still inflate AABB counts)
-                          const foremanPack = (typeof currentLayout !== 'undefined'
-                              && currentLayout && (currentLayout.packStrategy === 'foreman_space_first'
-                                || (currentLayout.packPasses && currentLayout.packPasses.foreman)))
-                            || (window.__lastPackStrategy === 'foreman_space_first')
-                            || (window.__foremanLast && window.__foremanLast.placed > 0);
-                          // Foreman quality: zero float + packer-resolved overlaps (mesh AABB digs
-                          // are expected when lane-packing assemblies to construct width).
-                          const packerOv = (window.__foremanLast && window.__foremanLast.report
-                            && window.__foremanLast.report.overlapCount != null)
-                            ? window.__foremanLast.report.overlapCount
-                            : overlapCount;
-                          // tipGapMmMax: allow ≤120mm residual on long floor assemblies
-                          const tipOk = !(tipGapMmMax > 120);
-                          const qualityOk = floatCount === 0 && tipOk
-                            && (foremanPack ? packerOv <= 8 : overlapCount <= 12);
-                          const braceLike = all.filter(r =>
-                            /FLANGE[_\s-]*BRACE|ANGLE[_\s-]*BRACE|L[_\s-]*BRACE|L_?ANGLE/i
-                              .test(String(r.mark || '') + ' ' + (r.marks || []).join(' ')));
-                          const braceGroups = (typeof assemblyGroups !== 'undefined' && assemblyGroups || [])
-                            .filter(g => {
-                              const sk = String(g.shapeKey || g.profileShape || '');
-                              const blob = String(g.mark || '') + ' ' + sk + ' ' + (g.groupKind || '');
-                              return sk === 'l_angle' || g.groupKind === 'nest_l'
-                                || /FLANGE[_\s-]*BRACE|ANGLE[_\s-]*BRACE|L[_\s-]*BRACE|L_?ANGLE/i.test(blob);
-                            })
-                            .map(g => ({
-                              mark: g.mark,
-                              shapeKey: g.shapeKey || g.profileShape || null,
-                              state: g.state,
-                              qty: g.qty,
-                              groupKind: g.groupKind || null,
-                            }));
-                          window.__cliPackReport = {
-                            ok: placedOk && widthOk && qualityOk && !groups.some(g =>
-                              /WIDTH_EXCEEDS/i.test(String(g.fitReason || ''))),
-                            qualityOk: qualityOk,
-                            tipOk: tipOk,
-                            widthOk: widthOk,
-                            placedOk: placedOk,
-                            packerOv: packerOv,
-                            totalClickable: all.length,
-                            inside: all.filter(r => !r.outside).length,
-                            outsideCount: outside.length,
-                            floatCount: floatCount,
-                            overlapCount: overlapCount,
-                            meshY: {
-                              maxMinY: maxMeshMinY,
-                              maxCy: maxMeshCy,
-                              tallNestTip: tallNestTip,
-                              tipGapMmMax: tipGapMmMax,
-                              tipGapMark: tipGapMark,
-                              n: meshBoxes.length,
-                              high: meshBoxes
-                                .map(m => ({
-                                  mark: m.mark,
-                                  nest: m.nest,
-                                  lock: m.lock,
-                                  gk: m.gk,
-                                  minY: +m.box.min.y.toFixed(3),
-                                  cy: +((m.box.min.y + m.box.max.y) * 0.5).toFixed(3),
-                                  h: +(m.box.max.y - m.box.min.y).toFixed(3),
-                                  itemY: m.y0,
-                                  fh: m.fh,
+
+                          // Step 2d — gravity commit: floor seat always y=0
+                          let step2d = { ok: false, error: 'csPackV2CommitFloorSeat missing' };
+                          if (typeof csPackV2CommitFloorSeat === 'function'
+                              && step2c && step2c.ok && step2b && step2b.ok) {
+                            const spec = (typeof rawScene !== 'undefined' && rawScene
+                              && rawScene.containerSpec)
+                              ? rawScene.containerSpec
+                              : { lengthMm: 12000, widthMm: 2438, heightMm: 2690 };
+                            const init = (typeof csPackV2InitialFreeRects === 'function')
+                              ? csPackV2InitialFreeRects(spec) : null;
+                            const floor = init && init.freeRects && init.freeRects[0];
+                            const env = init && init.envelope;
+                            const built = (typeof csPackV2BuildUnits === 'function')
+                              ? csPackV2BuildUnits(
+                                (typeof assemblyGroups !== 'undefined' && assemblyGroups) || [],
+                                { containerSpec: spec })
+                              : [];
+                            const fitsFloor = (u) =>
+                              +u.packLengthMm <= (floor && floor.length)
+                              && +u.packWidthMm <= (floor && floor.width)
+                              && +u.packHeightMm <= (floor && floor.heightAvailable);
+                            let probeU = built.find(u => fitsFloor(u));
+                            if (!probeU && built.length) probeU = built[0];
+                            const self2d = (typeof csPackV2Step2dSelfTest === 'function')
+                              ? csPackV2Step2dSelfTest() : { ok: true, skipped: true };
+                            let seat = null;
+                            let commit = null;
+                            let tamper = null;
+                            let rejectBad = null;
+                            if (probeU && floor && env
+                                && typeof csPackV2TryFloorSeat === 'function') {
+                              seat = csPackV2TryFloorSeat(
+                                probeU, floor.x, floor.z,
+                                { envelope: env, rect: floor, placedBoxes: [] });
+                              if (seat && seat.ok) {
+                                commit = csPackV2CommitFloorSeat(probeU, seat, {
+                                  envelope: env, rect: floor, placedBoxes: [],
+                                });
+                                const fakeY = Object.assign({}, seat, {
+                                  y: 500,
+                                  box: Object.assign({}, seat.box || {}, {
+                                    minY: 500, maxY: 500 + (+probeU.packHeightMm || 0),
+                                  }),
+                                });
+                                tamper = csPackV2CommitFloorSeat(probeU, fakeY, {
+                                  envelope: env, rect: floor, placedBoxes: [],
+                                  recheck: false,
+                                });
+                                rejectBad = csPackV2CommitFloorSeat(probeU, {
+                                  ok: false, reason: 'OVERLAP', x: seat.x, z: seat.z,
+                                }, { envelope: env, rect: floor });
+                              }
+                            }
+                            const gravityOk = !!(commit && commit.ok
+                              && commit.placement && commit.placement.y === 0
+                              && commit.placement.box
+                              && commit.placement.box.minY === 0
+                              && commit.placement.layer === 'floor');
+                            const tamperOk = !!(tamper && tamper.ok
+                              && tamper.placement && tamper.placement.y === 0
+                              && tamper.placement.box && tamper.placement.box.minY === 0);
+                            const rejectOk = !!(rejectBad && !rejectBad.ok
+                              && rejectBad.reason === 'SEAT_NOT_OK');
+                            step2d = {
+                              ok: self2d.ok !== false && gravityOk && tamperOk && rejectOk,
+                              selfTest: self2d,
+                              probeMark: probeU ? (probeU.mark || null) : null,
+                              commitY: commit && commit.placement
+                                ? commit.placement.y : null,
+                              commitMinY: commit && commit.placement && commit.placement.box
+                                ? commit.placement.box.minY : null,
+                              tamperForcedY0: tamperOk,
+                              rejectBadSeat: rejectOk,
+                              gravity: commit && commit.placement
+                                ? commit.placement.gravity : null,
+                            };
+                          }
+
+                          // Step 2e — guillotine free-rect split after floor commit
+                          let step2e = { ok: false, error: 'csPackV2ApplySplit missing' };
+                          if (typeof csPackV2ApplySplit === 'function'
+                              && step2d && step2d.ok && step2b && step2b.ok) {
+                            const spec = (typeof rawScene !== 'undefined' && rawScene
+                              && rawScene.containerSpec)
+                              ? rawScene.containerSpec
+                              : { lengthMm: 12000, widthMm: 2438, heightMm: 2690 };
+                            const init = (typeof csPackV2InitialFreeRects === 'function')
+                              ? csPackV2InitialFreeRects(spec) : null;
+                            const floor = init && init.freeRects && init.freeRects[0];
+                            const env = init && init.envelope;
+                            const built = (typeof csPackV2BuildUnits === 'function')
+                              ? csPackV2BuildUnits(
+                                (typeof assemblyGroups !== 'undefined' && assemblyGroups) || [],
+                                { containerSpec: spec })
+                              : [];
+                            // Prefer a unit that leaves a usable side lane after split
+                            const fitsCorner = (u) =>
+                              +u.packLengthMm <= (floor && floor.length)
+                              && +u.packWidthMm + 50 <= (floor && floor.width)
+                              && +u.packHeightMm <= (floor && floor.heightAvailable);
+                            let probeU = built.find(u => fitsCorner(u));
+                            if (!probeU) probeU = built.find(u =>
+                              +u.packLengthMm <= (floor && floor.length)
+                              && +u.packWidthMm <= (floor && floor.width)
+                              && +u.packHeightMm <= (floor && floor.heightAvailable));
+                            if (!probeU && built.length) probeU = built[0];
+                            const self2e = (typeof csPackV2Step2eSelfTest === 'function')
+                              ? csPackV2Step2eSelfTest() : { ok: true, skipped: true };
+                            let seat = null;
+                            let commit = null;
+                            let applied = null;
+                            let sideLane = null;
+                            let noOverlap = true;
+                            let inputIntact = false;
+                            if (probeU && floor && env
+                                && typeof csPackV2TryFloorSeat === 'function'
+                                && typeof csPackV2CommitFloorSeat === 'function') {
+                              seat = csPackV2TryFloorSeat(
+                                probeU, floor.x, floor.z,
+                                { envelope: env, rect: floor, placedBoxes: [] });
+                              if (seat && seat.ok) {
+                                commit = csPackV2CommitFloorSeat(probeU, seat, {
+                                  envelope: env, rect: floor, placedBoxes: [],
+                                });
+                              }
+                              if (commit && commit.ok && commit.placement) {
+                                const beforeN = init.freeRects.length;
+                                applied = csPackV2ApplySplit(
+                                  init.freeRects, floor, commit.placement, { gapMm: 0 });
+                                inputIntact = init.freeRects.length === beforeN;
+                                if (applied && applied.ok && applied.freeRects) {
+                                  sideLane = applied.freeRects.find(r =>
+                                    Math.abs(+r.length - +floor.length) <= 0.5);
+                                  for (let i = 0; i < applied.freeRects.length; i++) {
+                                    for (let j = i + 1; j < applied.freeRects.length; j++) {
+                                      if (typeof csPackV2FreeRectsOverlap === 'function'
+                                          && csPackV2FreeRectsOverlap(
+                                            applied.freeRects[i], applied.freeRects[j]))
+                                        noOverlap = false;
+                                    }
+                                    // leftover must not dig into placed box
+                                    const fr = applied.freeRects[i];
+                                    const frBox = (typeof csPackV2MakeBox === 'function')
+                                      ? csPackV2MakeBox(fr.x, fr.z, fr.length, fr.width, 1, 0)
+                                      : null;
+                                    if (frBox && commit.placement.box
+                                        && typeof csPackV2BoxesOverlap === 'function'
+                                        && csPackV2BoxesOverlap(frBox, commit.placement.box))
+                                      noOverlap = false;
+                                  }
+                                }
+                              }
+                            }
+                            const splitOk = !!(applied && applied.ok
+                              && applied.freeRects && applied.freeRects.length >= 1
+                              && sideLane && noOverlap && inputIntact
+                              && commit && commit.placement && commit.placement.y === 0);
+                            step2e = {
+                              ok: self2e.ok !== false && splitOk,
+                              selfTest: self2e,
+                              probeMark: probeU ? (probeU.mark || null) : null,
+                              probeDims: probeU ? {
+                                pl: Math.round(+probeU.packLengthMm || 0),
+                                pw: Math.round(+probeU.packWidthMm || 0),
+                                ph: Math.round(+probeU.packHeightMm || 0),
+                              } : null,
+                              leftoverCount: applied && applied.freeRects
+                                ? applied.freeRects.length : 0,
+                              hasSideLane: !!sideLane,
+                              sideLaneWidth: sideLane
+                                ? Math.round(+sideLane.width) : null,
+                              noOverlap: noOverlap,
+                              inputIntact: inputIntact,
+                              policy: applied ? applied.policy : null,
+                            };
+                          }
+
+                          // Step 2f — full floor loop + honest fitReason leftovers
+                          let step2f = { ok: false, error: 'csPackV2PackFloor missing' };
+                          if (typeof csPackV2PackFloor === 'function'
+                              && step2e && step2e.ok && step2a && step2a.ok) {
+                            const spec = (typeof rawScene !== 'undefined' && rawScene
+                              && rawScene.containerSpec)
+                              ? rawScene.containerSpec
+                              : { lengthMm: 12000, widthMm: 2438, heightMm: 2690 };
+                            const built = (typeof csPackV2BuildUnits === 'function')
+                              ? csPackV2BuildUnits(
+                                (typeof assemblyGroups !== 'undefined' && assemblyGroups) || [],
+                                { containerSpec: spec })
+                              : [];
+                            const self2f = (typeof csPackV2Step2fSelfTest === 'function')
+                              ? csPackV2Step2fSelfTest() : { ok: true, skipped: true };
+                            const selfShip = (typeof cs8ShipAxesSelfTest === 'function')
+                              ? cs8ShipAxesSelfTest() : { ok: true, skipped: true };
+                            const pack = csPackV2PackFloor(built, { containerSpec: spec });
+                            let placedY0 = true;
+                            let placedNoOv = true;
+                            let reasonsOk = true;
+                            let frNoOv = true;
+                            const reasonCounts = {};
+                            let absurdWithHints = 0;
+                            const absurdSample = [];
+                            const Wcap = +(spec.widthMm || 2438);
+                            for (let i = 0; i < built.length; i++) {
+                              const u = built[i];
+                              if (!u) continue;
+                              const pw = +u.packWidthMm || 0;
+                              const pl = +u.packLengthMm || 0;
+                              const ph = +u.packHeightMm || 0;
+                              const isAsm = !!(u.isAssembly
+                                || u.groupKind === 'welded_assembly'
+                                || u.groupKind === 'assembly_single');
+                              const hasHint = (+u.sectW >= 40) || (+u.shippingWidthMm >= 40)
+                                || (+u.flangeWidthMm >= 40) || (+u.sectH >= 40);
+                              const absurd = (typeof cs8IsAbsurdAssemblyFootprint === 'function')
+                                ? cs8IsAbsurdAssemblyFootprint(pl, pw, ph, u)
+                                : (pw > Wcap + 1 && pl > Wcap * 0.5);
+                              // Gate only assemblies — true-oversize plates stay FOOTPRINT_EXCEEDS
+                              if (isAsm && hasHint && absurd) {
+                                absurdWithHints++;
+                                if (absurdSample.length < 12) {
+                                  absurdSample.push({
+                                    mark: u.mark || null,
+                                    pl: Math.round(pl), pw: Math.round(pw), ph: Math.round(ph),
+                                    sectW: +u.sectW || 0, sectH: +u.sectH || 0,
+                                    shipW: +u.shippingWidthMm || +u.flangeWidthMm || 0,
+                                    shipL: +u.shippingLengthMm || 0,
+                                    shipH: +u.shippingHeightMm || 0,
+                                    gk: u.groupKind || null,
+                                    isAsm: true,
+                                  });
+                                }
+                              }
+                            }
+                            if (pack && pack.placed) {
+                              for (let i = 0; i < pack.placed.length; i++) {
+                                const p = pack.placed[i];
+                                if (!p || p.y !== 0 || !p.box || p.box.minY !== 0)
+                                  placedY0 = false;
+                                for (let j = i + 1; j < pack.placed.length; j++) {
+                                  const q = pack.placed[j];
+                                  if (p && q && p.box && q.box
+                                      && typeof csPackV2BoxesOverlap === 'function'
+                                      && csPackV2BoxesOverlap(p.box, q.box))
+                                    placedNoOv = false;
+                                }
+                              }
+                            }
+                            if (pack && pack.unplaced) {
+                              for (let i = 0; i < pack.unplaced.length; i++) {
+                                const u = pack.unplaced[i];
+                                if (!u || !u.fitReason) reasonsOk = false;
+                                else {
+                                  reasonCounts[u.fitReason] =
+                                    (reasonCounts[u.fitReason] || 0) + 1;
+                                }
+                              }
+                            }
+                            if (pack && pack.freeRects
+                                && typeof csPackV2FreeRectsOverlap === 'function') {
+                              for (let i = 0; i < pack.freeRects.length; i++) {
+                                for (let j = i + 1; j < pack.freeRects.length; j++) {
+                                  if (csPackV2FreeRectsOverlap(
+                                    pack.freeRects[i], pack.freeRects[j]))
+                                    frNoOv = false;
+                                }
+                              }
+                            }
+                            const accounted = !!(pack
+                              && (pack.placedCount + pack.unplacedCount) === built.length);
+                            const feasRate = pack && pack.feasibleCount > 0
+                              ? +pack.feasiblePlaceRate : 1;
+                            // Feasible floor rate: after dim honesty + corner/yaw
+                            const feasOk = feasRate >= 0.20 || !(pack && pack.feasibleCount > 0);
+                            const logicOk = !!(pack && pack.ok !== false
+                              && placedY0 && placedNoOv && reasonsOk && frNoOv
+                              && accounted && absurdWithHints === 0 && feasOk);
+                            step2f = {
+                              ok: self2f.ok !== false && selfShip.ok !== false && logicOk,
+                              selfTest: self2f,
+                              shipAxesSelfTest: selfShip,
+                              unitCount: built.length,
+                              placedCount: pack ? pack.placedCount : 0,
+                              unplacedCount: pack ? pack.unplacedCount : 0,
+                              freeRectCount: pack && pack.freeRects
+                                ? pack.freeRects.length : 0,
+                              placedY0: placedY0,
+                              placedNoOverlap: placedNoOv,
+                              freeRectsNoOverlap: frNoOv,
+                              allUnplacedHaveReason: reasonsOk,
+                              accounted: accounted,
+                              absurdFootprintCount: pack
+                                ? (pack.absurdFootprintCount || 0) : 0,
+                              absurdWithHints: absurdWithHints,
+                              absurdSample: absurdSample,
+                              feasibleCount: pack ? pack.feasibleCount : 0,
+                              feasiblePlaced: pack ? pack.feasiblePlaced : 0,
+                              feasiblePlaceRate: Math.round(feasRate * 1000) / 1000,
+                              reasonCounts: reasonCounts,
+                              unplacedSample: (pack && pack.unplaced)
+                                ? pack.unplaced.slice(0, 15).map(u => ({
+                                  mark: u.mark || null,
+                                  fitReason: u.fitReason || null,
+                                  pl: u.unit ? Math.round(+u.unit.packLengthMm || 0) : null,
+                                  pw: u.unit ? Math.round(+u.unit.packWidthMm || 0) : null,
+                                  ph: u.unit ? Math.round(+u.unit.packHeightMm || 0) : null,
                                 }))
-                                .sort((a, b) => b.minY - a.minY)
-                                .slice(0, 8),
+                                : [],
+                            };
+                          }
+
+                          // Step 3a — twin pair detect only (no seat yet)
+                          let step3a = { ok: false, error: 'csPackV2DetectTwinPairs missing' };
+                          if (typeof csPackV2DetectTwinPairs === 'function'
+                              && step2f && step2f.ok && step2a && step2a.ok) {
+                            const spec = (typeof rawScene !== 'undefined' && rawScene
+                              && rawScene.containerSpec)
+                              ? rawScene.containerSpec
+                              : { lengthMm: 12000, widthMm: 2438, heightMm: 2690 };
+                            const env = (typeof csPackV2FloorEnvelope === 'function')
+                              ? csPackV2FloorEnvelope(spec) : null;
+                            const built = (typeof csPackV2BuildUnits === 'function')
+                              ? csPackV2BuildUnits(
+                                (typeof assemblyGroups !== 'undefined' && assemblyGroups) || [],
+                                { containerSpec: spec })
+                              : [];
+                            const self3a = (typeof csPackV2Step3aSelfTest === 'function')
+                              ? csPackV2Step3aSelfTest() : { ok: true, skipped: true };
+                            const pairs = csPackV2DetectTwinPairs(built, env);
+                            let candCount = 0;
+                            for (let i = 0; i < built.length; i++) {
+                              if (typeof csPackV2IsTwinCandidate === 'function'
+                                  && csPackV2IsTwinCandidate(built[i], env))
+                                candCount++;
+                            }
+                            // Identity: every pair has two distinct uids
+                            let idsOk = true;
+                            const seen = new Set();
+                            for (let i = 0; i < pairs.length; i++) {
+                              const p = pairs[i];
+                              const ua = p && p.a && p.a._fmUid;
+                              const ub = p && p.b && p.b._fmUid;
+                              if (!ua || !ub || ua === ub || seen.has(ua) || seen.has(ub))
+                                idsOk = false;
+                              else { seen.add(ua); seen.add(ub); }
+                              if (p && Math.abs(+p.a.packLengthMm - +p.b.packLengthMm) > 50.5)
+                                idsOk = false;
+                            }
+                            step3a = {
+                              ok: self3a.ok !== false && idsOk,
+                              selfTest: self3a,
+                              candidateCount: candCount,
+                              pairCount: pairs.length,
+                              idsOk: idsOk,
+                              pairs: pairs.slice(0, 10).map(p => ({
+                                a: p.a ? (p.a.mark || p.a._fmUid) : null,
+                                b: p.b ? (p.b.mark || p.b._fmUid) : null,
+                                spanL: Math.round(+p.spanL || 0),
+                                seatW: Math.round(+p.seatW || 0),
+                                gapMm: p.gapMm,
+                                uids: p._fmUids || null,
+                              })),
+                            };
+                          }
+
+                          // Step 3b — twin #1 wall-hug (inspect design on real IFC pairs)
+                          let step3b = { ok: false, error: 'csPackV2SeatTwinWallHug missing' };
+                          if (typeof csPackV2SeatTwinWallHug === 'function'
+                              && step3a && step3a.ok) {
+                            const spec = (typeof rawScene !== 'undefined' && rawScene
+                              && rawScene.containerSpec)
+                              ? rawScene.containerSpec
+                              : { lengthMm: 12000, widthMm: 2438, heightMm: 2690 };
+                            const env = (typeof csPackV2FloorEnvelope === 'function')
+                              ? csPackV2FloorEnvelope(spec) : null;
+                            const built = (typeof csPackV2BuildUnits === 'function')
+                              ? csPackV2BuildUnits(
+                                (typeof assemblyGroups !== 'undefined' && assemblyGroups) || [],
+                                { containerSpec: spec })
+                              : [];
+                            const self3b = (typeof csPackV2Step3bSelfTest === 'function')
+                              ? csPackV2Step3bSelfTest() : { ok: true, skipped: true };
+                            const pairs = (typeof csPackV2DetectTwinPairs === 'function')
+                              ? csPackV2DetectTwinPairs(built, env) : [];
+                            const views = [];
+                            let allDesignOk = true;
+                            let seated = 0;
+                            // Probe up to 5 pairs — seat twin A only (3b scope)
+                            for (let i = 0; i < pairs.length && i < 5; i++) {
+                              const pr = pairs[i];
+                              const hug = csPackV2SeatTwinWallHug(pr.a, env, {
+                                placedBoxes: [],
+                              });
+                              if (hug && hug.ok) seated++;
+                              else allDesignOk = false;
+                              const d = hug && hug.inspect && hug.inspect.design
+                                ? hug.inspect.design : null;
+                              views.push({
+                                mark: pr.a ? (pr.a.mark || null) : null,
+                                ok: !!(hug && hug.ok),
+                                reason: hug ? hug.reason : 'null',
+                                designOk: !!(hug && hug.inspect && hug.inspect.ok),
+                                pl: d ? d.pl : Math.round(+(pr.a && pr.a.packLengthMm) || 0),
+                                pw: d ? d.pw : Math.round(+(pr.a && pr.a.packWidthMm) || 0),
+                                ph: d ? d.ph : Math.round(+(pr.a && pr.a.packHeightMm) || 0),
+                                x: d ? d.x : null,
+                                z: d ? d.z : null,
+                                y: d ? d.y : null,
+                                steelWOk: d ? d.steelWOk : null,
+                                atHomeWall: d ? d.atHomeWall : null,
+                                atRear: d ? d.atRear : null,
+                                onFloor: d ? d.onFloor : null,
+                                padded: d ? (d.pw > 400) : null,
+                              });
+                              if (d && (d.pw > 400 || !d.steelWOk || !d.atHomeWall
+                                  || !d.onFloor || !d.atRear))
+                                allDesignOk = false;
+                            }
+                            // No pairs is OK for IFCs without twins — still need self-test
+                            const probeOk = pairs.length === 0
+                              || (seated === Math.min(5, pairs.length) && allDesignOk);
+                            step3b = {
+                              ok: self3b.ok !== false && probeOk,
+                              selfTest: self3b,
+                              pairCount: pairs.length,
+                              seatedCount: seated,
+                              allDesignOk: allDesignOk,
+                              wallHugViews: views,
+                            };
+                          }
+
+                          // Step 3c — twin #2 beside (+60 mm); design view A+B
+                          let step3c = { ok: false, error: 'csPackV2PlaceTwinLane missing' };
+                          if (typeof csPackV2PlaceTwinLane === 'function'
+                              && step3a && step3a.ok) {
+                            const spec = (typeof rawScene !== 'undefined' && rawScene
+                              && rawScene.containerSpec)
+                              ? rawScene.containerSpec
+                              : { lengthMm: 12000, widthMm: 2438, heightMm: 2690 };
+                            const env = (typeof csPackV2FloorEnvelope === 'function')
+                              ? csPackV2FloorEnvelope(spec) : null;
+                            const built = (typeof csPackV2BuildUnits === 'function')
+                              ? csPackV2BuildUnits(
+                                (typeof assemblyGroups !== 'undefined' && assemblyGroups) || [],
+                                { containerSpec: spec })
+                              : [];
+                            const self3c = (typeof csPackV2Step3cSelfTest === 'function')
+                              ? csPackV2Step3cSelfTest() : { ok: true, skipped: true };
+                            const pairs = (typeof csPackV2DetectTwinPairs === 'function')
+                              ? csPackV2DetectTwinPairs(built, env) : [];
+                            const views = [];
+                            let allDesignOk = true;
+                            let seated = 0;
+                            for (let i = 0; i < pairs.length && i < 5; i++) {
+                              const pr = pairs[i];
+                              const lane = csPackV2PlaceTwinLane(pr, env, {
+                                placedBoxes: [],
+                              });
+                              if (lane && lane.ok) seated++;
+                              else allDesignOk = false;
+                              const dA = lane && lane.hug && lane.hug.inspect
+                                && lane.hug.inspect.design
+                                ? lane.hug.inspect.design : null;
+                              const dB = lane && lane.beside && lane.beside.inspect
+                                && lane.beside.inspect.design
+                                ? lane.beside.inspect.design : null;
+                              views.push({
+                                markA: pr.a ? (pr.a.mark || null) : null,
+                                markB: pr.b ? (pr.b.mark || null) : null,
+                                ok: !!(lane && lane.ok),
+                                reason: lane ? lane.reason : 'null',
+                                gapMm: lane ? lane.gapMm : null,
+                                A: dA ? {
+                                  pl: dA.pl, pw: dA.pw, ph: dA.ph,
+                                  x: dA.x, z: dA.z, y: dA.y,
+                                  steelWOk: dA.steelWOk, atHomeWall: dA.atHomeWall,
+                                  atRear: dA.atRear, onFloor: dA.onFloor,
+                                  padded: dA.pw > 400,
+                                } : null,
+                                B: dB ? {
+                                  pl: dB.pl, pw: dB.pw, ph: dB.ph,
+                                  x: dB.x, z: dB.z, y: dB.y,
+                                  gapMm: dB.gapMm, gapOk: dB.gapOk,
+                                  noOverlap: dB.noOverlap, steelWOk: dB.steelWOk,
+                                  sameRearAsA: dB.sameRearAsA, onFloor: dB.onFloor,
+                                  padded: dB.pw > 400,
+                                } : null,
+                              });
+                              if (!dA || !dB || dA.pw > 400 || dB.pw > 400
+                                  || !dA.steelWOk || !dB.steelWOk
+                                  || !dA.onFloor || !dB.onFloor
+                                  || !dB.gapOk || !dB.noOverlap
+                                  || !dB.sameRearAsA)
+                                allDesignOk = false;
+                            }
+                            const probeOk = pairs.length === 0
+                              || (seated === Math.min(5, pairs.length) && allDesignOk);
+                            step3c = {
+                              ok: self3c.ok !== false && probeOk,
+                              selfTest: self3c,
+                              pairCount: pairs.length,
+                              seatedCount: seated,
+                              allDesignOk: allDesignOk,
+                              twinLaneViews: views,
+                            };
+                          }
+
+                          // Step 3d — clean full-length leftover strip after twin lane
+                          let step3d = { ok: false, error: 'csPackV2RebuildTwinLeftoverRects missing' };
+                          if (typeof csPackV2RebuildTwinLeftoverRects === 'function'
+                              && typeof csPackV2PlaceTwinLane === 'function'
+                              && step3a && step3a.ok) {
+                            const spec = (typeof rawScene !== 'undefined' && rawScene
+                              && rawScene.containerSpec)
+                              ? rawScene.containerSpec
+                              : { lengthMm: 12000, widthMm: 2438, heightMm: 2690 };
+                            const env = (typeof csPackV2FloorEnvelope === 'function')
+                              ? csPackV2FloorEnvelope(spec) : null;
+                            const built = (typeof csPackV2BuildUnits === 'function')
+                              ? csPackV2BuildUnits(
+                                (typeof assemblyGroups !== 'undefined' && assemblyGroups) || [],
+                                { containerSpec: spec })
+                              : [];
+                            const self3d = (typeof csPackV2Step3dSelfTest === 'function')
+                              ? csPackV2Step3dSelfTest() : { ok: true, skipped: true };
+                            const pairs = (typeof csPackV2DetectTwinPairs === 'function')
+                              ? csPackV2DetectTwinPairs(built, env) : [];
+                            const views = [];
+                            let allDesignOk = true;
+                            let rebuilt = 0;
+                            for (let i = 0; i < pairs.length && i < 5; i++) {
+                              const pr = pairs[i];
+                              const lane = csPackV2PlaceTwinLane(pr, env, {
+                                placedBoxes: [],
+                              });
+                              const reb = (lane && lane.ok)
+                                ? csPackV2RebuildTwinLeftoverRects(env, lane.placed, {})
+                                : { ok: false, reason: 'LANE_FAIL', freeRects: [] };
+                              if (reb && reb.ok) rebuilt++;
+                              else allDesignOk = false;
+                              const d = reb && reb.inspect && reb.inspect.design
+                                ? reb.inspect.design : null;
+                              const side = d && d.sideStrip ? d.sideStrip : null;
+                              const front = d && d.frontRemnant ? d.frontRemnant : null;
+                              views.push({
+                                markA: pr.a ? (pr.a.mark || null) : null,
+                                markB: pr.b ? (pr.b.mark || null) : null,
+                                laneOk: !!(lane && lane.ok),
+                                ok: !!(reb && reb.ok),
+                                reason: reb ? reb.reason : 'null',
+                                rectCount: reb && reb.freeRects
+                                  ? reb.freeRects.length : 0,
+                                occupied: d ? d.occupied : null,
+                                sideStrip: side,
+                                frontRemnant: front,
+                                fullLengthOk: d ? d.fullLengthOk : null,
+                                sideZOk: d ? d.sideZOk : null,
+                                noRectOverlap: d ? d.noRectOverlap : null,
+                                noTwinDigIn: d ? d.noTwinDigIn : null,
+                                onFloor: d ? d.onFloor : null,
+                                envLength: env ? Math.round(env.lengthMm) : null,
+                              });
+                              if (!d || !d.fullLengthOk || !d.sideZOk
+                                  || !d.noRectOverlap || !d.noTwinDigIn
+                                  || !d.onFloor || (reb.freeRects
+                                    && reb.freeRects.length > 2))
+                                allDesignOk = false;
+                            }
+                            const probeOk = pairs.length === 0
+                              || (rebuilt === Math.min(5, pairs.length) && allDesignOk);
+                            step3d = {
+                              ok: self3d.ok !== false && probeOk,
+                              selfTest: self3d,
+                              pairCount: pairs.length,
+                              rebuiltCount: rebuilt,
+                              allDesignOk: allDesignOk,
+                              stripViews: views,
+                            };
+                          }
+
+                          // Step 3e — long nests into clean strip (design + no dig-in)
+                          let step3e = { ok: false, error: 'csPackV2PlaceLongNestsIntoStrip missing' };
+                          if (typeof csPackV2PlaceLongNestsIntoStrip === 'function'
+                              && typeof csPackV2PlaceTwinLane === 'function'
+                              && typeof csPackV2RebuildTwinLeftoverRects === 'function'
+                              && step3a && step3a.ok) {
+                            const spec = (typeof rawScene !== 'undefined' && rawScene
+                              && rawScene.containerSpec)
+                              ? rawScene.containerSpec
+                              : { lengthMm: 12000, widthMm: 2438, heightMm: 2690 };
+                            const env = (typeof csPackV2FloorEnvelope === 'function')
+                              ? csPackV2FloorEnvelope(spec) : null;
+                            const built = (typeof csPackV2BuildUnits === 'function')
+                              ? csPackV2BuildUnits(
+                                (typeof assemblyGroups !== 'undefined' && assemblyGroups) || [],
+                                { containerSpec: spec })
+                              : [];
+                            const self3e = (typeof csPackV2Step3eSelfTest === 'function')
+                              ? csPackV2Step3eSelfTest() : { ok: true, skipped: true };
+                            const pairs = (typeof csPackV2DetectTwinPairs === 'function')
+                              ? csPackV2DetectTwinPairs(built, env) : [];
+                            const longCands = built.filter(u =>
+                              typeof csPackV2IsLongNestUnit === 'function'
+                              && csPackV2IsLongNestUnit(u, env));
+                            const views = [];
+                            let allDesignOk = true;
+                            let probeRuns = 0;
+                            let probeOkRuns = 0;
+                            // Probe first twin pair lane → strip → long nests
+                            if (pairs.length > 0) {
+                              const pr = pairs[0];
+                              const lane = csPackV2PlaceTwinLane(pr, env, {
+                                placedBoxes: [],
+                              });
+                              const reb = (lane && lane.ok)
+                                ? csPackV2RebuildTwinLeftoverRects(env, lane.placed, {})
+                                : { ok: false, freeRects: [] };
+                              const pass = (reb && reb.ok)
+                                ? csPackV2PlaceLongNestsIntoStrip(
+                                  built, reb.freeRects, lane.placed, { envelope: env })
+                                : { ok: false, nestViews: [], placedLongCount: 0,
+                                    longCandidateCount: longCands.length };
+                              probeRuns = 1;
+                              const nestViews = (pass && pass.nestViews) || [];
+                              let designOk = !!(pass && pass.ok);
+                              for (let vi = 0; vi < nestViews.length && vi < 8; vi++) {
+                                const nv = nestViews[vi];
+                                const d = nv && nv.design ? nv.design : null;
+                                views.push({
+                                  mark: nv ? nv.mark : null,
+                                  ok: !!(nv && nv.ok),
+                                  reason: nv ? nv.reason : null,
+                                  pl: d ? d.pl : (nv && nv.pl),
+                                  pw: d ? d.pw : (nv && nv.pw),
+                                  ph: d ? d.ph : (nv && nv.ph),
+                                  x: d ? d.x : (nv && nv.x),
+                                  z: d ? d.z : (nv && nv.z),
+                                  y: d ? d.y : (nv && nv.y),
+                                  longEnough: d ? d.longEnough : null,
+                                  inStrip: d ? d.inStrip : null,
+                                  onFloor: d ? d.onFloor : null,
+                                  noTwinDigIn: d ? d.noTwinDigIn : null,
+                                  isNest: d ? d.isNest : null,
+                                });
+                                if (nv && nv.ok && d && (!d.longEnough || !d.inStrip
+                                    || !d.onFloor || !d.noTwinDigIn || !d.isNest))
+                                  designOk = false;
+                              }
+                              // No long nests is OK — pass still ok with 0 placed
+                              if (designOk && pass && pass.ok) probeOkRuns = 1;
+                              else allDesignOk = false;
+                              step3e = {
+                                ok: self3e.ok !== false && designOk && !!(pass && pass.ok),
+                                selfTest: self3e,
+                                pairCount: pairs.length,
+                                longCandidateCount: pass
+                                  ? pass.longCandidateCount : longCands.length,
+                                placedLongCount: pass ? pass.placedLongCount : 0,
+                                unplacedLongCount: pass && pass.unplacedLong
+                                  ? pass.unplacedLong.length : 0,
+                                allDesignOk: designOk,
+                                sideStripZ: reb && reb.sideStrip ? reb.sideStrip.z : null,
+                                nestViews: views,
+                              };
+                            } else {
+                              // No twins — still require self-test; long-nest helper alone OK
+                              step3e = {
+                                ok: self3e.ok !== false,
+                                selfTest: self3e,
+                                pairCount: 0,
+                                longCandidateCount: longCands.length,
+                                placedLongCount: 0,
+                                unplacedLongCount: 0,
+                                allDesignOk: true,
+                                nestViews: [],
+                                note: 'no_twin_pairs',
+                              };
+                            }
+                            if (probeRuns && !probeOkRuns) allDesignOk = false;
+                            if (step3e && step3e.allDesignOk === false) allDesignOk = false;
+                            step3e.allDesignOk = allDesignOk && (step3e.allDesignOk !== false);
+                          }
+
+                          // Step 3f — PackWithTwins full wire (twins→strip→long→floor)
+                          let step3 = { ok: false, error: 'csPackV2PackWithTwins missing' };
+                          if (typeof csPackV2PackWithTwins === 'function'
+                              && step3a && step3a.ok) {
+                            const spec = (typeof rawScene !== 'undefined' && rawScene
+                              && rawScene.containerSpec)
+                              ? rawScene.containerSpec
+                              : { lengthMm: 12000, widthMm: 2438, heightMm: 2690 };
+                            const built = (typeof csPackV2BuildUnits === 'function')
+                              ? csPackV2BuildUnits(
+                                (typeof assemblyGroups !== 'undefined' && assemblyGroups) || [],
+                                { containerSpec: spec })
+                              : [];
+                            const self3 = (typeof csPackV2Step3SelfTest === 'function')
+                              ? csPackV2Step3SelfTest() : { ok: true, skipped: true };
+                            const pack = csPackV2PackWithTwins(built, {
+                              containerSpec: spec,
+                              enableStacks: true,
+                            });
+                            let accounted = false;
+                            let feasOk = true;
+                            let absurdWithHints = 0;
+                            const absurdSample = [];
+                            const Wcap = +(spec.widthMm || 2438);
+                            if (pack) {
+                              accounted = (pack.placedCount + pack.unplacedCount) === built.length;
+                              const feasRate = pack.feasibleCount > 0
+                                ? +pack.feasiblePlaceRate : 1;
+                              feasOk = feasRate >= 0.20 || !(pack.feasibleCount > 0);
+                            }
+                            for (let i = 0; i < built.length; i++) {
+                              const u = built[i];
+                              if (!u) continue;
+                              const pw = +u.packWidthMm || 0;
+                              const pl = +u.packLengthMm || 0;
+                              const ph = +u.packHeightMm || 0;
+                              const isAsm = !!(u.isAssembly
+                                || u.groupKind === 'welded_assembly'
+                                || u.groupKind === 'assembly_single');
+                              const hasHint = (+u.sectW >= 40) || (+u.shippingWidthMm >= 40)
+                                || (+u.flangeWidthMm >= 40) || (+u.sectH >= 40);
+                              const absurd = (typeof cs8IsAbsurdAssemblyFootprint === 'function')
+                                ? cs8IsAbsurdAssemblyFootprint(pl, pw, ph, u)
+                                : (pw > Wcap + 1 && pl > Wcap * 0.5);
+                              if (isAsm && hasHint && absurd) {
+                                absurdWithHints++;
+                                if (absurdSample.length < 8) {
+                                  absurdSample.push({
+                                    mark: u.mark || null,
+                                    pl: Math.round(pl), pw: Math.round(pw), ph: Math.round(ph),
+                                  });
+                                }
+                              }
+                            }
+                            // Twin design sample (first 6 twin-role seats)
+                            const twinViews = [];
+                            if (pack && pack.placed) {
+                              for (let i = 0; i < pack.placed.length && twinViews.length < 6; i++) {
+                                const p = pack.placed[i];
+                                if (!p || (p.role !== 'twin_wall_hug' && p.role !== 'twin_beside'))
+                                  continue;
+                                twinViews.push({
+                                  mark: p.mark || null,
+                                  role: p.role,
+                                  pl: Math.round(+p.pl), pw: Math.round(+p.pw), ph: Math.round(+p.ph),
+                                  x: +p.x, z: +p.z, y: +p.y,
+                                  onFloor: p.y === 0 && p.box && p.box.minY === 0,
+                                  steelWOk: +p.pw >= 120 && +p.pw <= 400,
+                                  padded: +p.pw > 400,
+                                });
+                              }
+                            }
+                            const hasSideStrip = !!(pack && pack.hasSideStrip);
+                            const stripAcceptable = !!(pack && (pack.stripAcceptable
+                              || hasSideStrip || pack.stripOk));
+                            const longFit = pack ? (+pack.longNestFitCount || 0) : 0;
+                            const longPlaced = pack ? (+pack.longNestPlacedCount || 0) : 0;
+                            const longRate = pack && pack.longNestPlaceRate != null
+                              ? +pack.longNestPlaceRate
+                              : (longFit > 0 ? longPlaced / longFit : 1);
+                            const stripCap = pack ? (+pack.stripNestCapacity || 0) : 0;
+                            const longTarget = pack && pack.longNestTarget != null
+                              ? +pack.longNestTarget
+                              : Math.min(stripCap, longFit);
+                            // Real yard: fill min(strip capacity, fitters) — not every IFC nest
+                            const longNestOk = longFit === 0 || stripCap === 0
+                              || longPlaced >= longTarget;
+                            const twinLaneOk = pack.twinPairCount === 0
+                              || (pack.twinPairsPlaced >= 1 && pack.twinGapOk
+                                && pack.twinNoDig && hasSideStrip && stripAcceptable);
+                            const logicOk = !!(pack && pack.ok !== false
+                              && pack.designOk !== false
+                              && pack.allFloorY0 && pack.allNoOverlap
+                              && pack.stackDesignOk !== false
+                              && pack.stackNoTwinDig !== false
+                              && accounted && absurdWithHints === 0 && feasOk
+                              && twinLaneOk && longNestOk);
+                            step3 = {
+                              ok: self3.ok !== false && logicOk,
+                              selfTest: self3,
+                              unitCount: built.length,
+                              placedCount: pack ? pack.placedCount : 0,
+                              unplacedCount: pack ? pack.unplacedCount : 0,
+                              feasibleCount: pack ? pack.feasibleCount : 0,
+                              feasiblePlaced: pack ? pack.feasiblePlaced : 0,
+                              feasiblePlaceRate: pack ? pack.feasiblePlaceRate : null,
+                              absurdWithHints: absurdWithHints,
+                              absurdSample: absurdSample,
+                              twinPairCount: pack ? pack.twinPairCount : 0,
+                              twinPairsPlaced: pack ? pack.twinPairsPlaced : 0,
+                              twinPlacedCount: pack ? pack.twinPlacedCount : 0,
+                              twinGapOk: pack ? pack.twinGapOk : null,
+                              twinNoDig: pack ? pack.twinNoDig : null,
+                              twinStoppedForStrip: pack ? !!pack.twinStoppedForStrip : null,
+                              stripReserveMm: pack ? pack.stripReserveMm : null,
+                              stripOk: pack ? pack.stripOk : null,
+                              stripAcceptable: stripAcceptable,
+                              hasSideStrip: hasSideStrip,
+                              sideAbsentOk: pack && pack.stripInspect && pack.stripInspect.design
+                                ? !!pack.stripInspect.design.sideAbsentOk : null,
+                              sideStrip: pack && pack.sideStrip ? {
+                                length: Math.round(+pack.sideStrip.length),
+                                width: Math.round(+pack.sideStrip.width),
+                                x: +pack.sideStrip.x,
+                                z: +pack.sideStrip.z,
+                              } : null,
+                              longCandidateCount: pack ? pack.longCandidateCount : 0,
+                              longNestFitCount: longFit,
+                              longNestPlacedCount: longPlaced,
+                              longNestPlaceRate: longRate,
+                              stripNestCapacity: stripCap,
+                              longNestTarget: longTarget,
+                              allFloorY0: pack ? pack.allFloorY0 : null,
+                              allNoOverlap: pack ? pack.allNoOverlap : null,
+                              stackCount: pack ? (+pack.stackCount || 0) : 0,
+                              stackDesignOk: pack ? pack.stackDesignOk !== false : null,
+                              allStacksOnSupport: pack ? !!pack.allStacksOnSupport : null,
+                              stackNoTwinDig: pack ? pack.stackNoTwinDig !== false : null,
+                              accounted: accounted,
+                              twinViews: twinViews,
+                              laneResults: pack ? (pack.laneResults || []).slice(0, 8) : [],
+                            };
+                          }
+
+                          // Step 4a — support map from placed nests (probe only; no stacking yet)
+                          let step4a = { ok: false, error: 'csPackV2BuildSupportMap missing' };
+                          if (typeof csPackV2BuildSupportMap === 'function'
+                              && step3 && step3.ok !== false
+                              && typeof csPackV2PackWithTwins === 'function') {
+                            const spec4 = (typeof rawScene !== 'undefined' && rawScene
+                              && rawScene.containerSpec)
+                              ? rawScene.containerSpec
+                              : { lengthMm: 12000, widthMm: 2438, heightMm: 2690 };
+                            const built4 = (typeof csPackV2BuildUnits === 'function')
+                              ? csPackV2BuildUnits(
+                                (typeof assemblyGroups !== 'undefined' && assemblyGroups) || [],
+                                { containerSpec: spec4 })
+                              : [];
+                            const pack4 = csPackV2PackWithTwins(built4, {
+                              containerSpec: spec4, enableStacks: false,
+                            });
+                            const self4a = (typeof csPackV2Step4aSelfTest === 'function')
+                              ? csPackV2Step4aSelfTest() : { ok: true, skipped: true };
+                            const map4 = csPackV2BuildSupportMap(
+                              pack4.placed || [], pack4.envelope, {});
+                            const nestOnFloor = (pack4.placed || []).filter(p =>
+                              p && (p.role === 'long_nest_strip'
+                                || (p.unit && typeof csPackIsNestUnit === 'function'
+                                  && csPackIsNestUnit(p.unit))));
+                            const twinOnFloor = (pack4.placed || []).filter(p =>
+                              p && (p.role === 'twin_wall_hug' || p.role === 'twin_beside'));
+                            const twinAsSupport = (map4.supports || []).filter(s =>
+                              twinOnFloor.some(t => t._fmUid === s.sourceUid)).length;
+                            const tallRejected = (map4.rejected || []).filter(r =>
+                              String(r.reason || '').indexOf('TALL') >= 0).length;
+                            const nestSupportMatch = map4.supportCount === nestOnFloor.length
+                              || (nestOnFloor.length > 0 && map4.supportCount
+                                === nestOnFloor.filter(p =>
+                                  typeof csPackV2IsTallCarrier !== 'function'
+                                  || !csPackV2IsTallCarrier(p, pack4.envelope)).length);
+                            step4a = {
+                              ok: self4a.ok !== false && map4.ok !== false
+                                && twinAsSupport === 0 && nestSupportMatch,
+                              selfTest: self4a,
+                              supportCount: map4.supportCount || 0,
+                              rejectedCount: map4.rejectedCount || 0,
+                              nestPlacedCount: nestOnFloor.length,
+                              twinPlacedCount: twinOnFloor.length,
+                              twinAsSupport: twinAsSupport,
+                              tallRejected: tallRejected,
+                              nestSupportMatch: nestSupportMatch,
+                              supports: (map4.supports || []).slice(0, 12).map(s => ({
+                                mark: s.mark || null,
+                                sourceUid: s.sourceUid,
+                                pl: Math.round(+s.pl),
+                                pw: Math.round(+s.pw),
+                                ph: Math.round(+s.ph),
+                                topY: Math.round(+s.topY),
+                                x: +s.x,
+                                z: +s.z,
+                                kind: s.kind,
+                                role: s.role || null,
+                              })),
+                              rejectedSample: (map4.rejected || []).slice(0, 12).map(r => ({
+                                mark: r.mark || null,
+                                reason: r.reason || null,
+                                role: r.role || null,
+                              })),
+                            };
+                          }
+
+                          // Step 4b — stack candidate rules probe (no seat/commit yet)
+                          let step4b = { ok: false, error: 'csPackV2IsStackCandidate missing' };
+                          if (typeof csPackV2IsStackCandidate === 'function'
+                              && typeof csPackV2BuildSupportMap === 'function'
+                              && step4a && step4a.ok !== false
+                              && typeof csPackV2PackWithTwins === 'function') {
+                            const spec4b = (typeof rawScene !== 'undefined' && rawScene
+                              && rawScene.containerSpec)
+                              ? rawScene.containerSpec
+                              : { lengthMm: 12000, widthMm: 2438, heightMm: 2690 };
+                            const built4b = (typeof csPackV2BuildUnits === 'function')
+                              ? csPackV2BuildUnits(
+                                (typeof assemblyGroups !== 'undefined' && assemblyGroups) || [],
+                                { containerSpec: spec4b })
+                              : [];
+                            const pack4b = csPackV2PackWithTwins(built4b, {
+                              containerSpec: spec4b, enableStacks: false,
+                            });
+                            const self4b = (typeof csPackV2Step4bSelfTest === 'function')
+                              ? csPackV2Step4bSelfTest() : { ok: true, skipped: true };
+                            const map4b = csPackV2BuildSupportMap(
+                              pack4b.placed || [], pack4b.envelope, {});
+                            const placedUids = {};
+                            for (let i = 0; i < (pack4b.placed || []).length; i++) {
+                              const p = pack4b.placed[i];
+                              if (p && p._fmUid != null) placedUids[p._fmUid] = true;
+                            }
+                            const leftoverNests = built4b.filter(u =>
+                              u && typeof csPackIsNestUnit === 'function'
+                              && csPackIsNestUnit(u)
+                              && (u._fmUid == null || !placedUids[u._fmUid]));
+                            let candidatePairs = 0;
+                            let unitsWithCandidate = 0;
+                            const reasonCounts = {};
+                            const samples = [];
+                            for (let i = 0; i < leftoverNests.length; i++) {
+                              const u = leftoverNests[i];
+                              let unitOk = false;
+                              for (let j = 0; j < (map4b.supports || []).length; j++) {
+                                const c = csPackV2IsStackCandidate(
+                                  u, map4b.supports[j], pack4b.envelope, {});
+                                if (c && c.ok) {
+                                  candidatePairs++;
+                                  unitOk = true;
+                                  if (samples.length < 8) {
+                                    samples.push({
+                                      mark: u.mark || null,
+                                      supportMark: map4b.supports[j].mark || null,
+                                      bearingFrac: c.design
+                                        ? Math.round(+c.design.bearingFrac * 1000) / 1000
+                                        : null,
+                                      topY: map4b.supports[j].topY,
+                                      ph: c.design ? c.design.ph : null,
+                                    });
+                                  }
+                                } else if (c && c.reason) {
+                                  reasonCounts[c.reason] = (reasonCounts[c.reason] || 0) + 1;
+                                }
+                              }
+                              if (unitOk) unitsWithCandidate++;
+                            }
+                            // Assemblies must never be stack candidates
+                            let asmCand = 0;
+                            for (let i = 0; i < built4b.length; i++) {
+                              const u = built4b[i];
+                              if (!u || typeof csPackIsNestUnit !== 'function') continue;
+                              if (csPackIsNestUnit(u)) continue;
+                              if (!(u.isAssembly || u.groupKind === 'welded_assembly'
+                                || u.groupKind === 'assembly_single')) continue;
+                              for (let j = 0; j < (map4b.supports || []).length; j++) {
+                                const c = csPackV2IsStackCandidate(
+                                  u, map4b.supports[j], pack4b.envelope, {});
+                                if (c && c.ok) asmCand++;
+                              }
+                            }
+                            step4b = {
+                              ok: self4b.ok !== false && asmCand === 0,
+                              selfTest: self4b,
+                              supportCount: map4b.supportCount || 0,
+                              leftoverNestCount: leftoverNests.length,
+                              candidatePairs: candidatePairs,
+                              unitsWithCandidate: unitsWithCandidate,
+                              assemblyCandidates: asmCand,
+                              rejectReasons: reasonCounts,
+                              samples: samples,
+                            };
+                          }
+
+                          // Step 4c — try stack seat probe (preview only; no commit)
+                          let step4c = { ok: false, error: 'csPackV2TryStackSeat missing' };
+                          if (typeof csPackV2TryStackSeat === 'function'
+                              && typeof csPackV2BuildSupportMap === 'function'
+                              && step4b && step4b.ok !== false
+                              && typeof csPackV2PackWithTwins === 'function') {
+                            const spec4c = (typeof rawScene !== 'undefined' && rawScene
+                              && rawScene.containerSpec)
+                              ? rawScene.containerSpec
+                              : { lengthMm: 12000, widthMm: 2438, heightMm: 2690 };
+                            const built4c = (typeof csPackV2BuildUnits === 'function')
+                              ? csPackV2BuildUnits(
+                                (typeof assemblyGroups !== 'undefined' && assemblyGroups) || [],
+                                { containerSpec: spec4c })
+                              : [];
+                            const pack4c = csPackV2PackWithTwins(built4c, {
+                              containerSpec: spec4c, enableStacks: false,
+                            });
+                            const self4c = (typeof csPackV2Step4cSelfTest === 'function')
+                              ? csPackV2Step4cSelfTest() : { ok: true, skipped: true };
+                            const map4c = csPackV2BuildSupportMap(
+                              pack4c.placed || [], pack4c.envelope, {});
+                            const boxes4c = (pack4c.placed || []).map(p => p && p.box)
+                              .filter(Boolean);
+                            const placedUids4c = {};
+                            for (let i = 0; i < (pack4c.placed || []).length; i++) {
+                              const p = pack4c.placed[i];
+                              if (p && p._fmUid != null) placedUids4c[p._fmUid] = true;
+                            }
+                            const leftover4c = built4c.filter(u =>
+                              u && typeof csPackIsNestUnit === 'function'
+                              && csPackIsNestUnit(u)
+                              && (u._fmUid == null || !placedUids4c[u._fmUid]));
+                            let seatOkCount = 0;
+                            let unitsSeatOk = 0;
+                            let floatOrFloorY = 0;
+                            let digOverlap = 0;
+                            const seatReasons = {};
+                            const seatSamples = [];
+                            for (let i = 0; i < leftover4c.length; i++) {
+                              const u = leftover4c[i];
+                              let unitOk = false;
+                              for (let j = 0; j < (map4c.supports || []).length; j++) {
+                                const s = csPackV2TryStackSeat(u, map4c.supports[j], {
+                                  envelope: pack4c.envelope,
+                                  placedBoxes: boxes4c,
+                                });
+                                if (s && s.ok) {
+                                  seatOkCount++;
+                                  unitOk = true;
+                                  if (!(+s.y > 0) || (s.box && +s.box.minY === 0
+                                    && +map4c.supports[j].topY > 0))
+                                    floatOrFloorY++;
+                                  for (let k = 0; k < boxes4c.length; k++) {
+                                    if (s.box && csPackV2BoxesOverlap(s.box, boxes4c[k]))
+                                      digOverlap++;
+                                  }
+                                  if (seatSamples.length < 8) {
+                                    seatSamples.push({
+                                      mark: u.mark || null,
+                                      supportMark: map4c.supports[j].mark || null,
+                                      y: +s.y,
+                                      topY: +map4c.supports[j].topY,
+                                      pl: Math.round(+s.pl),
+                                      pw: Math.round(+s.pw),
+                                      ph: Math.round(+s.ph),
+                                      bearingFrac: s.candidate && s.candidate.design
+                                        ? Math.round(+s.candidate.design.bearingFrac * 1000) / 1000
+                                        : null,
+                                      onSupport: !!(s.inspect && s.inspect.design
+                                        && s.inspect.design.onSupport),
+                                    });
+                                  }
+                                } else if (s && s.reason) {
+                                  seatReasons[s.reason] = (seatReasons[s.reason] || 0) + 1;
+                                }
+                              }
+                              if (unitOk) unitsSeatOk++;
+                            }
+                            step4c = {
+                              ok: self4c.ok !== false && floatOrFloorY === 0
+                                && digOverlap === 0,
+                              selfTest: self4c,
+                              supportCount: map4c.supportCount || 0,
+                              leftoverNestCount: leftover4c.length,
+                              seatOkCount: seatOkCount,
+                              unitsSeatOk: unitsSeatOk,
+                              floatOrFloorY: floatOrFloorY,
+                              digOverlap: digOverlap,
+                              rejectReasons: seatReasons,
+                              samples: seatSamples,
+                            };
+                          }
+
+                          // Step 4d — commit stack seat probe (single commits; no pass loop yet)
+                          let step4d = { ok: false, error: 'csPackV2CommitStackSeat missing' };
+                          if (typeof csPackV2CommitStackSeat === 'function'
+                              && typeof csPackV2TryStackSeat === 'function'
+                              && typeof csPackV2BuildSupportMap === 'function'
+                              && step4c && step4c.ok !== false
+                              && typeof csPackV2PackWithTwins === 'function') {
+                            const spec4d = (typeof rawScene !== 'undefined' && rawScene
+                              && rawScene.containerSpec)
+                              ? rawScene.containerSpec
+                              : { lengthMm: 12000, widthMm: 2438, heightMm: 2690 };
+                            const built4d = (typeof csPackV2BuildUnits === 'function')
+                              ? csPackV2BuildUnits(
+                                (typeof assemblyGroups !== 'undefined' && assemblyGroups) || [],
+                                { containerSpec: spec4d })
+                              : [];
+                            const pack4d = csPackV2PackWithTwins(built4d, {
+                              containerSpec: spec4d, enableStacks: false,
+                            });
+                            const self4d = (typeof csPackV2Step4dSelfTest === 'function')
+                              ? csPackV2Step4dSelfTest() : { ok: true, skipped: true };
+                            const map4d = csPackV2BuildSupportMap(
+                              pack4d.placed || [], pack4d.envelope, {});
+                            const boxes4d = (pack4d.placed || []).map(p => p && p.box)
+                              .filter(Boolean);
+                            const placedUids4d = {};
+                            for (let i = 0; i < (pack4d.placed || []).length; i++) {
+                              const p = pack4d.placed[i];
+                              if (p && p._fmUid != null) placedUids4d[p._fmUid] = true;
+                            }
+                            const leftover4d = built4d.filter(u =>
+                              u && typeof csPackIsNestUnit === 'function'
+                              && csPackIsNestUnit(u)
+                              && (u._fmUid == null || !placedUids4d[u._fmUid]));
+                            let commitOk = 0;
+                            let commitFail = 0;
+                            let badFloorY = 0;
+                            let badRole = 0;
+                            let digOverlap4d = 0;
+                            const commitReasons = {};
+                            const commitSamples = [];
+                            // Probe: try commit first leftover nest on first viable support
+                            // (not a full pass — that is 4e). Validate gravity lock.
+                            for (let i = 0; i < leftover4d.length; i++) {
+                              const u = leftover4d[i];
+                              let did = false;
+                              for (let j = 0; j < (map4d.supports || []).length; j++) {
+                                const sup = map4d.supports[j];
+                                const s = csPackV2TryStackSeat(u, sup, {
+                                  envelope: pack4d.envelope,
+                                  placedBoxes: boxes4d,
+                                });
+                                if (!s || !s.ok) {
+                                  if (s && s.reason)
+                                    commitReasons[s.reason] = (commitReasons[s.reason] || 0) + 1;
+                                  continue;
+                                }
+                                const cm = csPackV2CommitStackSeat(u, s, sup, {
+                                  envelope: pack4d.envelope,
+                                  placedBoxes: boxes4d,
+                                });
+                                if (cm && cm.ok && cm.placement) {
+                                  commitOk++;
+                                  did = true;
+                                  const pl = cm.placement;
+                                  if (+sup.topY > 0 && +pl.y === 0) badFloorY++;
+                                  if (pl.role !== 'nest_stack' || pl.layer !== 'stack')
+                                    badRole++;
+                                  for (let k = 0; k < boxes4d.length; k++) {
+                                    if (csPackV2BoxesOverlap(pl.box, boxes4d[k]))
+                                      digOverlap4d++;
+                                  }
+                                  if (commitSamples.length < 8) {
+                                    commitSamples.push({
+                                      mark: u.mark || null,
+                                      supportMark: sup.mark || null,
+                                      y: +pl.y,
+                                      minY: pl.box ? +pl.box.minY : null,
+                                      topY: +sup.topY,
+                                      role: pl.role,
+                                      layer: pl.layer,
+                                      onSupport: !!(pl.inspect && pl.inspect.design
+                                        && pl.inspect.design.onSupport),
+                                    });
+                                  }
+                                  // Don't mutate boxes for probe of other units —
+                                  // 4e will do sequential commits. One success per unit.
+                                  break;
+                                }
+                                commitFail++;
+                                if (cm && cm.reason)
+                                  commitReasons[cm.reason] = (commitReasons[cm.reason] || 0) + 1;
+                              }
+                              if (!did) { /* leftover without commit — ok for probe */ }
+                            }
+                            step4d = {
+                              ok: self4d.ok !== false && badFloorY === 0
+                                && badRole === 0 && digOverlap4d === 0,
+                              selfTest: self4d,
+                              supportCount: map4d.supportCount || 0,
+                              leftoverNestCount: leftover4d.length,
+                              commitOk: commitOk,
+                              commitFail: commitFail,
+                              badFloorY: badFloorY,
+                              badRole: badRole,
+                              digOverlap: digOverlap4d,
+                              rejectReasons: commitReasons,
+                              samples: commitSamples,
+                            };
+                          }
+
+                          // Step 4e — PlaceNestStacks pass (probe; wire into PackWithTwins = 4f)
+                          let step4e = { ok: false, error: 'csPackV2PlaceNestStacks missing' };
+                          if (typeof csPackV2PlaceNestStacks === 'function'
+                              && step4d && step4d.ok !== false
+                              && typeof csPackV2PackWithTwins === 'function') {
+                            const spec4e = (typeof rawScene !== 'undefined' && rawScene
+                              && rawScene.containerSpec)
+                              ? rawScene.containerSpec
+                              : { lengthMm: 12000, widthMm: 2438, heightMm: 2690 };
+                            const built4e = (typeof csPackV2BuildUnits === 'function')
+                              ? csPackV2BuildUnits(
+                                (typeof assemblyGroups !== 'undefined' && assemblyGroups) || [],
+                                { containerSpec: spec4e })
+                              : [];
+                            const pack4e = csPackV2PackWithTwins(built4e, {
+                              containerSpec: spec4e, enableStacks: false,
+                            });
+                            const self4e = (typeof csPackV2Step4eSelfTest === 'function')
+                              ? csPackV2Step4eSelfTest() : { ok: true, skipped: true };
+                            const pass4e = csPackV2PlaceNestStacks(built4e, pack4e.placed || [], {
+                              envelope: pack4e.envelope,
+                              containerSpec: spec4e,
+                            });
+                            let digTwin4e = 0;
+                            let floatY4e = 0;
+                            for (let i = 0; i < (pass4e.stacked || []).length; i++) {
+                              const pl = pass4e.stacked[i];
+                              if (!pl || !pl.box) continue;
+                              if (+pl.supportTopY > 0 && +pl.y === 0) floatY4e++;
+                              if (Math.abs(+pl.box.minY - +pl.y) > 0.5) floatY4e++;
+                              for (let j = 0; j < (pack4e.placed || []).length; j++) {
+                                const tw = pack4e.placed[j];
+                                if (!tw || !tw.box) continue;
+                                if ((tw.role === 'twin_wall_hug' || tw.role === 'twin_beside')
+                                    && typeof csPackV2BoxesOverlap === 'function'
+                                    && csPackV2BoxesOverlap(pl.box, tw.box))
+                                  digTwin4e++;
+                              }
+                            }
+                            const unplacedReasons = {};
+                            for (let i = 0; i < (pass4e.stillUnplaced || []).length; i++) {
+                              const r = pass4e.stillUnplaced[i].reason || 'UNKNOWN';
+                              unplacedReasons[r] = (unplacedReasons[r] || 0) + 1;
+                            }
+                            step4e = {
+                              ok: self4e.ok !== false && pass4e.designOk !== false
+                                && floatY4e === 0 && digTwin4e === 0
+                                && pass4e.accounted !== false,
+                              selfTest: self4e,
+                              stackCount: pass4e.stackCount || 0,
+                              leftoverIn: pass4e.leftoverIn || 0,
+                              stillUnplacedCount: pass4e.stillUnplacedCount || 0,
+                              accounted: !!pass4e.accounted,
+                              designOk: !!pass4e.designOk,
+                              allOnSupport: !!pass4e.allOnSupport,
+                              allNoDigIn: !!pass4e.allNoDigIn,
+                              allNoFloorY0: !!pass4e.allNoFloorY0,
+                              floatY: floatY4e,
+                              digTwin: digTwin4e,
+                              unplacedReasons: unplacedReasons,
+                              samples: (pass4e.stacked || []).slice(0, 8).map(p => ({
+                                mark: p.mark || null,
+                                y: +p.y,
+                                minY: p.box ? +p.box.minY : null,
+                                supportTopY: +p.supportTopY,
+                                role: p.role,
+                                supportMark: null,
+                              })),
+                              attemptSample: (pass4e.attempts || []).slice(0, 10).map(a => ({
+                                mark: a.mark || null,
+                                ok: !!a.ok,
+                                reason: a.reason || null,
+                                supportMark: a.supportMark || null,
+                                y: a.y != null ? +a.y : null,
+                                sameFamily: a.sameFamily != null ? !!a.sameFamily : null,
+                              })),
+                            };
+                          }
+
+                          // Step 4f — wired PackWithTwins+stacks + full Step4 suite
+                          let step4 = { ok: false, error: 'csPackV2PackWithTwins missing' };
+                          if (typeof csPackV2PackWithTwins === 'function'
+                              && step4e && step4e.ok !== false) {
+                            const spec4f = (typeof rawScene !== 'undefined' && rawScene
+                              && rawScene.containerSpec)
+                              ? rawScene.containerSpec
+                              : { lengthMm: 12000, widthMm: 2438, heightMm: 2690 };
+                            const built4f = (typeof csPackV2BuildUnits === 'function')
+                              ? csPackV2BuildUnits(
+                                (typeof assemblyGroups !== 'undefined' && assemblyGroups) || [],
+                                { containerSpec: spec4f })
+                              : [];
+                            const self4 = (typeof csPackV2Step4SelfTest === 'function')
+                              ? csPackV2Step4SelfTest() : { ok: true, skipped: true };
+                            const packOff = csPackV2PackWithTwins(built4f, {
+                              containerSpec: spec4f, enableStacks: false,
+                            });
+                            const packOn = csPackV2PackWithTwins(built4f, {
+                              containerSpec: spec4f, enableStacks: true,
+                            });
+                            const stackItems = (packOn.placed || []).filter(p =>
+                              p && (p.role === 'nest_stack' || p.layer === 'stack'));
+                            const floorItems = (packOn.placed || []).filter(p =>
+                              p && p.role !== 'nest_stack' && p.layer !== 'stack');
+                            let floatY4f = 0;
+                            let digPair = 0;
+                            let digTwin4f = 0;
+                            for (let i = 0; i < stackItems.length; i++) {
+                              const pl = stackItems[i];
+                              if (!pl.box) continue;
+                              if (!(+pl.y > 0) && !(+pl.supportTopY === 0)) floatY4f++;
+                              if (Math.abs(+pl.box.minY - +pl.y) > 0.5) floatY4f++;
+                            }
+                            for (let i = 0; i < (packOn.placed || []).length; i++) {
+                              const a = packOn.placed[i];
+                              if (!a || !a.box) continue;
+                              for (let j = i + 1; j < packOn.placed.length; j++) {
+                                const b = packOn.placed[j];
+                                if (!b || !b.box) continue;
+                                if (typeof csPackV2BoxesOverlap === 'function'
+                                    && csPackV2BoxesOverlap(a.box, b.box))
+                                  digPair++;
+                              }
+                              if (a.role === 'nest_stack' || a.layer === 'stack') {
+                                for (let j = 0; j < packOn.placed.length; j++) {
+                                  const tw = packOn.placed[j];
+                                  if (!tw || !tw.box) continue;
+                                  if ((tw.role === 'twin_wall_hug' || tw.role === 'twin_beside')
+                                      && typeof csPackV2BoxesOverlap === 'function'
+                                      && csPackV2BoxesOverlap(a.box, tw.box))
+                                    digTwin4f++;
+                                }
+                              }
+                            }
+                            const accounted4f = packOn.placedCount + packOn.unplacedCount
+                              === built4f.length;
+                            const improved = packOn.placedCount >= packOff.placedCount
+                              && (packOn.stackCount || 0)
+                                === Math.max(0, packOn.placedCount - packOff.placedCount);
+                            const twinAsStackSup = stackItems.filter(p =>
+                              p.supportUid != null
+                              && (packOn.placed || []).some(t =>
+                                t && t._fmUid === p.supportUid
+                                && (t.role === 'twin_wall_hug' || t.role === 'twin_beside'))).length;
+                            step4 = {
+                              ok: self4.ok !== false && packOn.ok !== false
+                                && packOn.stackDesignOk !== false
+                                && packOn.allFloorY0 && packOn.allNoOverlap
+                                && floatY4f === 0 && digPair === 0 && digTwin4f === 0
+                                && twinAsStackSup === 0 && accounted4f && improved,
+                              selfTest: self4,
+                              enableStacks: !!packOn.enableStacks,
+                              unitCount: built4f.length,
+                              placedFloorOnly: packOff.placedCount || 0,
+                              placedWithStacks: packOn.placedCount || 0,
+                              unplacedCount: packOn.unplacedCount || 0,
+                              stackCount: packOn.stackCount || 0,
+                              stackLeftoverIn: packOn.stackLeftoverIn || 0,
+                              stackStillUnplaced: packOn.stackStillUnplacedCount || 0,
+                              feasiblePlaceRate: packOn.feasiblePlaceRate,
+                              allFloorY0: !!packOn.allFloorY0,
+                              allStacksOnSupport: !!packOn.allStacksOnSupport,
+                              allNoOverlap: !!packOn.allNoOverlap,
+                              stackNoTwinDig: packOn.stackNoTwinDig !== false,
+                              stackDesignOk: packOn.stackDesignOk !== false,
+                              floatY: floatY4f,
+                              digPair: digPair,
+                              digTwin: digTwin4f,
+                              twinAsStackSupport: twinAsStackSup,
+                              accounted: accounted4f,
+                              improved: improved,
+                              floorItemCount: floorItems.length,
+                              stackItemCount: stackItems.length,
+                              samples: stackItems.slice(0, 10).map(p => ({
+                                mark: p.mark || null,
+                                y: +p.y,
+                                minY: p.box ? +p.box.minY : null,
+                                supportTopY: +p.supportTopY,
+                                supportUid: p.supportUid != null ? p.supportUid : null,
+                                role: p.role,
+                                layer: p.layer,
+                              })),
+                            };
+                          }
+
+                          // Step 5 — Optimise report + soak gates (float/dig/twins/stacks)
+                          let step5 = { ok: false, error: 'csPackV2BuildPackReport missing' };
+                          if (typeof csPackV2BuildPackReport === 'function'
+                              && step4 && step4.ok !== false) {
+                            const spec5 = (typeof rawScene !== 'undefined' && rawScene
+                              && rawScene.containerSpec)
+                              ? rawScene.containerSpec
+                              : { lengthMm: 12000, widthMm: 2438, heightMm: 2690 };
+                            const built5 = (typeof csPackV2BuildUnits === 'function')
+                              ? csPackV2BuildUnits(
+                                (typeof assemblyGroups !== 'undefined' && assemblyGroups) || [],
+                                { containerSpec: spec5, checkedOnly: false })
+                              : [];
+                            // Fast 5f on fixtures (skip nested 5e/4 — those already ran above)
+                            const self5f = (typeof csPackV2Step5fSelfTest === 'function')
+                              ? csPackV2Step5fSelfTest({ skipRegression: true })
+                              : { ok: true, skipped: true };
+                            const opt5 = (typeof csPackV2RunOptimise === 'function')
+                              ? csPackV2RunOptimise({
+                                  units: built5,
+                                  containerSpec: spec5,
+                                  enableStacks: true,
+                                })
+                              : null;
+                            const opt5off = (typeof csPackV2RunOptimise === 'function')
+                              ? csPackV2RunOptimise({
+                                  units: built5,
+                                  containerSpec: spec5,
+                                  enableStacks: false,
+                                })
+                              : null;
+                            const report5 = (opt5 && opt5.report)
+                              ? opt5.report
+                              : csPackV2BuildPackReport(opt5 || packOn || null);
+                            const soak5 = (typeof csPackV2SoakInspect === 'function' && opt5)
+                              ? csPackV2SoakInspect(opt5, {
+                                  containerSpec: spec5,
+                                  floorOnly: opt5off && opt5off.pack,
+                                })
+                              : { ok: false, error: 'soak_missing' };
+                            try {
+                              if (typeof csPackV2PublishPackReport === 'function' && report5)
+                                csPackV2PublishPackReport(report5, { updateDom: false });
+                            } catch (_) { /* */ }
+                            const matchStep4 = !!(report5
+                              && step4.placedWithStacks === report5.placedCount
+                              && step4.stackCount === report5.stackCount
+                              && step4.unplacedCount === report5.unplacedCount);
+                            const applyOk = !!(opt5 && opt5.apply
+                              && opt5.apply.missed === 0
+                              && opt5.placedItems
+                              && opt5.placedItems.length === report5.placedCount);
+                            const twinOk = !report5.twinPlacedCount
+                              || (report5.twinHugCount >= 1 && soak5.twinHugOk);
+                            const stackOk = !report5.stackCount
+                              || (soak5.stacksElevated && soak5.stackCount === report5.stackCount);
+                            step5 = {
+                              ok: self5f.ok !== false
+                                && report5 && report5.ok !== false
+                                && soak5 && soak5.ok !== false
+                                && soak5.floatCount === 0
+                                && soak5.digCount === 0
+                                && soak5.digTwin === 0
+                                && matchStep4 && applyOk
+                                && twinOk && stackOk
+                                && report5.gates
+                                && report5.gates.allFloorY0
+                                && report5.gates.allNoOverlap
+                                && report5.gates.stackNoTwinDig,
+                              selfTest: {
+                                ok: self5f.ok !== false,
+                                passed: self5f.passed,
+                                total: self5f.total,
+                                skipped: !!self5f.skipped,
+                                mode: 'step5f_fast',
+                              },
+                              unitCount: built5.length,
+                              soak: {
+                                ok: soak5.ok,
+                                summary: soak5.summary,
+                                floatCount: soak5.floatCount,
+                                digCount: soak5.digCount,
+                                digTwin: soak5.digTwin,
+                                twinHugOk: soak5.twinHugOk,
+                                twinHugCount: soak5.twinHugCount,
+                                twinBesideCount: soak5.twinBesideCount,
+                                stackCount: soak5.stackCount,
+                                stacksElevated: soak5.stacksElevated,
+                                improved: soak5.improved,
+                                accounted: soak5.accounted,
+                                placedFloorOnly: opt5off ? opt5off.pack.placedCount : null,
+                                placedWithStacks: opt5 ? opt5.pack.placedCount : null,
+                              },
+                              report: report5 ? {
+                                ok: report5.ok,
+                                summary: report5.summary,
+                                placedCount: report5.placedCount,
+                                unplacedCount: report5.unplacedCount,
+                                twinPlacedCount: report5.twinPlacedCount,
+                                twinHugCount: report5.twinHugCount,
+                                twinBesideCount: report5.twinBesideCount,
+                                stackCount: report5.stackCount,
+                                floorCount: report5.floorCount,
+                                longNestPlacedCount: report5.longNestPlacedCount,
+                                hasSideStrip: report5.hasSideStrip,
+                                stripReserveMm: report5.stripReserveMm,
+                                enableStacks: report5.enableStacks,
+                                leftoverByReason: report5.leftoverByReason,
+                                leftovers: (report5.leftovers || []).slice(0, 25),
+                                gates: report5.gates,
+                                weightKg: report5.weightKg,
+                                weightUtilizationPct: report5.weightUtilizationPct,
+                              } : null,
+                              matchStep4: matchStep4,
+                              applyOk: applyOk,
+                              twinOk: twinOk,
+                              stackOk: stackOk,
+                              toast: (opt5 && opt5.toast) || (report5 && report5.toast) || null,
+                            };
+                          }
+
+                          window.__cliGroupReport = {
+                            ok: selfTest.ok !== false && fatNests.length === 0
+                              && yardOk && step2a.ok !== false && step2b.ok !== false
+                              && step2c.ok !== false && step2d.ok !== false
+                              && step2e.ok !== false && step2f.ok !== false
+                              && step3a.ok !== false && step3b.ok !== false
+                              && step3c.ok !== false && step3d.ok !== false
+                              && step3e.ok !== false && step3.ok !== false
+                              && step4a.ok !== false && step4b.ok !== false
+                              && step4c.ok !== false && step4d.ok !== false
+                              && step4e.ok !== false && step4.ok !== false
+                              && step5.ok !== false,
+                            mode: 'group_yard_step2_plus_step3_plus_step4_plus_step5f',
+                            groupCount: groups.length,
+                            outsideCount: outs.length,
+                            selfTest: selfTest,
+                            nestUnitCount: nestUnits.length,
+                            fatNestCount: fatNests.length,
+                            fatNests: fatNests.slice(0, 20),
+                            shortLenCount: shortLen.length,
+                            shortLen: shortLen.slice(0, 15),
+                            nestSample: nestUnits.slice(0, 25),
+                            step2a: step2a,
+                            step2b: step2b,
+                            step2c: step2c,
+                            step2d: step2d,
+                            step2e: step2e,
+                            step2f: step2f,
+                            step3a: step3a,
+                            step3b: step3b,
+                            step3c: step3c,
+                            step3d: step3d,
+                            step3e: step3e,
+                            step3: step3,
+                            step4a: step4a,
+                            step4b: step4b,
+                            step4c: step4c,
+                            step4d: step4d,
+                            step4e: step4e,
+                            step4: step4,
+                            step5: step5,
+                            yard: {
+                              floatCount: floats.length,
+                              floats: floats.slice(0, 25),
+                              tipWarnNestCount: tipWarnNest.length,
+                              tipWarnNests: tipWarnNest.slice(0, 25),
+                              tipWarnAsmCount: tipWarnAsm.length,
+                              tipWarnAsms: tipWarnAsm.slice(0, 25),
+                              overlapCount: overlaps.length,
+                              nestOverlapCount: nestOverlaps.length,
+                              overlaps: overlaps.slice(0, 30),
                             },
-                            packStrategy: (typeof currentLayout !== 'undefined'
-                              && currentLayout && currentLayout.packStrategy)
-                              || (window.__lastPackStrategy || null),
-                            foremanReport: (typeof currentLayout !== 'undefined'
-                              && currentLayout && currentLayout.foremanReport)
-                              || (window.__foremanLast && window.__foremanLast.report)
-                              || null,
-                            packPasses: (typeof currentLayout !== 'undefined'
-                              && currentLayout && currentLayout.packPasses)
-                              || null,
-                            foremanLast: window.__foremanLast || null,
-                            braceClickable: braceLike.slice(0, 20),
-                            braceGroups: braceGroups.slice(0, 20),
-                            rf012Clickable: rf012,
-                            rf012Groups: groups,
-                            rf012Scene: sceneRf,
-                            rf012Placed: placedRf,
-                            rf012Oversized: overRf,
-                            unitProbe: unitProbe,
-                            braceProbe: braceProbe,
-                            widthExceedsCount: widthExceeds.length,
-                            outsideSample: outside.slice(0, 15),
+                            groups: groups.slice(0, 80).map(g => ({
+                              mark: g.mark || null,
+                              groupKind: g.groupKind || null,
+                              qty: g.qty || 0,
+                              state: g.state || null,
+                              weightKg: g.sortWeightKg || g.weightKg || 0,
+                              packUnits: (g.packUnits || []).length,
+                            })),
                           };
                         } catch (e) {
-                          window.__cliPackReport = {
+                          window.__cliGroupReport = {
                             ok: false,
                             error: String(e && e.message || e),
                           };
                         } finally {
-                          window.__cliPackBusy = false;
+                          window.__cliGroupBusy = false;
                         }
                       })();
                       return 'started';
                     })()
                     """);
-                string packJson = "{\"ok\":false,\"error\":\"pack report timeout\"}";
-                for (int i = 0; i < 150; i++) // up to ~5 min for large IFC best-of pack
+                string groupJson = "{\"ok\":false,\"error\":\"group report timeout\"}";
+                for (int i = 0; i < 180; i++) // up to ~3 min (large IFC Group By)
                 {
-                    await Task.Delay(2000);
+                    await Task.Delay(1000);
                     string probe = await webView.CoreWebView2.ExecuteScriptAsync(
-                        "window.__cliPackReport ? JSON.stringify(window.__cliPackReport) : (window.__cliPackBusy ? '\"BUSY\"' : 'null')");
+                        "window.__cliGroupReport ? JSON.stringify(window.__cliGroupReport) : (window.__cliGroupBusy ? '\"BUSY\"' : 'null')");
                     string? probeVal = null;
                     try { probeVal = JsonSerializer.Deserialize<string>(probe); } catch { /* */ }
                     if (probeVal == "BUSY" || probeVal == null) continue;
                     if (!string.IsNullOrWhiteSpace(probeVal) && probeVal.StartsWith('{'))
                     {
-                        packJson = probeVal;
+                        groupJson = probeVal;
                         break;
                     }
                 }
                 try
                 {
-                    string reportPath = Path.Combine(AppContext.BaseDirectory, "_ifc_pack_report.json");
-                    await File.WriteAllTextAsync(reportPath, packJson);
+                    await File.WriteAllTextAsync(
+                        Path.Combine(AppContext.BaseDirectory, "_ifc_group_report.json"),
+                        groupJson);
                 }
-                catch (Exception rex)
-                {
-                    try
-                    {
-                        await File.WriteAllTextAsync(
-                            Path.Combine(AppContext.BaseDirectory, "_ifc_pack_report.json"),
-                            $"{{\"ok\":false,\"error\":{JsonSerializer.Serialize(rex.Message)}}}");
-                    }
-                    catch { /* */ }
-                }
+                catch { /* */ }
                 lblStatus.Text = $"{job.JobNo}  |  {phaseText}  |  {items.Count} assemblies " +
-                                  $"({skipped} skipped), {Math.Round(totalWeight, 1)} kg  |  Optimised";
+                                  $"({skipped} skipped), {Math.Round(totalWeight, 1)} kg  |  Grouped";
             }
         }
         catch (Exception ex)
@@ -842,7 +2233,7 @@ public class MainForm : Form
         try
         {
             string json = File.ReadAllText(dialog.FileName);
-            using var doc = JsonDocument.Parse(json); // validate it's actually JSON before pushing to the browser
+            using var doc = JsonDocument.Parse(json);
 
             await PushSceneJsonAsync(json);
 
@@ -897,10 +2288,6 @@ public class MainForm : Form
         }
     }
 
-    /// <summary>
-    /// Large scenes: write JSON once and let the viewer fetch it via virtual host.
-    /// Avoids double-escaping megabytes of mesh data through ExecuteScriptAsync.
-    /// </summary>
     private async Task PushSceneToViewerAsync(RawScene scene)
     {
         string json = await Task.Run(() => JsonSerializer.Serialize(scene, new JsonSerializerOptions
@@ -923,7 +2310,6 @@ public class MainForm : Form
         string cachePath = Path.Combine(AppContext.BaseDirectory, "_scene_cache.json");
         await File.WriteAllTextAsync(cachePath, json);
 
-        // Bust cache so a second load always re-fetches
         string url = "https://steel.local/_scene_cache.json?t=" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         string js = $"loadSceneFromUrl({JsonSerializer.Serialize(url)})";
         await webView.CoreWebView2.ExecuteScriptAsync(js);

@@ -226,14 +226,91 @@ function renderContainer(idx) {
         packYawOnly: true,
       };
     }
-    const box = makeShape(shapeIt, color);
-    box.position.set(it.x * SCALE, it.y * SCALE, it.z * SCALE);
-    // Exact Group By orientation first, then packer yaw only
-    if (typeof applyGroupByFrozenQuat === 'function')
-      applyGroupByFrozenQuat(box, it);
-    applyPackItemRotation(box, shapeIt);
+    // Twin rafters: real IFC mesh, forced upright to pack footprint (L×H×W).
+    // Proxy box only if align cannot reach steel W×H (pitched IFC leftover).
+    let box;
+    const pairLane = !!(it._pairLaneLock || it._pairPreferIfcMesh
+      || /rafter_pair/i.test(String(it.packOrientTag || '')));
+    if (pairLane && typeof THREE !== 'undefined') {
+      const L = Math.max(+it.packFootprintL || +it.l || +it.lengthMm || 1000, 100);
+      const H = Math.max(
+        +(it.stableBundleMm && it.stableBundleMm.h)
+        || +it.packFootprintH || +it.h || +it.heightMm || 500, 50);
+      const W = Math.max(+it._pairVisW
+        || (it.stableBundleMm && +it.stableBundleMm.w)
+        || 200, 80);
+      // Build real IFC assembly (skip nest-keep reshape that zeros parts)
+      const ifcIt = {
+        ...it,
+        _keepGroupByBundle: false,
+        _skipStability: true,
+        _yardStraighten: true,
+        assemblyShipPose: true,
+        packYawOnly: true,
+        packFootprintL: L,
+        packFootprintW: W,
+        packFootprintH: H,
+        qty: 1,
+      };
+      box = makeShape(ifcIt, color);
+      // Ship-prep upright, then ALWAYS align to packer L×H×W (steel seat)
+      if (typeof csShipPrepMesh === 'function') {
+        try { csShipPrepMesh(box, ifcIt); }
+        catch (_) { /* */ }
+      }
+      {
+        const prevL = it.packFootprintL, prevW = it.packFootprintW, prevH = it.packFootprintH;
+        it.packFootprintL = L; it.packFootprintW = W; it.packFootprintH = H;
+        if (typeof alignMeshToPackFootprint === 'function')
+          alignMeshToPackFootprint(box, it);
+        it.packFootprintL = prevL; it.packFootprintW = prevW; it.packFootprintH = prevH;
+      }
+      const yaw = (it.userRot && it.userRot.y) || 0;
+      if (Math.abs(yaw) > 1e-9) {
+        box.quaternion.premultiply(
+          new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw));
+        box.rotation.setFromQuaternion(box.quaternion);
+      }
+      box.updateMatrixWorld(true);
+      let bb0 = new THREE.Box3().setFromObject(box);
+      const sc0 = SCALE;
+      let meshW0 = (bb0.max.z - bb0.min.z) / sc0;
+      let meshH0 = (bb0.max.y - bb0.min.y) / sc0;
+      // Stiffeners / end plates can fatten W; keep IFC if web height is upright
+      const uprightOk = meshH0 >= H * 0.55 && meshH0 <= H * 1.65
+        && meshW0 <= Math.max(W * 3.8, 720) && meshW0 < meshH0 * 1.15;
+      if (!uprightOk && typeof makeBox === 'function') {
+        box = makeBox(L, H, W, color, 0.92);
+        if (Math.abs(yaw) > 1e-9) {
+          box.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+          box.rotation.setFromQuaternion(box.quaternion);
+        }
+        it._pairUsedBoxProxy = true;
+      } else {
+        it._pairUsedBoxProxy = false;
+      }
+      it._orientLocked = true;
+      it._lockedQuaternion = box.quaternion.clone();
+      it._keepGroupByBundle = false;
+      it._pairVisW = W;
+    } else {
+      box = makeShape(shapeIt, color);
+      if (typeof applyGroupByFrozenQuat === 'function')
+        applyGroupByFrozenQuat(box, it);
+      applyPackItemRotation(box, shapeIt);
+      if (shapeIt._keepGroupByBundle || shapeIt._freezeGroupByPose || it._groupByQuat) {
+        it._keepGroupByBundle = !!shapeIt._keepGroupByBundle;
+        it._orientLocked = true;
+        if (typeof THREE !== 'undefined')
+          it._lockedQuaternion = box.quaternion.clone();
+      }
+    }
+    const seatX = it._packerSeatX0 != null ? it._packerSeatX0
+      : (it._packerSeatX != null ? it._packerSeatX : it.x);
+    const seatZ = it._packerSeatZ0 != null ? it._packerSeatZ0
+      : (it._packerSeatZ != null ? it._packerSeatZ : it.z);
+    box.position.set(seatX * SCALE, (it.y || 0) * SCALE, seatZ * SCALE);
     snapMeshToPackerFootY(box, it);
-    // Real floor contact — prefer live mesh minY (fh can mismatch plates)
     if (typeof isFloorCargoItem === 'function' ? isFloorCargoItem(it)
         : (it.floorAnchor || it.y == null
           || (it.packFootprintH > 0 && it.y <= it.packFootprintH * 0.55))) {
@@ -242,12 +319,6 @@ function renderContainer(idx) {
     scene.add(box);
     const sid = it.stagingGroupId || findStagingIdForUnit(it);
     if (sid && !it.stagingGroupId) it.stagingGroupId = sid;
-    if (shapeIt._keepGroupByBundle || shapeIt._freezeGroupByPose || it._groupByQuat) {
-      it._keepGroupByBundle = !!shapeIt._keepGroupByBundle;
-      it._orientLocked = true;
-      if (typeof THREE !== 'undefined')
-        it._lockedQuaternion = box.quaternion.clone();
-    }
     clickable.push({ mesh: box, item: it, stagingGroupId: sid || null });
     pieceCount += it.qty;
   });
@@ -275,6 +346,10 @@ function renderContainer(idx) {
       snapMeshToPackerFootY(c.mesh, c.item);
     });
   }
+
+  // Absolute last: immutable packer seats + clear mesh dig-in for twin lanes
+  if (inside.length && typeof forceImmutablePackerLaneSeats === 'function')
+    forceImmutablePackerLaneSeats(inside, cont);
 
   if (idx === 0 && currentLayout.oversized && currentLayout.oversized.length) {
     // Items outside container — render with REAL shapes (makeShape), not plain boxes.
@@ -1443,7 +1518,8 @@ function resolveAabbOverlaps(entries) {
   const eps = 1e-4;
   const scR = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.01;
   const floorBand = 400 * scR; // ~400mm — both near floor → prefer XZ, not Y float
-  for (let pass = 0; pass < 16; pass++) {
+  // More passes: packPoseLock cargo still digs into neighbors after nail/tip-level
+  for (let pass = 0; pass < 24; pass++) {
     let moved = false;
     const boxes = entries.map(e => {
       e.mesh.updateMatrixWorld(true);
@@ -1456,6 +1532,7 @@ function resolveAabbOverlaps(entries) {
         const ox = Math.min(a.max.x, b.max.x) - Math.max(a.min.x, b.min.x);
         const oy = Math.min(a.max.y, b.max.y) - Math.max(a.min.y, b.min.y);
         const oz = Math.min(a.max.z, b.max.z) - Math.max(a.min.z, b.min.z);
+        // Touch OK (flush); only separate real dig-in
         if (ox <= eps || oy <= eps || oz <= eps) continue;
 
         const bothFloor = a.min.y < floorBand && b.min.y < floorBand;
@@ -2198,6 +2275,8 @@ function alignMeshToPackFootprint(mesh, it) {
   const tol = Math.max(80, Math.min(tL, tW, tH) * 0.08);
   const wantFlat = typeof packItemNeedsFlatAlign === 'function'
     && packItemNeedsFlatAlign(it);
+  // Twin / ship-prep rafters: tall thin footprint — punish pitched-flat hard
+  const wantUpright = !wantFlat && tH > tW * 2.2 && tH > 800;
 
   const measure = () => {
     mesh.updateMatrixWorld(true);
@@ -2213,6 +2292,11 @@ function alignMeshToPackFootprint(mesh, it) {
     const eL = Math.abs(d[0] - target[0]);
     const eH = Math.abs(d[1] - target[1]);
     const eW = Math.abs(d[2] - target[2]);
+    if (wantUpright) {
+      const fatPen = Math.max(0, d[2] - tW * 1.6) * 24;
+      const shortPen = Math.max(0, tH * 0.65 - d[1]) * 30;
+      return eH * 5 + eW * 8 + eL + fatPen + shortPen;
+    }
     if (!wantFlat) return eL + eH + eW;
     const tallPen = Math.max(0, d[1] - target[1]) * 14
       + Math.max(0, d[1] - Math.min(tL, tW, tH) * 1.35) * 20;
@@ -2398,11 +2482,137 @@ function yardItemWeightKg(it) {
  *  3) Separate mesh AABB overlaps
  *  4) Clamp inside walls; write world pose back to item
  */
+/**
+ * Final authority for twin / foreman floor seats.
+ * Uses immutable _packerSeat* and pushes meshes apart until AABBs clear.
+ */
+function forceImmutablePackerLaneSeats(entries, cont) {
+  if (!entries || !entries.length || typeof THREE === 'undefined') return;
+  const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.001;
+  const halfW = (((cont && cont.widthMm) || 2438) * sc) / 2;
+  const gapM = 0.05;
+  const list = entries.filter(e => e && e.mesh && e.item && !e.outsideContainer);
+  // ONLY twin-rafter lanes — never all items that happen to have a seat stamp
+  const locked = list.filter(c => {
+    const it = c.item;
+    return !!(it._pairLaneLock || it._pairPreferIfcMesh || it._usePackFootprintProxy
+      || /rafter_pair/i.test(String(it.packOrientTag || '')));
+  });
+  if (locked.length < 1) return;
+
+  function seatCenter(mesh, xMm, zMm) {
+    mesh.position.x = xMm * sc;
+    mesh.position.z = zMm * sc;
+    mesh.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(mesh);
+    if (!isFinite(box.min.x)) return;
+    mesh.position.x += (xMm * sc) - (box.min.x + box.max.x) * 0.5;
+    mesh.position.z += (zMm * sc) - (box.min.z + box.max.z) * 0.5;
+    mesh.updateMatrixWorld(true);
+  }
+
+  locked.forEach(c => {
+    const it = c.item;
+    // Prefer frozen original seats (never corrupted by fat-mesh shove)
+    const x = it._packerSeatX0 != null ? Number(it._packerSeatX0)
+      : (it._packerSeatX != null ? Number(it._packerSeatX) : Number(it.x) || 0);
+    const z = it._packerSeatZ0 != null ? Number(it._packerSeatZ0)
+      : (it._packerSeatZ != null ? Number(it._packerSeatZ) : Number(it.z) || 0);
+    if (it._lockedQuaternion) {
+      c.mesh.quaternion.copy(it._lockedQuaternion);
+      c.mesh.rotation.setFromQuaternion(c.mesh.quaternion);
+    }
+    seatCenter(c.mesh, x, z);
+    if (typeof nailMeshToGroundY === 'function') nailMeshToGroundY(c.mesh, 0);
+    it.x = x;
+    it.z = z;
+    it._packerSeatX = x;
+    it._packerSeatZ = z;
+  });
+
+  locked.sort((a, b) => {
+    const za = a.item._packerSeatZ0 != null ? a.item._packerSeatZ0
+      : (a.item._packerSeatZ != null ? a.item._packerSeatZ : (a.item.z || 0));
+    const zb = b.item._packerSeatZ0 != null ? b.item._packerSeatZ0
+      : (b.item._packerSeatZ != null ? b.item._packerSeatZ : (b.item.z || 0));
+    return za - zb;
+  });
+  for (let pass = 0; pass < 8; pass++) {
+    let moved = false;
+    for (let i = 0; i < locked.length; i++) {
+      for (let j = i + 1; j < locked.length; j++) {
+        const A = locked[i], B = locked[j];
+        A.mesh.updateMatrixWorld(true);
+        B.mesh.updateMatrixWorld(true);
+        const ba = new THREE.Box3().setFromObject(A.mesh);
+        let bb = new THREE.Box3().setFromObject(B.mesh);
+        const ox = Math.min(ba.max.x, bb.max.x) - Math.max(ba.min.x, bb.min.x);
+        const oy = Math.min(ba.max.y, bb.max.y) - Math.max(ba.min.y, bb.min.y);
+        const oz = Math.min(ba.max.z, bb.max.z) - Math.max(ba.min.z, bb.min.z);
+        if (!(ox > 0.02 && oy > 0.02 && oz > 0.02)) continue;
+        const need = (ba.max.z + gapM) - bb.min.z;
+        if (need <= 0) continue;
+        B.mesh.position.z += need;
+        B.mesh.updateMatrixWorld(true);
+        bb = new THREE.Box3().setFromObject(B.mesh);
+        if (bb.max.z > halfW - 0.002) {
+          B.mesh.position.z -= (bb.max.z - (halfW - 0.002));
+          B.mesh.updateMatrixWorld(true);
+          bb = new THREE.Box3().setFromObject(B.mesh);
+        }
+        if (typeof nailMeshToGroundY === 'function') nailMeshToGroundY(B.mesh, 0);
+        // Update live item.z for display — do NOT clobber _packerSeatZ0
+        const cz = ((bb.min.z + bb.max.z) * 0.5) / sc;
+        B.item.z = cz;
+        B.item._packerSeatZ = cz;
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+  try {
+    console.info('[LANE-SEAT] z0='
+      + locked.map(c => Math.round(
+        c.item._packerSeatZ0 != null ? c.item._packerSeatZ0 : c.item.z || 0
+      )).join(',')
+      + ' meshZ='
+      + locked.map(c => {
+        c.mesh.updateMatrixWorld(true);
+        const b = new THREE.Box3().setFromObject(c.mesh);
+        return Math.round(((b.min.z + b.max.z) * 0.5) / sc);
+      }).join(','));
+  } catch (_) { /* */ }
+}
+
 function yardSettlePackedMeshes(entries, cont) {
   if (!entries || !entries.length || typeof THREE === 'undefined') return;
   const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.001;
   const list = entries.filter(e => e && e.mesh && e.item && !e.outsideContainer);
   if (!list.length) return;
+
+  function yardLaneLocked(it) {
+    if (!it) return false;
+    // Twin rafter lanes only — never lock every stamped seat
+    if (it._pairLaneLock || it._pairPreferIfcMesh || it._usePackFootprintProxy)
+      return true;
+    if (/rafter_pair/i.test(String(it.packOrientTag || ''))) return true;
+    return false;
+  }
+
+  // Snapshot IMMUTABLE packer seats (prefer Z0/X0)
+  const packerXZ = new Map();
+  list.forEach(c => {
+    const it = c.item;
+    const sx = it._packerSeatX0 != null ? Number(it._packerSeatX0)
+      : (it._packerSeatX != null ? Number(it._packerSeatX) : Number(it.x) || 0);
+    const sz = it._packerSeatZ0 != null ? Number(it._packerSeatZ0)
+      : (it._packerSeatZ != null ? Number(it._packerSeatZ) : Number(it.z) || 0);
+    packerXZ.set(c, {
+      x: sx,
+      z: sz,
+      lock: yardLaneLocked(it),
+    });
+  });
 
   // Heaviest first — they claim the floor; light goods stack / fill gaps
   list.sort((a, b) => yardItemWeightKg(b.item) - yardItemWeightKg(a.item));
@@ -2457,43 +2667,120 @@ function yardSettlePackedMeshes(entries, cont) {
     }
   });
 
-  // Gravity + overlap on REAL mesh AABBs (ignore packPoseLock)
-  restackWithGravity(list);
-  resolveAabbOverlaps(list);
-  restackWithGravity(list);
-  resolveAabbOverlaps(list);
-  restackWithGravity(list);
-  resolveAabbOverlaps(list);
+  // Gravity / AABB resolve for FILLERS only — lane-locked rafters keep packer XZ
+  const fillers = list.filter(c => !yardLaneLocked(c.item));
+  const lockedLane = list.filter(c => yardLaneLocked(c.item));
+  if (fillers.length) {
+    restackWithGravity(fillers);
+    resolveAabbOverlaps(fillers);
+    restackWithGravity(fillers);
+    resolveAabbOverlaps(fillers);
+  }
+  // Locked: Y only (nail to floor) — never lateral shove into twin
+  lockedLane.forEach(c => {
+    const snap = packerXZ.get(c);
+    if (snap) {
+      c.mesh.position.x = snap.x * sc;
+      c.mesh.position.z = snap.z * sc;
+    }
+    if (typeof nailMeshToGroundY === 'function') nailMeshToGroundY(c.mesh, 0);
+  });
 
   if (cont && typeof clampMeshesInsideContainer === 'function') {
-    clampMeshesInsideContainer(list.map(c => c.mesh), cont);
-  }
-  // Clamp can re-crowd — one more separate + gravity
-  resolveAabbOverlaps(list);
-  restackWithGravity(list);
-
-  // Chronic mesh dig-in after settle → eject lighter piece outside (honest load)
-  yardEjectChronicOverlaps(list, cont);
-  // Supports may have been ejected — drop remaining cargo again (no float)
-  const remain = list.filter(c => !c.outsideContainer);
-  if (remain.length) {
-    restackWithGravity(remain);
-    resolveAabbOverlaps(remain);
-    restackWithGravity(remain);
-    if (cont && typeof clampMeshesInsideContainer === 'function')
-      clampMeshesInsideContainer(remain.map(c => c.mesh), cont);
-    restackWithGravity(remain);
+    // Clamp fillers; re-seat locked after clamp
+    clampMeshesInsideContainer(fillers.map(c => c.mesh), cont);
+    lockedLane.forEach(c => {
+      const snap = packerXZ.get(c);
+      if (!snap) return;
+      c.mesh.position.x = snap.x * sc;
+      c.mesh.position.z = snap.z * sc;
+      if (typeof nailMeshToGroundY === 'function') nailMeshToGroundY(c.mesh, 0);
+    });
   }
 
-  // Yard shove: slide floor cargo toward home corner (min X, min |Z|) for density
-  yardShoveFloorToHome(list.filter(c => !c.outsideContainer), cont);
-  // Shove can re-crowd — separate + gravity once more (no second eject — avoids thrash)
+  // Chronic mesh dig-in → eject fillers only (never eject pair lanes)
+  yardEjectChronicOverlaps(fillers, cont);
   {
-    const afterShove = list.filter(c => !c.outsideContainer);
+    const remain = fillers.filter(c => !c.outsideContainer);
+    if (remain.length) {
+      restackWithGravity(remain);
+      resolveAabbOverlaps(remain);
+      restackWithGravity(remain);
+      if (cont && typeof clampMeshesInsideContainer === 'function')
+        clampMeshesInsideContainer(remain.map(c => c.mesh), cont);
+    }
+  }
+
+  yardShoveFloorToHome(
+    list.filter(c => !c.outsideContainer && !yardLaneLocked(c.item)),
+    cont
+  );
+  {
+    const afterShove = fillers.filter(c => !c.outsideContainer);
     if (afterShove.length) {
       resolveAabbOverlaps(afterShove);
       restackWithGravity(afterShove);
-      resolveAabbOverlaps(afterShove);
+    }
+  }
+
+  // Seat locked meshes so WORLD AABB centre == packer XZ, then clear dig-ins
+  function seatAabbCenterToPacker(mesh, xMm, zMm) {
+    mesh.position.x = xMm * sc;
+    mesh.position.z = zMm * sc;
+    mesh.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(mesh);
+    if (!isFinite(box.min.x)) return;
+    const cx = (box.min.x + box.max.x) * 0.5;
+    const cz = (box.min.z + box.max.z) * 0.5;
+    mesh.position.x += (xMm * sc) - cx;
+    mesh.position.z += (zMm * sc) - cz;
+    mesh.updateMatrixWorld(true);
+  }
+  const halfW = (((cont && cont.widthMm) || 2438) * sc) / 2;
+  const gapM = 0.04; // 40mm visual clear
+  const lockedAlive = lockedLane.filter(c => !c.outsideContainer);
+  lockedAlive.forEach(c => {
+    const snap = packerXZ.get(c);
+    if (!snap) return;
+    seatAabbCenterToPacker(c.mesh, snap.x, snap.z);
+    if (typeof nailMeshToGroundY === 'function') nailMeshToGroundY(c.mesh, 0);
+    c.item.x = snap.x;
+    c.item.z = snap.z;
+  });
+  // Push later twin clear of earlier (by packer Z) until mesh AABBs don't dig in
+  lockedAlive.sort((a, b) => {
+    const za = (packerXZ.get(a) && packerXZ.get(a).z) || 0;
+    const zb = (packerXZ.get(b) && packerXZ.get(b).z) || 0;
+    return za - zb;
+  });
+  for (let i = 0; i < lockedAlive.length; i++) {
+    for (let j = i + 1; j < lockedAlive.length; j++) {
+      const A = lockedAlive[i], B = lockedAlive[j];
+      A.mesh.updateMatrixWorld(true);
+      B.mesh.updateMatrixWorld(true);
+      let ba = new THREE.Box3().setFromObject(A.mesh);
+      let bb = new THREE.Box3().setFromObject(B.mesh);
+      const ox = Math.min(ba.max.x, bb.max.x) - Math.max(ba.min.x, bb.min.x);
+      const oy = Math.min(ba.max.y, bb.max.y) - Math.max(ba.min.y, bb.min.y);
+      const oz = Math.min(ba.max.z, bb.max.z) - Math.max(ba.min.z, bb.min.z);
+      if (!(ox > 0.01 && oy > 0.01 && oz > 0.01)) continue;
+      // Move B in +Z (away from home wall) so bb.min.z = ba.max.z + gap
+      const need = (ba.max.z + gapM) - bb.min.z;
+      if (need > 0) {
+        B.mesh.position.z += need;
+        B.mesh.updateMatrixWorld(true);
+        bb = new THREE.Box3().setFromObject(B.mesh);
+        if (bb.max.z > halfW - 0.002) {
+          B.mesh.position.z -= (bb.max.z - (halfW - 0.002));
+          B.mesh.updateMatrixWorld(true);
+          bb = new THREE.Box3().setFromObject(B.mesh);
+        }
+        if (typeof nailMeshToGroundY === 'function') nailMeshToGroundY(B.mesh, 0);
+        const snapB = packerXZ.get(B);
+        const cz = ((bb.min.z + bb.max.z) * 0.5) / sc;
+        B.item.z = cz;
+        if (snapB) snapB.z = cz;
+      }
     }
   }
 
@@ -2631,15 +2918,63 @@ function yardSettlePackedMeshes(entries, cont) {
   }
   const settled = list.filter(c => !c.outsideContainer);
   if (settled.length) {
-    reseatAfterOrientRestore(settled);
-    reseatAfterOrientRestore(settled);
+    // Orient restore for fillers; locked keep quat already applied at render
+    const settledFill = settled.filter(c => !yardLaneLocked(c.item));
+    if (settledFill.length) {
+      reseatAfterOrientRestore(settledFill);
+      reseatAfterOrientRestore(settledFill);
+    }
   }
-  nailUnsupportedToFloor(settled);
-  restoreLockedOrients(settled);
-  forcePackerFeet(settled);
-  // Absolute last: floor cargo must touch ground (never trust fh/y mismatch)
-  forcePackerFeet(settled);
-  nailUnsupportedToFloor(settled);
+  nailUnsupportedToFloor(settled.filter(c => !yardLaneLocked(c.item)));
+  forcePackerFeet(settled.filter(c => !yardLaneLocked(c.item)));
+
+  // Absolute last: re-seat pair lanes after any filler motion, clear mesh dig-in
+  {
+    const lockedEnd = list.filter(c => !c.outsideContainer && yardLaneLocked(c.item));
+    lockedEnd.forEach(c => {
+      const snap = packerXZ.get(c);
+      if (!snap) return;
+      if (c.item._lockedQuaternion && typeof THREE !== 'undefined') {
+        c.mesh.quaternion.copy(c.item._lockedQuaternion);
+        c.mesh.rotation.setFromQuaternion(c.mesh.quaternion);
+      }
+      seatAabbCenterToPacker(c.mesh, snap.x, snap.z);
+      if (typeof nailMeshToGroundY === 'function') nailMeshToGroundY(c.mesh, 0);
+    });
+    lockedEnd.sort((a, b) => {
+      const za = (packerXZ.get(a) && packerXZ.get(a).z) || 0;
+      const zb = (packerXZ.get(b) && packerXZ.get(b).z) || 0;
+      return za - zb;
+    });
+    for (let i = 0; i < lockedEnd.length; i++) {
+      for (let j = i + 1; j < lockedEnd.length; j++) {
+        const A = lockedEnd[i], B = lockedEnd[j];
+        A.mesh.updateMatrixWorld(true);
+        B.mesh.updateMatrixWorld(true);
+        const ba = new THREE.Box3().setFromObject(A.mesh);
+        let bb = new THREE.Box3().setFromObject(B.mesh);
+        const ox = Math.min(ba.max.x, bb.max.x) - Math.max(ba.min.x, bb.min.x);
+        const oy = Math.min(ba.max.y, bb.max.y) - Math.max(ba.min.y, bb.min.y);
+        const oz = Math.min(ba.max.z, bb.max.z) - Math.max(ba.min.z, bb.min.z);
+        if (!(ox > 0.01 && oy > 0.01 && oz > 0.01)) continue;
+        const need = (ba.max.z + gapM) - bb.min.z;
+        if (need <= 0) continue;
+        B.mesh.position.z += need;
+        B.mesh.updateMatrixWorld(true);
+        bb = new THREE.Box3().setFromObject(B.mesh);
+        if (bb.max.z > halfW - 0.002) {
+          B.mesh.position.z -= (bb.max.z - (halfW - 0.002));
+          B.mesh.updateMatrixWorld(true);
+          bb = new THREE.Box3().setFromObject(B.mesh);
+        }
+        if (typeof nailMeshToGroundY === 'function') nailMeshToGroundY(B.mesh, 0);
+        const snapB = packerXZ.get(B);
+        const cz = ((bb.min.z + bb.max.z) * 0.5) / sc;
+        B.item.z = cz;
+        if (snapB) snapB.z = cz;
+      }
+    }
+  }
 
   // Sync packer records to settled mesh (keeps later Optimise/seed honest)
   list.filter(c => !c.outsideContainer).forEach(c => {
@@ -2650,9 +2985,17 @@ function yardSettlePackedMeshes(entries, cont) {
     const cx = (box.min.x + box.max.x) * 0.5 / sc;
     const cy = (box.min.y + box.max.y) * 0.5 / sc;
     const cz = (box.min.z + box.max.z) * 0.5 / sc;
-    it.x = cx;
-    it.y = cy;
-    it.z = cz;
+    const snap = packerXZ.get(c);
+    if (snap && snap.lock) {
+      // Keep lane XZ (may have been nudged clear of twin); Y from live mesh
+      it.x = snap.x;
+      it.z = snap.z;
+      it.y = cy;
+    } else {
+      it.x = cx;
+      it.y = cy;
+      it.z = cz;
+    }
     // Do NOT overwrite packer footprints from pitched mesh AABB when orient-locked
     if (!it._orientLocked && !it.packOrientTag) {
       it.packFootprintL = (box.max.x - box.min.x) / sc;
@@ -2994,20 +3337,29 @@ function applyPackItemRotation(mesh, it) {
  * Pack place theatre: show only final seats (commit) one-by-one.
  * No orient / rotate / slot-try ghost — user only sees placed pieces.
  */
-async function animatePackPlacementReveal(packedContainers, keepOutside, placementSteps) {
+async function animatePackPlacementReveal(packedContainers, keepOutside, placementSteps, packMeta) {
   const finalCont = (packedContainers && packedContainers[0])
     ? { ...packedContainers[0] }
     : null;
   if (!finalCont) return;
+  const meta = packMeta || {};
 
   const steps = (placementSteps || []).slice();
   const finalItems = (finalCont.items || []).slice();
+  // Key by unique pack-unit id first — twins often share the same mark string
   const byMark = new Map();
   finalItems.forEach(it => {
+    if (it._fmUid) byMark.set(`uid:${it._fmUid}`, it);
     const marks = it.marks && it.marks.length ? it.marks : [it.mark];
     marks.forEach(m => { if (m) byMark.set(m, it); });
     if (it.mark) byMark.set(it.mark, it);
   });
+  function resolveCommitItem(s) {
+    if (s && s._fmUid && byMark.has(`uid:${s._fmUid}`))
+      return byMark.get(`uid:${s._fmUid}`);
+    if (s && s.mark && byMark.has(s.mark)) return byMark.get(s.mark);
+    return null;
+  }
 
   const live = {
     ...finalCont,
@@ -3017,7 +3369,13 @@ async function animatePackPlacementReveal(packedContainers, keepOutside, placeme
     volumeUtilizationPct: 0,
   };
   const remainingOutside = (keepOutside || []).slice();
-  currentLayout = { containers: [live], oversized: remainingOutside };
+  currentLayout = {
+    containers: [live],
+    oversized: remainingOutside,
+    packStrategy: meta.packStrategy || meta.strategy || 'foreman_space_first',
+    packPasses: meta.packPasses || { foreman: true },
+    foremanReport: meta.foremanReport || null,
+  };
   currentContainerIdx = 0;
   renderContainer(0);
 
@@ -3031,7 +3389,13 @@ async function animatePackPlacementReveal(packedContainers, keepOutside, placeme
 
   function syncLive(extraOutside) {
     const outs = extraOutside != null ? extraOutside : remainingOutside;
-    currentLayout = { containers: [live], oversized: outs };
+    currentLayout = {
+      containers: [live],
+      oversized: outs,
+      packStrategy: meta.packStrategy || meta.strategy || 'foreman_space_first',
+      packPasses: meta.packPasses || { foreman: true },
+      foremanReport: meta.foremanReport || null,
+    };
     renderContainer(0);
   }
 
@@ -3045,8 +3409,10 @@ async function animatePackPlacementReveal(packedContainers, keepOutside, placeme
     const typ = s.type || (s.mark ? 'commit' : '');
 
     if (typ === 'commit') {
-      const finalIt = byMark.get(s.mark);
-      if (finalIt && !live.items.some(it => it.mark === finalIt.mark)) {
+      const finalIt = resolveCommitItem(s) || byMark.get(s.mark);
+      if (finalIt && !live.items.some(it =>
+        it === finalIt
+        || (finalIt._fmUid && it._fmUid === finalIt._fmUid))) {
         seatIdx++;
         live.items.push(finalIt);
         wSum += (finalIt.unitWeightKg || finalIt.weight || 0);
@@ -3096,475 +3462,15 @@ async function animatePackPlacementReveal(packedContainers, keepOutside, placeme
   currentLayout = {
     containers: packedContainers,
     oversized: keepOutside || [],
+    packStrategy: meta.packStrategy || meta.strategy || 'foreman_space_first',
+    packPasses: meta.packPasses || { foreman: true },
+    foremanReport: meta.foremanReport || null,
   };
   renderContainer(0);
 }
 
 async function layoutPlaceSelected() {
-  if (!rawScene) return;
-  if (!requireGrouped('Optimise')) return;
-  const btn = document.getElementById('btnOptimisePlace');
-  if (btn && btn.dataset.packing === '1') return; // re-entry guard
-  const animate = !!(document.getElementById('animatePackBox')?.checked);
-  const spec = rawScene.containerSpec;
-
-  // Capture EXACT world pose + shape snapshot BEFORE re-pack (for unfit restore)
-  const prevPose = {};
-  clickable.forEach(c => {
-    if (!c?.mesh || !c?.item) return;
-    c.mesh.updateMatrixWorld(true);
-    const marks = c.item.marks && c.item.marks.length ? c.item.marks : [c.item.mark];
-    const q = c.mesh.quaternion;
-    const pose = {
-      x: c.mesh.position.x / SCALE,
-      y: c.mesh.position.y / SCALE,
-      z: c.mesh.position.z / SCALE,
-      rot: { x: c.mesh.rotation.x, y: c.mesh.rotation.y, z: c.mesh.rotation.z },
-      // Exact Group By orientation (Euler rebuild loses pitch/roll)
-      quat: { x: q.x, y: q.y, z: q.z, w: q.w },
-      outside: !!c.outsideContainer,
-      // Deep-enough shape snapshot — restore must NEVER use packer dims
-      item: {
-        ...c.item,
-        marks: marks.filter(Boolean),
-        nestPieces: c.item.nestPieces
-          ? c.item.nestPieces.map(np => ({ ...np }))
-          : null,
-        parts: c.item.parts || null,
-        pathPointsMm: c.item.pathPointsMm || null,
-        _groupByQuat: c.item._groupByQuat || {
-          x: q.x, y: q.y, z: q.z, w: q.w,
-        },
-        _freezeGroupByPose: !!(c.item._freezeGroupByPose || c.item._groupByQuat),
-      },
-    };
-    marks.forEach(m => { if (m) prevPose[m] = pose; });
-  });
-
-  // Capture any rotations the user applied while items were outside
-  captureVisibleRotations();
-
-  // FIRST: fix pack numbers — #1 heaviest, #2 next… then Optimise in that order
-  if (typeof renumberCheckOrderByWeight === 'function')
-    renumberCheckOrderByWeight();
-  else if (typeof renumberCheckOrder === 'function')
-    renumberCheckOrder();
-
-  const checkedGroups = assemblyGroups
-    .filter(g => g.checked && g.state !== 'oversized')
-    .slice()
-    .sort((a, b) => (a.checkOrder || 9999) - (b.checkOrder || 9999));
-  // Safety: if numbers missing, fall back to weight sort
-  if (checkedGroups.some(g => !(g.checkOrder > 0))
-      && typeof sortStagingGroupsByWeight === 'function')
-    sortStagingGroupsByWeight(checkedGroups);
-
-  const markOrder = new Map();
-  checkedGroups.forEach((g, i) => {
-    const marks = g.marks && g.marks.length ? g.marks : [g.mark];
-    marks.forEach(m => {
-      if (!m) return;
-      if (!markOrder.has(m)) markOrder.set(m, g.checkOrder || (i + 1));
-    });
-  });
-  const checkedMarks = new Set(markOrder.keys());
-
-  if (checkedMarks.size === 0) {
-    showToast('Select items first — numbered heaviest=#1, then Optimise', 3200);
-    return;
-  }
-
-  // Refresh list so UI shows #1… before pack runs
-  if (typeof renderStagingList === 'function') renderStagingList();
-  if (typeof updateSelectAllBox === 'function') updateSelectAllBox();
-
-  // Items / pack units follow weight numbers (#1 first)
-  const selectedItems = [];
-  const seenItem = new Set();
-  checkedGroups.forEach(g => {
-    const marks = g.marks && g.marks.length ? g.marks : [g.mark];
-    marks.forEach(m => {
-      if (!m || seenItem.has(m)) return;
-      const it = rawScene.items.find(x => x.mark === m);
-      if (!it) return;
-      seenItem.add(m);
-      selectedItems.push(it);
-    });
-  });
-
-  // Already-inside unchecked pieces become packer seeds (new items pack around them)
-  const seedItems = [];
-  const seededMarks = new Set();
-  Object.keys(prevPose).forEach(m => {
-    if (checkedMarks.has(m)) return;
-    const prev = prevPose[m];
-    if (!prev || prev.outside) return;
-    seedItems.push({
-      ...prev.item,
-      x: prev.x, y: prev.y, z: prev.z,
-      userRot: prev.rot,
-    });
-    seededMarks.add(m);
-  });
-
-  // STEP 8: pack units in #1→#n order (already weight-ranked)
-  const packUnits = [];
-  checkedGroups.forEach(g => {
-    // KEEP Group-By packUnits (nests AND assemblies). Rebuilding at Optimise
-    // re-ran pitch_to_construct and destroyed the frozen yard seat.
-    const nestGk = String(g.groupKind || '').toLowerCase();
-    const nestSk = String(g.shapeKey || g.profileShape || '').toLowerCase();
-    const isNestGroup = /^nest_[zcl]$/.test(nestGk)
-      || nestSk === 'z_channel' || nestSk === 'c_channel' || nestSk === 'l_angle';
-    const isAsmGroup = nestGk === 'welded_assembly' || !!g.isAssembly
-      || !!(g.parts && g.parts.length >= 2);
-    const hasFrozenSb = !!(g.packUnits && g.packUnits.some(pu =>
-      pu && pu.stableBundleMm && pu.stableBundleMm.l > 0
-      && (pu._freezeGroupByPose
-        || /yard_straighten|measured|rest_pose|fm_sb/i.test(
-          String(pu.stableBundleMm.source || '')))));
-    let pus;
-    if ((isNestGroup || isAsmGroup || hasFrozenSb)
-        && g.packUnits && g.packUnits.length) {
-      pus = g.packUnits;
-    } else {
-      pus = (typeof createPackUnits === 'function')
-        ? createPackUnits(g)
-        : (g.packUnits || []);
-      if (pus && pus.length) g.packUnits = pus;
-    }
-    const gw = Math.max(0, Number(g.sortWeightKg || g.weightKg) || 0);
-    const r1 = g.rule1_orientation
-      || (g.stabilityInfo && g.stabilityInfo.rule1_orientation)
-      || null;
-    // Within a group: heavier pack units first (single assemblies already 1-each)
-    const orderedPu = (pus || []).slice().sort((a, b) =>
-      (b.total_weight || b.weightKg || 0) - (a.total_weight || a.weightKg || 0));
-    orderedPu.forEach(pu => {
-      if (!(pu.total_weight > 0) && !(pu.weightKg > 0) && gw > 0) {
-        pu.total_weight = gw;
-        pu.weightKg = gw;
-      }
-      // Stage A/B → Stage C: carry Rule1 gravity pose into packer
-      if (r1 && !pu.rule1_orientation) pu.rule1_orientation = r1;
-      if (g.stabilityInfo && !pu.stabilityInfo) pu.stabilityInfo = g.stabilityInfo;
-      if (r1 && r1.two_point_base) pu.two_point_base = true;
-      // Keep IFC piece marks (RF012) on the pack unit for axis / placement ID
-      const gMarks = g.marks && g.marks.length ? g.marks : [g.mark];
-      pu.marks = Array.from(new Set([...(pu.marks || []), ...gMarks, pu.mark].filter(Boolean)));
-      if (g.isAssembly || g.groupKind === 'welded_assembly') pu.isAssembly = true;
-      pu._groupWeightKg = gw;
-      pu._groupKind = g.groupKind;
-      pu._checkOrder = g.checkOrder || 0;
-      // Freeze Group By world orientation from live yard mesh (WYSIWYG → Optimise)
-      if (!pu._groupByQuat && g._groupByQuat) pu._groupByQuat = { ...g._groupByQuat };
-      if (!pu._groupByQuat) {
-        const marks = pu.marks && pu.marks.length ? pu.marks : [pu.mark];
-        for (let mi = 0; mi < marks.length && !pu._groupByQuat; mi++) {
-          const prev = prevPose[marks[mi]];
-          if (!prev) continue;
-          // Prefer exact mesh quaternion — Euler rebuild loses nest/assembly roll
-          if (prev.quat && prev.quat.w != null) {
-            pu._groupByQuat = { ...prev.quat };
-            pu._freezeGroupByPose = true;
-          } else if (prev.item && prev.item._groupByQuat) {
-            pu._groupByQuat = { ...prev.item._groupByQuat };
-            pu._freezeGroupByPose = true;
-          } else if (prev.rot && typeof THREE !== 'undefined') {
-            const e = new THREE.Euler(
-              prev.rot.x || 0, prev.rot.y || 0, prev.rot.z || 0, 'XYZ');
-            const q = new THREE.Quaternion().setFromEuler(e);
-            pu._groupByQuat = { x: q.x, y: q.y, z: q.z, w: q.w };
-            pu._freezeGroupByPose = true;
-          }
-        }
-      }
-      if (pu._groupByQuat) pu._freezeGroupByPose = true;
-      // Ship Prep gate: ensure load-ready before Optimise (auto-prep if missing)
-      if (typeof csShipPrepReady === 'function' && !csShipPrepReady(pu)
-          && typeof csShipPrepPackUnit === 'function') {
-        try { csShipPrepPackUnit(pu); } catch (_) { /* */ }
-      }
-      if (pu._shipPrepped || (typeof csShipPrepReady === 'function' && csShipPrepReady(pu)))
-        pu._shipPrepped = true;
-      packUnits.push(pu);
-    });
-  });
-  // Refuse Optimise for units that still lack ship-prep (honest — leave outside)
-  const shipReady = [];
-  const shipBlocked = [];
-  packUnits.forEach(pu => {
-    if (typeof csShipPrepReady === 'function' ? csShipPrepReady(pu)
-        : !!(pu._shipPrepped || pu._freezeGroupByPose || pu._keepGroupByBundle
-          || pu._groupByQuat))
-      shipReady.push(pu);
-    else shipBlocked.push(pu);
-  });
-  if (shipBlocked.length) {
-    try {
-      console.warn('[Optimise] ship-prep missing — left outside:',
-        shipBlocked.map(u => u.mark).slice(0, 8));
-    } catch (_) { /* */ }
-  }
-  packUnits.length = 0;
-  shipReady.forEach(u => packUnits.push(u));
-  // Keep UI number order; only break ties with packer tier/weight
-  if (typeof cs8SortHeavyAnchor === 'function')
-    cs8SortHeavyAnchor(packUnits, spec.lengthMm);
-  // Re-assert: among same tier, honour checkOrder (#1 before #2)
-  packUnits.sort((a, b) => {
-    const oa = a._checkOrder || 0;
-    const ob = b._checkOrder || 0;
-    if (oa > 0 && ob > 0 && oa !== ob) return oa - ob;
-    return 0; // leave cs8SortHeavyAnchor relative order
-  });
-
-  try {
-    const top = packUnits.slice(0, 5).map(pu =>
-      `#${pu._checkOrder || '?'}:${pu.mark || '?'}:${Math.round(pu.total_weight || pu.weightKg || 0)}kg`);
-    console.info('[Optimise try-order]', top.join(' → '), '… (#1=heaviest)');
-  } catch (_) { /* */ }
-
-  if (btn) {
-    btn.dataset.packing = '1';
-    btn.disabled = true;
-    btn.style.opacity = '0.55';
-    btn.textContent = animate
-      ? 'Optimising (live)…'
-      : 'Optimising (heavy-first)…';
-  }
-
-  let packedLayout;
-  try {
-    packedLayout = layoutOptimized(selectedItems, spec, userRotations, {
-      maxContainers: 1,
-      seedItems,
-      // markOrder NOT used for placement — Heavy-Anchoring ignores click Order
-      markOrder: null,
-      packUnits: packUnits.length ? packUnits : undefined,
-      stagingGroups: checkedGroups,
-      pass2: true, // bundle filler after heavy floor anchors
-      strictWeightSort: true,
-    });
-  } catch (err) {
-    if (btn) {
-      btn.dataset.packing = '';
-      btn.disabled = false;
-      btn.style.opacity = '';
-      btn.innerHTML = '✓ Optimise &amp; Move Selected to Container';
-    }
-    showToast('Optimise failed — see console', 4000);
-    console.error(err);
-    return;
-  }
-
-  // Real mesh check: if packed pose sticks outside walls, reject → keep previous location.
-  // Foreman / packPoseLock: trust packer footprint — IFC mesh pitch must not eject valid seats.
-  const trustForeman = packedLayout.packStrategy === 'foreman_space_first'
-    || packedLayout.strategy === 'foreman_space_first'
-    || !!(packedLayout.packPasses && packedLayout.packPasses.foreman);
-  (packedLayout.containers || []).forEach(c => {
-    const keep = [];
-    const reject = [];
-    (c.items || []).forEach(it => {
-      const marks = [it.mark, ...(it.marks || [])].filter(Boolean);
-      const isSeed = marks.some(m => seededMarks.has(m));
-      if (isSeed || it.packPoseLock || trustForeman) {
-        keep.push(it);
-        return;
-      }
-      if (itemPoseFitsInContainer(it, c)) keep.push(it);
-      else reject.push(it);
-    });
-    c.items = keep;
-    if (reject.length) {
-      packedLayout.oversized = (packedLayout.oversized || []).concat(reject);
-    }
-  });
-
-  // STEP 9 — validate rules; violating placements → oversized (restore below).
-  // Foreman already resolved overlaps to ≤0.5mm — Step9 collision pass was
-  // rejecting touching nests / AABB packs and dumping ~60% of the load outside.
-  if (typeof enforceValidationOnLayout === 'function' && !trustForeman) {
-    enforceValidationOnLayout(packedLayout, {
-      stagingGroups: checkedGroups,
-      pipeline: ['orient', 'group', 'nest', 'pack'],
-    });
-  }
-
-  // Update staging cards: placed vs needs-rotate
-  const placedMarks = new Set();
-  (packedLayout.containers || []).forEach(c => {
-    (c.items || []).forEach(it => {
-      if (it.mark) placedMarks.add(it.mark);
-      (it.marks || []).forEach(m => placedMarks.add(m));
-    });
-  });
-  seededMarks.forEach(m => placedMarks.add(m));
-
-  // Any checked mark not placed → treat as unfit (restore exact pose)
-  const needsRotate = [...(packedLayout.oversized || [])];
-  const needsRotateMarks = new Set();
-  needsRotate.forEach(u => {
-    [u.mark, ...(u.marks || [])].filter(Boolean).forEach(m => needsRotateMarks.add(m));
-  });
-  checkedMarks.forEach(m => {
-    if (placedMarks.has(m) || needsRotateMarks.has(m)) return;
-    needsRotateMarks.add(m);
-    needsRotate.push({ mark: m, marks: [m], fitReason: 'no_fit' });
-  });
-
-  // Map Constraint Override Log (fitReason) → staging cards
-  const reasonByMark = new Map();
-  needsRotate.forEach(u => {
-    const code = u.fitReason || 'no_fit';
-    const msg = u.fitReasonMsg || code;
-    [u.mark, ...(u.marks || [])].filter(Boolean).forEach(m => {
-      if (!reasonByMark.has(m)) reasonByMark.set(m, { code, msg, weight: u.weight || u.unitWeightKg || 0 });
-    });
-  });
-
-  assemblyGroups.forEach(g => {
-    const marks = g.marks && g.marks.length ? g.marks : [g.mark];
-    const puMarks = (g.packUnits || []).flatMap(pu =>
-      [pu.mark, ...(pu.marks || [])].filter(Boolean));
-    const allMarks = Array.from(new Set([...marks, ...puMarks, g.mark].filter(Boolean)));
-    const anyPlaced = allMarks.some(m => placedMarks.has(m));
-    const anyNeedsRot = allMarks.some(m => needsRotateMarks.has(m));
-    if (anyPlaced && (g.checked || marks.some(m => seededMarks.has(m)))) {
-      g.state = 'placed';
-      g.containerId = activeContainerId || 'C1';
-      g.needsRotate = false;
-      g.fitReason = null;
-      g.fitReasonMsg = null;
-    } else if (anyNeedsRot && g.checked) {
-      g.state = 'unplaced';
-      g.needsRotate = true;
-      g.containerId = null;
-      let reason = null;
-      marks.forEach(m => { if (!reason && reasonByMark.has(m)) reason = reasonByMark.get(m); });
-      g.fitReason = reason ? reason.code : 'no_fit';
-      g.fitReasonMsg = reason ? reason.msg : 'No fit in container';
-    }
-  });
-
-  let packedContainers = packedLayout.containers || [];
-  if (!packedContainers.length && rawScene.containerSpec) {
-    const s = rawScene.containerSpec;
-    packedContainers = [{
-      containerNumber: 1,
-      lengthMm: s.lengthMm, widthMm: s.widthMm, heightMm: s.heightMm,
-      maxWeightKg: s.maxWeightKg,
-      usedWeightKg: 0, weightUtilizationPct: 0, volumeUtilizationPct: 0,
-      items: [],
-    }];
-  }
-
-  // Failed / previous-outside leftovers stay at previous world pose (Step 9 restore)
-  let keepOutside = [];
-  if (typeof restoreUnfitToPrevPose === 'function') {
-    keepOutside = restoreUnfitToPrevPose(needsRotate, prevPose, placedMarks, spec);
-  } else {
-    needsRotate.forEach(u => {
-      const marks = [u.mark, ...(u.marks || [])].filter(Boolean);
-      marks.forEach(m => {
-        if (!m || placedMarks.has(m)) return;
-        const prev = prevPose[m];
-        keepOutside.push({
-          ...(prev?.item || u),
-          mark: m,
-          x: prev ? prev.x : (u.x || 0),
-          y: prev ? prev.y : ((u.heightMm || u.h || 200) / 2),
-          z: prev ? prev.z : ((spec.widthMm / 2) + 800),
-          userRot: prev?.rot || null,
-          outsideContainer: true,
-          needsRotate: true,
-          restoredFromOptimise: true,
-        });
-      });
-    });
-  }
-  // Keep other previously-outside unchecked items where they were
-  const seenKeep = new Set(keepOutside.map(it => it.mark).filter(Boolean));
-  Object.keys(prevPose).forEach(m => {
-    if (checkedMarks.has(m) || placedMarks.has(m) || seenKeep.has(m)) return;
-    if (!prevPose[m].outside) return;
-    seenKeep.add(m);
-    const prev = prevPose[m];
-    keepOutside.push({
-      ...prev.item,
-      mark: m,
-      x: prev.x, y: prev.y, z: prev.z,
-      userRot: prev.rot,
-      outsideContainer: true,
-      needsRotate: false,
-    });
-  });
-
-  currentContainerIdx = 0;
-
-  try {
-    const steps = packedLayout.placementSteps || [];
-    const hasPlaces = steps.some(s => s && s.type === 'commit')
-      || ((packedContainers[0] && packedContainers[0].items) || []).length > 0;
-    if (animate && packedContainers.length && hasPlaces) {
-      await animatePackPlacementReveal(
-        packedContainers,
-        keepOutside,
-        steps
-      );
-    } else {
-      currentLayout = {
-        containers: packedContainers,
-        oversized: keepOutside,
-        packStrategy: packedLayout.packStrategy || packedLayout.strategy || null,
-        packPasses: packedLayout.packPasses || null,
-        foremanReport: packedLayout.foremanReport || null,
-        placementSteps: packedLayout.placementSteps || null,
-      };
-      renderContainer(0);
-    }
-  } finally {
-    if (btn) {
-      btn.dataset.packing = '';
-      btn.innerHTML = '✓ Optimise &amp; Move Selected to Container';
-      btn.style.opacity = '';
-    }
-    if (typeof updateWorkflowUI === 'function') updateWorkflowUI();
-  }
-
-  renderStagingList();
-  updateStagingFooter();
-  syncSidebarContainersFromLayout();
-
-  const nPlaced = [...placedMarks].filter(m => checkedMarks.has(m)).length;
-  const nRot = needsRotateMarks.size;
-  const p2 = packedLayout.packPasses || {};
-  const passHint = p2.pass2
-    ? ` · Pass2 fill+${p2.filled || 0}`
-    : '';
-  // Constraint Override Log — heaviest rejects first (why beam stayed outside)
-  const rejectLog = [...reasonByMark.entries()]
-    .map(([mark, r]) => ({ mark, ...r }))
-    .sort((a, b) => (b.weight || 0) - (a.weight || 0));
-  if (nRot > 0) {
-    const top = rejectLog.slice(0, 2)
-      .map(r => `${r.mark}: ${r.code}`)
-      .join(' · ');
-    showToast(
-      `⚠ ${nRot} outside (heavy-first). ${nPlaced} placed${passHint}`
-      + (top ? ` — ${top}` : ''),
-      7000
-    );
-    try {
-      console.warn('[Constraint Override Log]', rejectLog);
-    } catch (_) { /* */ }
-  } else {
-    showToast(
-      `✓ ${nPlaced} placed · Heavy-Anchor (weight→length) + Floor ≥80%${passHint}`,
-      3400
-    );
-  }
+  runOptimizeKeepingLeftovers();
 }
 
 function setMode(mode) {
@@ -3617,100 +3523,126 @@ function captureCurrentPoses() {
 }
 
 /**
- * Optimise packing — items that fit go inside; leftovers stay at their
- * ORIGINAL world pose (not dumped in a new line). User may Rotate them
- * outside and Move / arrow them into the container afterwards.
+ * Optimise & Place — Pack V2 (twins + stacks).
+ * Checked staging groups → BuildUnits → PackWithTwins → seats in container;
+ * leftovers stay outside with honest fitReason.
  */
 function runOptimizeKeepingLeftovers() {
-  if (!rawScene) return;
-  const spec = rawScene.containerSpec;
-  captureVisibleRotations();
-  const prevPose = captureCurrentPoses();
-
-  const packedLayout = layoutOptimized(rawScene.items, spec, userRotations, {
-    maxContainers: 1,
-  });
-
-  // STEP 9 — validate; reject violators → oversized → restore pose
-  if (typeof enforceValidationOnLayout === 'function') {
-    enforceValidationOnLayout(packedLayout, {
-      stagingGroups: (typeof assemblyGroups !== 'undefined') ? assemblyGroups : null,
-      pipeline: ['orient', 'group', 'nest', 'pack'],
-    });
+  if (!rawScene) return null;
+  if (typeof requireGrouped === 'function' && !requireGrouped('Optimise'))
+    return null;
+  if (typeof csPackV2RunOptimise !== 'function') {
+    if (typeof showToast === 'function')
+      showToast('Pack V2 not loaded', 3000);
+    return null;
   }
 
-  const placedMarks = new Set();
-  (packedLayout.containers || []).forEach(c => {
-    (c.items || []).forEach(it => {
-      if (it.mark) placedMarks.add(it.mark);
-      (it.marks || []).forEach(m => { if (m) placedMarks.add(m); });
-    });
-  });
-
-  let packedContainers = packedLayout.containers || [];
-  if (!packedContainers.length) {
-    packedContainers = [{
-      containerNumber: 1,
-      lengthMm: spec.lengthMm, widthMm: spec.widthMm, heightMm: spec.heightMm,
-      maxWeightKg: spec.maxWeightKg || 26000,
-      usedWeightKg: 0, weightUtilizationPct: 0, volumeUtilizationPct: 0,
-      items: [],
-    }];
+  const groups = (typeof assemblyGroups !== 'undefined' && assemblyGroups)
+    ? assemblyGroups : [];
+  const checked = groups.filter(g => g && g.checked && g.state !== 'oversized');
+  if (!checked.length) {
+    if (typeof showToast === 'function')
+      showToast('Select sets first — click 1, 2, 3… then Optimise & Place', 3200);
+    return null;
   }
 
-  // Exact pre-optimise restore — shape/size unchanged
-  const unfit = [...(packedLayout.oversized || [])];
-  (rawScene.items || []).forEach(it => {
-    if (!it.mark || placedMarks.has(it.mark)) return;
-    if (unfit.some(u => u.mark === it.mark || (u.marks || []).includes(it.mark))) return;
-    unfit.push({ mark: it.mark, marks: [it.mark], fitReason: 'no_fit' });
+  // Freeze Group By orientations from the current yard view
+  try {
+    if (typeof captureVisibleRotations === 'function')
+      captureVisibleRotations();
+  } catch (_) { /* */ }
+  try {
+    if (typeof clickable !== 'undefined' && clickable
+        && typeof stampGroupByQuatOnStaging === 'function') {
+      clickable.forEach(c => {
+        if (c && c.mesh && c.item)
+          stampGroupByQuatOnStaging(c.item, c.mesh);
+      });
+    }
+  } catch (_) { /* */ }
+
+  const result = csPackV2RunOptimise({
+    groups,
+    containerSpec: rawScene.containerSpec,
+    enableStacks: true,
+    checkedOnly: true,
   });
 
-  let keepOutside = (typeof restoreUnfitToPrevPose === 'function')
-    ? restoreUnfitToPrevPose(unfit, prevPose, placedMarks, spec)
-    : [];
-  const seenKeep = new Set();
-  keepOutside.forEach(it => {
-    [it.mark, ...(it.marks || [])].filter(Boolean).forEach(m => seenKeep.add(m));
-  });
-
-  // Update staging cards
-  if (assemblyGroups && assemblyGroups.length) {
-    assemblyGroups.forEach(g => {
-      const marks = g.marks && g.marks.length ? g.marks : [g.mark];
-      const anyPlaced = marks.some(m => placedMarks.has(m));
-      const anyOut = marks.some(m => seenKeep.has(m));
-      if (anyPlaced) {
-        g.state = 'placed';
-        g.containerId = activeContainerId || 'C1';
-        g.needsRotate = false;
-      } else if (anyOut) {
-        g.state = 'unplaced';
-        g.containerId = null;
-        g.needsRotate = !!keepOutside.find(k =>
-          (k.mark === g.mark || (k.marks || []).some(m => marks.includes(m))) && k.needsRotate);
-      }
-    });
+  if (!result || !result.layout) {
+    if (typeof showToast === 'function')
+      showToast((result && result.toast) || 'Optimise failed', 3500);
+    return result;
   }
 
-  currentLayout = {
-    containers: packedContainers,
-    oversized: keepOutside,
-  };
+  currentLayout = result.layout;
   currentContainerIdx = 0;
-  renderContainer(0);
-  renderStagingList();
-  updateStagingFooter();
-  if (typeof syncSidebarContainersFromLayout === 'function') syncSidebarContainersFromLayout();
+  currentMode = 'optimize';
 
-  const nIn = placedMarks.size;
-  const nOut = keepOutside.length;
-  if (nOut > 0) {
-    showToast(
-      `✓ ${nIn} inside · ${nOut} left at original position — Rotate / Move them into the container`,
-      5500
-    );
-  } else {
-    showToast(`✓ All items packed inside (${nIn})`, 3000);
-  }
+  // Staging card states from placed / leftover items
+  const placedByGroup = new Set();
+  const leftByGroup = new Map();
+  (result.placedItems || []).forEach(it => {
+    if (it.stagingGroupId) placedByGroup.add(it.stagingGroupId);
+  });
+  (result.leftoverItems || []).forEach(it => {
+    if (!it.stagingGroupId) return;
+    if (!leftByGroup.has(it.stagingGroupId))
+      leftByGroup.set(it.stagingGroupId, it);
+  });
+
+  const contId = (typeof activeContainerId !== 'undefined' && activeContainerId)
+    ? activeContainerId : 'C1';
+  groups.forEach(g => {
+    if (!g || !g.checked) return;
+    if (placedByGroup.has(g.id)) {
+      g.state = 'placed';
+      g.containerId = contId;
+      g.needsRotate = false;
+      g.fitReason = null;
+      g.stackFailReason = null;
+    } else if (leftByGroup.has(g.id)) {
+      const left = leftByGroup.get(g.id);
+      g.state = 'unplaced';
+      g.containerId = null;
+      g.fitReason = left.fitReason || null;
+      g.stackFailReason = left.stackFailReason || null;
+      g.needsRotate = false;
+    }
+  });
+
+  try { renderContainer(0); } catch (_) { /* */ }
+  try { if (typeof renderStagingList === 'function') renderStagingList(); } catch (_) { /* */ }
+  try { if (typeof updateStagingFooter === 'function') updateStagingFooter(); } catch (_) { /* */ }
+  try {
+    if (typeof syncSidebarContainersFromLayout === 'function')
+      syncSidebarContainersFromLayout();
+  } catch (_) { /* */ }
+  try { if (typeof updateWorkflowUI === 'function') updateWorkflowUI(); } catch (_) { /* */ }
+
+  if (typeof showToast === 'function')
+    showToast(result.toast || 'Pack V2 done', 4500);
+
+  try {
+    if (result.report && typeof csPackV2PublishPackReport === 'function')
+      csPackV2PublishPackReport(result.report, { updateDom: true, replaceStats: false });
+  } catch (_) { /* */ }
+
+  try {
+    if (typeof csPackV2SoakInspect === 'function') {
+      const soak = csPackV2SoakInspect(result, {
+        containerSpec: rawScene.containerSpec,
+      });
+      result.soak = soak;
+      if (typeof window !== 'undefined')
+        window.__lastPackV2Soak = soak;
+      if (!soak.ok && typeof showToast === 'function')
+        showToast('⚠ ' + (soak.summary || 'Soak gate fail'), 5000);
+    }
+  } catch (_) { /* */ }
+
+  try {
+    if (typeof window !== 'undefined')
+      window.__lastPackV2Optimise = result;
+  } catch (_) { /* */ }
+  return result;
 }

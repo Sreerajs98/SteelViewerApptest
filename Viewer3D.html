@@ -13,6 +13,7 @@
     js/04-ifc-assembly.js    xBIM mesh assemblies + bundles
     js/05-packing.js         expandUnits + layouts
     js/08-grouping.js        real-world Group by Shape rules
+    js/08b-cs-ship-axes.js   Assembly shipping-pose pack dims (no remorph)
     js/19-cs-validate.js     STEP 9 — PACK_CONFIG + validation + unfit restore
     js/09-cross-section.js   STEP 1 — 2D cross-section extract
     js/10-cs-analyze.js      STEP 2 — open/closed/concavity/symmetry/nest dir
@@ -24,10 +25,9 @@
     js/14-cs-nest-offset.js  STEP 7 — nest offset auto (no shape change)
     js/15-cs-stability.js    Auto nest rest-pose / CoG stability (rigid only)
     js/15a-warehouse-ground.js FIRST PRIORITY — AABB widest-face on ground
-    js/15b-cs-ship-prep.js   Ship Prep — load-ready pose per class (then Optimise places)
-    js/16-taper-pack.js      Tapered/non-uniform station clearance (no static offset)
+    js/15b-cs-ship-prep.js   Ship Prep — load-ready pose per class
     js/17-cs-pack-units.js   STEP 7 — build pack units (no shape change)
-    js/18-cs-container-pack.js STEP 8 — container fit/pack Y-yaw only (no shape change)
+    js/18-cs-pack-v2.js      Optimise v2 — Step1 footprint normalize (more later)
     js/06-render-interact.js render, drag, rotate, place
     js/07-load-scene.js      loadScene + C# bridge
   Full pre-split snapshot: Viewer3D.monolith.backup.html
@@ -98,14 +98,11 @@
           ⊟ Ungroup
         </button>
       </div>
-      <label id="animatePackLabel" style="display:flex;align-items:center;gap:6px;margin-top:8px;font-size:11px;color:var(--text2);cursor:pointer;user-select:none"
-             title="Live Floor Anchor: heaviest assemblies first on floor (≥80% bearing, yaw 0°/180°), then compact.">
-        <input type="checkbox" id="animatePackBox"
-               style="width:14px;height:14px;accent-color:var(--green);cursor:pointer">
-        Animate pack (live try: rotate all dirs → seat)
-      </label>
-      <button id="btnOptimisePlace" onclick="layoutPlaceSelected()" style="width:100%;margin-top:6px;padding:7px 0;border-radius:6px;border:none;background:var(--green);color:#fff;font-size:12.5px;font-weight:600;cursor:pointer;opacity:0.45" title="Heavy-first Floor Anchor: try all stable-base directions (yaw + face rolls), ≥80% bearing, then Pass2 compact/fill. Check Animate to watch each try." disabled>
-        ✓ Optimise &amp; Move Selected to Container
+      <!-- Step 5d — Pack V2 Optimise & Place (after Group + pick 1,2,3…) -->
+      <button id="btnOptimisePlace" onclick="layoutPlaceSelected()"
+        style="width:100%;margin-top:6px;padding:7px 0;border-radius:6px;border:none;background:var(--green);color:#fff;font-size:12.5px;font-weight:600;cursor:pointer;opacity:0.45"
+        title="Step 4 — after Group + pick order 1,2,3… Pack V2 (twins + stacks)" disabled>
+        ▣ Optimise &amp; Place
       </button>
     </div>
     <div id="stagingList">
@@ -150,7 +147,7 @@
       <div id="cogDisplay"></div>
     </div>
 
-    <div id="hint">After Group: drag a set to rearrange · click=select · empty space=orbit · → Into container for packing</div>
+    <div id="hint">After Group: pick 1,2,3… · Optimise &amp; Place (Pack V2) · drag to rearrange</div>
   </div>
 
   <!-- ── RIGHT: CONTAINER MANAGER ─────────────────────────────── -->
@@ -244,6 +241,7 @@
 <script src="viewer/js/04-ifc-assembly.js"></script>
 <script src="viewer/js/05-packing.js"></script>
 <script src="viewer/js/08-grouping.js"></script>
+<script src="viewer/js/08b-cs-ship-axes.js"></script>
 <script src="viewer/js/19-cs-validate.js"></script>
 <script src="viewer/js/09-cross-section.js"></script>
 <script src="viewer/js/10-cs-analyze.js"></script>
@@ -256,10 +254,8 @@
 <script src="viewer/js/15a-warehouse-ground.js"></script>
 <script src="viewer/js/15-cs-stability.js"></script>
 <script src="viewer/js/15b-cs-ship-prep.js"></script>
-<script src="viewer/js/16-taper-pack.js"></script>
 <script src="viewer/js/17-cs-pack-units.js"></script>
-<script src="viewer/js/18-cs-container-pack.js"></script>
-<script src="viewer/js/18b-cs-foreman-pack.js"></script>
+<script src="viewer/js/18-cs-pack-v2.js"></script>
 <script src="viewer/js/06-render-interact.js"></script>
 <script src="viewer/js/07-load-scene.js"></script>
 <script src="viewer/js/99-grouping-tests.js"></script>
@@ -272,6 +268,5 @@
 <script src="viewer/js/99-cs-ground-tests.js"></script>
 <script src="viewer/js/99-cs-z-ground-measure.js"></script>
 <script src="viewer/js/99-cs-step7-tests.js"></script>
-<script src="viewer/js/99-cs-warehouse-tests.js"></script>
 </body>
 </html>

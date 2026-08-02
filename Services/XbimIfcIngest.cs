@@ -428,15 +428,18 @@ public static class XbimIfcIngest
         if (weightEst)
             weight = estimateKg;
 
-        string remarks = $"[xBIM assembly ×{parts.Count} parts; L={union.MaxX - union.MinX:0} H={union.MaxZ - union.MinZ:0} W={union.MaxY - union.MinY:0}]";
-        return new SteelItem
+        double envL = Math.Max(1, union.MaxX - union.MinX);
+        double envH = Math.Max(1, union.MaxZ - union.MinZ);
+        double envW = Math.Max(1, union.MaxY - union.MinY);
+        string remarks = $"[xBIM assembly ×{parts.Count} parts; L={envL:0} H={envH:0} W={envW:0}]";
+        var item = new SteelItem
         {
             AssmMark = string.IsNullOrWhiteSpace(mark) ? $"{name}-{asm.EntityLabel}" : mark,
             Qty = 1,
             AssemblyName = name,
-            LengthMm = Math.Max(1, union.MaxX - union.MinX),
-            HeightMm = Math.Max(1, union.MaxZ - union.MinZ),
-            WidthMm = Math.Max(1, union.MaxY - union.MinY),
+            LengthMm = envL,
+            HeightMm = envH,
+            WidthMm = envW,
             UnitWeightKg = weight,
             TotalWeightKg = weight,
             ProfileDesc = profile,
@@ -451,6 +454,8 @@ public static class XbimIfcIngest
             SpecialHandling = PickSpecialHandling(psets, remarks, profile),
             Remarks = remarks
         };
+        IfcAssemblyReader.ApplyShippingDimsFromParts(item, parts, envL, envW, envH, 0);
+        return item;
     }
 
     private static SteelItem? BuildSingleItem(

@@ -357,6 +357,7 @@ public static class IfcAssemblyReader
                     item.FlangeClearGapMm = gapMm;
                     item.Remarks += $" flangeClearGap={gapMm:0}mm; pack=assemblyAABB";
                 }
+                ApplyShippingDimsFromParts(item, asmParts, envL, envW, envH, gapMm);
             }
 
             // Bent sag rod only: IFC centerline + diameter → exact 3D path
@@ -532,11 +533,78 @@ public static class IfcAssemblyReader
                 FlangeClearGapMm = flangeGapMm,
                 Remarks = $"[built-up {asmName} FL={flCount} WB={wbCount} {gapNote}; pack=assemblyAABB; webFill=flangeGap]"
             });
+            ApplyShippingDimsFromParts(items[^1], asmParts, envL, envW, envH, flangeGapMm);
             foreach (var pid in partIds) usedIds.Add(pid);
         }
 
         items.AddRange(ExtractLooseElements(entities, psets, entityToPsets, usedIds));
         return items;
+    }
+
+    /// <summary>
+    /// Derive shipping-pose L×flangeW×webH from parts + world AABB.
+    /// Keeps world AABB on Length/Width/Height; stamps Shipping* when confident.
+    /// </summary>
+    internal static void ApplyShippingDimsFromParts(
+        SteelItem item,
+        List<AssemblyPart> parts,
+        double envL, double envW, double envH,
+        double flangeGapMm)
+    {
+        if (item == null || parts == null || parts.Count == 0) return;
+
+        double flangeW = 0;
+        double partMaxLen = 0;
+        foreach (var p in parts)
+        {
+            bool isFl = p.PartKind == "flange" || IsTeklaFlangeMark(p.Name, p.ProfileDesc);
+            double[] box = { p.LengthMm, p.WidthMm, p.HeightMm, p.BoxXMm, p.BoxYMm, p.BoxZMm };
+            Array.Sort(box);
+            // largest part axis ≈ extrusion / span contribution
+            partMaxLen = Math.Max(partMaxLen, box[^1]);
+            if (isFl)
+            {
+                // flange plate: thin × width × length — middle = seat width
+                if (box.Length >= 2 && box[1] >= 40 && box[1] <= 600)
+                    flangeW = Math.Max(flangeW, box[1]);
+                if (p.Section?.W is > 40 and <= 600)
+                    flangeW = Math.Max(flangeW, p.Section.W);
+            }
+        }
+
+        if (item.Section?.W is > 40 and <= 450)
+            flangeW = Math.Max(flangeW, item.Section.W);
+
+        double spanL = Math.Max(partMaxLen, Math.Max(envL, Math.Max(envW, envH)));
+        // Prefer longest env axis as span when parts lack clear extrusion
+        double[] env = { envL, envW, envH };
+        Array.Sort(env);
+        if (spanL < env[^1] * 0.85) spanL = env[^1];
+
+        double webH = flangeGapMm;
+        if (webH < 80 && item.Section?.H is > 80 and <= 3000)
+            webH = item.Section.H;
+        if (webH < 80)
+        {
+            // middle env axis often = web depth on pitched AABB
+            if (env.Length >= 2 && env[1] >= 80 && env[1] <= 3000) webH = env[1];
+        }
+
+        if (flangeW < 40)
+        {
+            // smallest env axis if flange-like
+            if (env[0] >= 40 && env[0] <= 450) flangeW = env[0];
+        }
+
+        item.FlangeWidthMm = flangeW > 0 ? flangeW : 0;
+        // Only stamp shipping when we have a usable flange seat (avoids garbage)
+        if (spanL > 500 && flangeW >= 40 && flangeW <= 600 && webH >= 80)
+        {
+            item.ShippingLengthMm = spanL;
+            item.ShippingWidthMm = flangeW;
+            item.ShippingHeightMm = webH;
+            item.Remarks += $" ship={spanL:0}x{flangeW:0}x{webH:0}";
+        }
     }
 
     /// <summary>

@@ -587,6 +587,12 @@ function cspuMakePackUnit(pieces, stageGroup, idx, method) {
     lengthMaxMm: packLen,
     widthMm: packW,
     heightMm: packH,
+    // Durable IFC shipping-pose fields (when extract stamped them)
+    shippingLengthMm: +first.shippingLengthMm || 0,
+    shippingWidthMm: +first.shippingWidthMm || +first.flangeWidthMm || 0,
+    shippingHeightMm: +first.shippingHeightMm || 0,
+    flangeWidthMm: +first.flangeWidthMm || +first.shippingWidthMm || 0,
+    flangeClearGapMm: +first.flangeClearGapMm || 0,
     skidMm: bundle_bbox.skidMm != null ? bundle_bbox.skidMm : cspuSkidHeightMm(),
     memberItems: Array.from(byMark.values()),
     nestPieces,

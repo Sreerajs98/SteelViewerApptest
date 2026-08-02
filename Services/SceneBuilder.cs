@@ -42,6 +42,10 @@ public static class SceneBuilder
                 LengthMm = item.LengthMm,
                 WidthMm = item.WidthMm,
                 HeightMm = item.HeightMm,
+                ShippingLengthMm = item.ShippingLengthMm,
+                ShippingWidthMm = item.ShippingWidthMm,
+                ShippingHeightMm = item.ShippingHeightMm,
+                FlangeWidthMm = item.FlangeWidthMm,
                 Qty = item.Qty,
                 UnitWeightKg = item.UnitWeightKg,
                 ProfileDesc = item.ProfileDesc,
@@ -175,6 +179,16 @@ public class RawItem
     public double LengthMm { get; set; }
     public double WidthMm { get; set; }
     public double HeightMm { get; set; }
+
+    /// <summary>Shipping-pose span mm (0 = unknown).</summary>
+    public double ShippingLengthMm { get; set; }
+    /// <summary>Shipping-pose seat width mm (0 = unknown).</summary>
+    public double ShippingWidthMm { get; set; }
+    /// <summary>Shipping-pose height mm (0 = unknown).</summary>
+    public double ShippingHeightMm { get; set; }
+    /// <summary>Flange plate width mm when known.</summary>
+    public double FlangeWidthMm { get; set; }
+
     public int Qty { get; set; }
     public double UnitWeightKg { get; set; }
     public string ProfileDesc { get; set; } = "";

@@ -14,6 +14,20 @@ public class SteelItem
     public double WidthMm { get; set; }
     public double HeightMm { get; set; }
 
+    /// <summary>
+    /// Shipping-pose length (member span mm). 0 when unknown — viewer falls back to world AABB + JS sanitize.
+    /// </summary>
+    public double ShippingLengthMm { get; set; }
+
+    /// <summary>Shipping-pose floor seat width (flange / steel width mm).</summary>
+    public double ShippingWidthMm { get; set; }
+
+    /// <summary>Shipping-pose height (web depth / clear gap mm).</summary>
+    public double ShippingHeightMm { get; set; }
+
+    /// <summary>True flange plate width mm when resolved from FL parts.</summary>
+    public double FlangeWidthMm { get; set; }
+
     public double UnitWeightKg { get; set; }
     public double TotalWeightKg { get; set; }
 
