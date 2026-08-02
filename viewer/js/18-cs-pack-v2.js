@@ -87,6 +87,16 @@ function csPackIsNestUnit(u) {
     || sk === 'c_channel' || sk === 'l_angle';
 }
 
+/**
+ * Group By Z/C (and L) nest packs — footprint + nest mesh arrangement are LAW.
+ * Pack V2 must translate these into the container without thin-column remorph or yaw.
+ * Flag comes from Step7 createPackUnits / ship-prep (`_keepGroupByBundle`).
+ */
+function csPackIsGroupByLockedNest(u) {
+  if (!u || !csPackIsNestUnit(u)) return false;
+  return !!(u._keepGroupByBundle || u._freezeGroupByPose);
+}
+
 function csPackIsAssemblyUnit(u) {
   if (!u) return false;
   return !!(u.isAssembly
@@ -319,6 +329,53 @@ function csPackNormalizePackUnit(u, opts) {
       });
     }
   }
+
+  // ── Group By Z/C nest: keep yard nest L×W×H (no thin-column remorph) ──
+  if (csPackIsGroupByLockedNest(u)) {
+    const sb = u.stableBundleMm || u.bundle_bbox || null;
+    const before = `${u.packLengthMm}|${u.packWidthMm}|${u.packHeightMm}`;
+    if (sb && +sb.l > 0) pl = Math.max(pl, +sb.l);
+    if (sb && +sb.w > 0) pw = +sb.w;
+    if (sb && +sb.h > 0) ph = +sb.h;
+    // Prefer already-stamped Group By pack* when present and sane
+    if (+u.packWidthMm > 0 && +u.packHeightMm > 0
+        && !(sb && +sb.w > 0)) {
+      pw = +u.packWidthMm;
+      ph = +u.packHeightMm;
+    }
+    if (!(pw > 0)) pw = Math.max(thinW, 40);
+    if (!(ph > 0)) ph = Math.max(sectH, 40);
+    u.packLengthMm = Math.max(pl, 1);
+    u.packWidthMm = Math.max(pw, 1);
+    u.packHeightMm = Math.max(ph, 1);
+    u.packFootprintL = u.packLengthMm;
+    u.packFootprintW = u.packWidthMm;
+    u.packFootprintH = u.packHeightMm;
+    u.lengthMm = u.packLengthMm;
+    u.widthMm = u.packWidthMm;
+    u.heightMm = u.packHeightMm;
+    u._keepGroupByBundle = true;
+    u._freezeGroupByPose = true;
+    if (!u.stableBundleMm) {
+      u.stableBundleMm = {
+        l: u.packLengthMm, w: u.packWidthMm, h: u.packHeightMm,
+        source: 'groupby_nest_lock',
+      };
+    } else if (!u.stableBundleMm.source
+        || u.stableBundleMm.source === 'nest_repair') {
+      u.stableBundleMm = {
+        ...u.stableBundleMm,
+        l: u.packLengthMm, w: u.packWidthMm, h: u.packHeightMm,
+        source: 'groupby_nest_lock',
+      };
+    }
+    const after = `${u.packLengthMm}|${u.packWidthMm}|${u.packHeightMm}`;
+    return {
+      changed: before !== after,
+      reason: before !== after ? 'groupby_nest_lock' : null,
+    };
+  }
+
   const n = csPackNestPieceCount(u);
   const off = Math.max(
     8,
@@ -1684,7 +1741,8 @@ function csPackV2FindFloorSeat(unit, freeRects, opts) {
   const placed = o.placedBoxes || [];
   const rects = freeRects || [];
   const base = csPackV2Foot(unit);
-  const allowYaw = o.allowYaw !== false;
+  // Group By Z/C nests keep length along X (same as yard) — never yaw 90
+  const allowYaw = o.allowYaw !== false && !csPackIsGroupByLockedNest(unit);
 
   if (!(base.pl > 0 && base.pw > 0 && base.ph > 0))
     return {
@@ -6511,6 +6569,31 @@ function csPackNormalizeSelfTest() {
   check('N1', r1.changed && fat.packWidthMm < 600 && fat.stableBundleMm.source === 'nest_repair',
     `pw=${fat.packWidthMm} src=${fat.stableBundleMm && fat.stableBundleMm.source}`);
 
+  // Group By locked nest → keep yard nest W/H (no thin-column remorph)
+  const locked = {
+    groupKind: 'nest_z',
+    shapeKey: 'z_channel',
+    _keepGroupByBundle: true,
+    _freezeGroupByPose: true,
+    sectW: 85, sectH: 200,
+    qty: 8,
+    nestingOffsetMm: 40,
+    nestPieces: [
+      { lengthMm: 9600, sectW: 85, sectH: 200 },
+      { lengthMm: 9600, sectW: 85, sectH: 200 },
+    ],
+    lengthMm: 9600,
+    widthMm: 420,
+    heightMm: 380,
+    packLengthMm: 9600, packWidthMm: 420, packHeightMm: 380,
+    stableBundleMm: { l: 9600, w: 420, h: 380, source: 'ship_prep' },
+  };
+  const rLock = csPackNormalizePackUnit(locked, { containerSpec: { widthMm: 2438 } });
+  check('N1b', locked.packWidthMm === 420 && locked.packHeightMm === 380
+    && (rLock.reason === 'groupby_nest_lock' || rLock.reason == null)
+    && locked.stableBundleMm.source !== 'nest_repair',
+    `pw=${locked.packWidthMm} ph=${locked.packHeightMm} src=${locked.stableBundleMm && locked.stableBundleMm.source} r=${rLock.reason}`);
+
   // Already-tight nest → no false inflate
   const okNest = {
     groupKind: 'nest_z',
@@ -8486,6 +8569,30 @@ function csPackV2MakeRenderItemFromUnit(unit) {
   if (g && g._groupByQuat && !item._groupByQuat)
     item._groupByQuat = { ...g._groupByQuat };
   if (item._groupByQuat) item._freezeGroupByPose = true;
+
+  // Z/C Group By nest: same interlock / pair stack mesh in the container
+  if (csPackIsGroupByLockedNest(unit) || csPackIsGroupByLockedNest(item)) {
+    item._keepGroupByBundle = true;
+    item._freezeGroupByPose = true;
+  }
+
+  // Ensure nest method reaches makeZPurlinBundle / makeChannelBundle
+  const nm = item.nestMethod || unit.nestMethod || null;
+  const nmMethod = (nm && (nm.method || nm)) || item.nest_method || unit.nest_method || null;
+  if (nmMethod) {
+    if (!item.nestMethod || typeof item.nestMethod !== 'object')
+      item.nestMethod = { method: String(nmMethod) };
+    else if (!item.nestMethod.method)
+      item.nestMethod = { ...item.nestMethod, method: String(nmMethod) };
+    if (!item.nestingInfo)
+      item.nestingInfo = {
+        method: String(nmMethod),
+        nesting_offset: +item.nestingOffsetMm || +item.nesting_offset || 0,
+        alternate_flip: !!(item.alternate_flip || (nm && nm.alternate_flip)),
+      };
+    else if (!item.nestingInfo.method)
+      item.nestingInfo = { ...item.nestingInfo, method: String(nmMethod) };
+  }
 
   item.outsideContainer = true; // until 5b places it
   item._packV2Applied = false;

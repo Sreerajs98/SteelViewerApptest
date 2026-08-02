@@ -212,7 +212,20 @@ function renderContainer(idx) {
         unitWidth: (isNest ? sectW : null) || it.unitWidth,
         qty: Math.max(1, +it.qty || (it.nestPieces && it.nestPieces.length) || 1),
         nestPieces: it.nestPieces ? it.nestPieces.map(np => ({ ...np })) : null,
-        nestingInfo: it.nestingInfo ? { ...it.nestingInfo } : null,
+        nestingInfo: (() => {
+          const ni = it.nestingInfo ? { ...it.nestingInfo } : {};
+          const method = ni.method
+            || (it.nestMethod && it.nestMethod.method)
+            || it.nest_method
+            || null;
+          if (method && !ni.method) ni.method = method;
+          if (!(ni.nesting_offset > 0)
+              && (it.nestingOffsetMm > 0 || it.nesting_offset > 0))
+            ni.nesting_offset = +it.nestingOffsetMm || +it.nesting_offset;
+          if (it.alternate_flip && ni.alternate_flip == null)
+            ni.alternate_flip = true;
+          return Object.keys(ni).length ? ni : null;
+        })(),
         nestMethod: it.nestMethod || null,
         nestingOffsetMm: it.nestingOffsetMm || it.nesting_offset || null,
         orientation_info: it.orientation_info ? { ...it.orientation_info } : null,
