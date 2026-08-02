@@ -8565,6 +8565,30 @@ function csPackV2MakeRenderItemFromUnit(unit) {
   item.packFootprintW = item.packWidthMm;
   item.packFootprintH = item.packHeightMm;
 
+  // Stamp original geometry dims before pack AABB wins (rafter IFC mesh)
+  if (item.isAssembly || item.groupKind === 'welded_assembly') {
+    const mem0 = (item.memberItems && item.memberItems[0]) || null;
+    const pitched = item.stableBundleMm && item.stableBundleMm.pitchedFrom;
+    if (item._origLengthMm == null) {
+      item._origLengthMm = +(mem0 && mem0.lengthMm) || +item.shippingLengthMm
+        || +(pitched && pitched.l) || +item.lengthMm || 0;
+    }
+    if (item._origWidthMm == null) {
+      item._origWidthMm = +(mem0 && (mem0.widthMm || mem0.unitWidth || mem0.sectW))
+        || +item.shippingWidthMm || +item.flangeWidthMm || +item.sectW
+        || +(pitched && pitched.w) || 0;
+    }
+    if (item._origHeightMm == null) {
+      item._origHeightMm = +(mem0 && (mem0.heightMm || mem0.unitHeight || mem0.sectH))
+        || +item.shippingHeightMm || +item.sectH
+        || +(pitched && pitched.h) || 0;
+    }
+    if ((!item.parts || !item.parts.length) && g && g.parts && g.parts.length)
+      item.parts = g.parts.map(p => (p && typeof p === 'object') ? { ...p } : p);
+    if ((!item.parts || !item.parts.length) && mem0 && mem0.parts && mem0.parts.length)
+      item.parts = mem0.parts.map(p => (p && typeof p === 'object') ? { ...p } : p);
+  }
+
   item.stagingGroupId = (g && g.id) || item.stagingGroupId || null;
   if (g && g._groupByQuat && !item._groupByQuat)
     item._groupByQuat = { ...g._groupByQuat };
