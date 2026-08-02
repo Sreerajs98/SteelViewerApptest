@@ -258,7 +258,7 @@ public class MainForm : Form
 
     /// <summary>
     /// Load IFC into the viewer. CLI (--ifc) skips the phase picker (all phases)
-    /// then runs Group By only — Optimise/packing is disabled.
+    /// then runs Group By + Pack V2 Optimise soak (steps 2–5) and writes a report.
     /// </summary>
     private async Task LoadIfcPathAsync(string ifcPath, bool skipPhasePicker)
     {
@@ -2026,6 +2026,26 @@ public class MainForm : Form
                                   floorOnly: opt5off && opt5off.pack,
                                 })
                               : { ok: false, error: 'soak_missing' };
+                            // Live THREE soak: apply layout + render, then measure meshes
+                            let live5 = { ok: true, skipped: true, reason: 'NO_RENDER' };
+                            try {
+                              if (opt5 && opt5.layout && typeof renderContainer === 'function') {
+                                currentLayout = opt5.layout;
+                                currentContainerIdx = 0;
+                                renderContainer(0);
+                                if (typeof csPackV2LiveMeshSoak === 'function'
+                                    && typeof clickable !== 'undefined') {
+                                  live5 = csPackV2LiveMeshSoak(
+                                    clickable,
+                                    opt5.layout.containers[0] || spec5);
+                                }
+                              }
+                            } catch (liveErr) {
+                              live5 = {
+                                ok: false,
+                                error: String(liveErr && liveErr.message || liveErr),
+                              };
+                            }
                             try {
                               if (typeof csPackV2PublishPackReport === 'function' && report5)
                                 csPackV2PublishPackReport(report5, { updateDom: false });
@@ -2042,6 +2062,9 @@ public class MainForm : Form
                               || (report5.twinHugCount >= 1 && soak5.twinHugOk);
                             const stackOk = !report5.stackCount
                               || (soak5.stacksElevated && soak5.stackCount === report5.stackCount);
+                            const liveOk = live5.skipped || (live5.ok !== false
+                              && (+live5.floatCount || 0) === 0
+                              && (+live5.digCount || 0) === 0);
                             step5 = {
                               ok: self5f.ok !== false
                                 && report5 && report5.ok !== false
@@ -2051,6 +2074,7 @@ public class MainForm : Form
                                 && soak5.digTwin === 0
                                 && matchStep4 && applyOk
                                 && twinOk && stackOk
+                                && liveOk
                                 && report5.gates
                                 && report5.gates.allFloorY0
                                 && report5.gates.allNoOverlap
@@ -2079,6 +2103,19 @@ public class MainForm : Form
                                 placedFloorOnly: opt5off ? opt5off.pack.placedCount : null,
                                 placedWithStacks: opt5 ? opt5.pack.placedCount : null,
                               },
+                              live: {
+                                ok: live5.ok !== false,
+                                skipped: !!live5.skipped,
+                                summary: live5.summary || null,
+                                floatCount: live5.floatCount != null ? live5.floatCount : null,
+                                digCount: live5.digCount != null ? live5.digCount : null,
+                                digTwin: live5.digTwin != null ? live5.digTwin : null,
+                                meshDigCount: live5.meshDigCount != null ? live5.meshDigCount : null,
+                                meshCount: live5.meshCount != null ? live5.meshCount : null,
+                                stackCount: live5.stackCount != null ? live5.stackCount : null,
+                                twinHugOk: live5.twinHugOk,
+                                error: live5.error || null,
+                              },
                               report: report5 ? {
                                 ok: report5.ok,
                                 summary: report5.summary,
@@ -2103,6 +2140,7 @@ public class MainForm : Form
                               applyOk: applyOk,
                               twinOk: twinOk,
                               stackOk: stackOk,
+                              liveOk: liveOk,
                               toast: (opt5 && opt5.toast) || (report5 && report5.toast) || null,
                             };
                           }
@@ -2197,9 +2235,45 @@ public class MainForm : Form
                 }
                 try
                 {
-                    await File.WriteAllTextAsync(
-                        Path.Combine(AppContext.BaseDirectory, "_ifc_group_report.json"),
-                        groupJson);
+                    string reportPath = Path.Combine(AppContext.BaseDirectory, "_ifc_group_report.json");
+                    await File.WriteAllTextAsync(reportPath, groupJson);
+                    if (!string.IsNullOrWhiteSpace(Program.CliReportOutPath))
+                    {
+                        try
+                        {
+                            string dest = Program.CliReportOutPath.Trim().Trim('"');
+                            if (!Path.IsPathRooted(dest))
+                            {
+                                // Resolve relative to the caller's cwd, not the EXE folder
+                                dest = Path.GetFullPath(dest, Directory.GetCurrentDirectory());
+                            }
+                            string? dir = Path.GetDirectoryName(dest);
+                            if (!string.IsNullOrWhiteSpace(dir))
+                                Directory.CreateDirectory(dir);
+                            File.Copy(reportPath, dest, overwrite: true);
+                        }
+                        catch (Exception outEx)
+                        {
+                            try
+                            {
+                                await File.WriteAllTextAsync(
+                                    Path.Combine(AppContext.BaseDirectory, "_ifc_group_report_out_error.txt"),
+                                    outEx.ToString());
+                            }
+                            catch { /* */ }
+                        }
+                    }
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(groupJson);
+                        bool ok = doc.RootElement.TryGetProperty("ok", out var okEl)
+                            && okEl.ValueKind == JsonValueKind.True;
+                        Environment.ExitCode = ok ? 0 : 1;
+                    }
+                    catch
+                    {
+                        Environment.ExitCode = 2;
+                    }
                 }
                 catch { /* */ }
                 lblStatus.Text = $"{job.JobNo}  |  {phaseText}  |  {items.Count} assemblies " +

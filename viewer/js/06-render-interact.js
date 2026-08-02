@@ -323,11 +323,21 @@ function renderContainer(idx) {
     pieceCount += it.qty;
   });
 
-  // Yard settle: ALL inside cargo (incl. packPoseLock) — heavy→floor, no float,
-  // no mesh AABB dig-in. Packer seats are a hint; real steel must sit & clear.
+  // Yard settle vs Pack V2 authority
   const inside = clickable.filter(c => !c.outsideContainer);
-  if (inside.length && typeof yardSettlePackedMeshes === 'function') {
+  const isPackV2Layout = !!(currentLayout
+    && (currentLayout.packStrategy === 'pack_v2_twins_stacks'
+      || (cont.items || []).some(it => it && it._packV2Applied)));
+
+  if (isPackV2Layout && inside.length) {
+    // Pack V2 seats are LAW — do not yard-settle / tip-level / shove
+    if (typeof forceImmutablePackV2Seats === 'function')
+      forceImmutablePackV2Seats(inside, cont);
+  } else if (inside.length && typeof yardSettlePackedMeshes === 'function') {
+    // Legacy path: yard settle then twin-lane lock
     yardSettlePackedMeshes(inside, cont);
+    if (typeof forceImmutablePackerLaneSeats === 'function')
+      forceImmutablePackerLaneSeats(inside, cont);
   } else if (inside.length) {
     const unlocked = inside.filter(c =>
       !c.item?.packPoseLock && !c.item?.exactPoseLock);
@@ -345,11 +355,9 @@ function renderContainer(idx) {
       );
       snapMeshToPackerFootY(c.mesh, c.item);
     });
+    if (typeof forceImmutablePackerLaneSeats === 'function')
+      forceImmutablePackerLaneSeats(inside, cont);
   }
-
-  // Absolute last: immutable packer seats + clear mesh dig-in for twin lanes
-  if (inside.length && typeof forceImmutablePackerLaneSeats === 'function')
-    forceImmutablePackerLaneSeats(inside, cont);
 
   if (idx === 0 && currentLayout.oversized && currentLayout.oversized.length) {
     // Items outside container — render with REAL shapes (makeShape), not plain boxes.
@@ -2483,6 +2491,81 @@ function yardItemWeightKg(it) {
  *  4) Clamp inside walls; write world pose back to item
  */
 /**
+ * Final authority for ALL Pack V2 seats (twins, nests, stacks).
+ * Packer XZ + footY are law — no yard settle, no tip remorph, no dig-shove.
+ */
+function forceImmutablePackV2Seats(entries, cont) {
+  if (!entries || !entries.length || typeof THREE === 'undefined') return 0;
+  const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.001;
+  const list = entries.filter(e =>
+    e && e.mesh && e.item && !e.outsideContainer
+    && (e.item._packV2Applied || e.item.packPoseLock));
+  if (!list.length) return 0;
+
+  function seatCenterXZ(mesh, xMm, zMm) {
+    mesh.position.x = xMm * sc;
+    mesh.position.z = zMm * sc;
+    mesh.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(mesh);
+    if (!isFinite(box.min.x) || !isFinite(box.max.x)) return;
+    mesh.position.x += (xMm * sc) - (box.min.x + box.max.x) * 0.5;
+    mesh.position.z += (zMm * sc) - (box.min.z + box.max.z) * 0.5;
+    mesh.updateMatrixWorld(true);
+  }
+
+  function seatFootY(mesh, footYMm) {
+    mesh.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(mesh);
+    if (!isFinite(box.min.y)) return;
+    const dy = (+footYMm || 0) * sc - box.min.y;
+    if (Math.abs(dy) > 1e-9) mesh.position.y += dy;
+    mesh.updateMatrixWorld(true);
+  }
+
+  let n = 0;
+  list.forEach(c => {
+    const it = c.item;
+    const x = it._packerSeatX0 != null ? Number(it._packerSeatX0)
+      : (it._packerSeatX != null ? Number(it._packerSeatX) : Number(it.x) || 0);
+    const z = it._packerSeatZ0 != null ? Number(it._packerSeatZ0)
+      : (it._packerSeatZ != null ? Number(it._packerSeatZ) : Number(it.z) || 0);
+    const foot = it._packV2FootYMm != null ? Number(it._packV2FootYMm)
+      : (it.supportTopY != null && (it.role === 'nest_stack' || it.packLayer === 'stack')
+        ? Number(it.supportTopY)
+        : (it.y != null && it.packFootprintH
+          ? Number(it.y) - Number(it.packFootprintH) * 0.5
+          : 0));
+
+    // Preserve Group By / locked orientation — translate only
+    if (it._lockedQuaternion) {
+      c.mesh.quaternion.copy(it._lockedQuaternion);
+      c.mesh.rotation.setFromQuaternion(c.mesh.quaternion);
+    } else if (it._groupByQuat && typeof applyGroupByFrozenQuat === 'function') {
+      applyGroupByFrozenQuat(c.mesh, it);
+    }
+
+    seatCenterXZ(c.mesh, x, z);
+    seatFootY(c.mesh, foot);
+
+    it.x = x;
+    it.z = z;
+    it._packerSeatX = x;
+    it._packerSeatZ = z;
+    it._packV2FootYMm = foot;
+    // Keep viewer center Y in sync with foot + footprint
+    const fh = Number(it.packFootprintH) || Number(it.heightMm) || 0;
+    if (fh > 0) it.y = foot + fh * 0.5;
+    n += 1;
+  });
+
+  try {
+    console.info('[PackV2-SEAT] seated=' + n
+      + ' feet=' + list.map(c => Math.round(c.item._packV2FootYMm || 0)).join(','));
+  } catch (_) { /* */ }
+  return n;
+}
+
+/**
  * Final authority for twin / foreman floor seats.
  * Uses immutable _packerSeat* and pushes meshes apart until AABBs clear.
  */
@@ -3524,8 +3607,8 @@ function captureCurrentPoses() {
 
 /**
  * Optimise & Place — Pack V2 (twins + stacks).
- * Checked staging groups → BuildUnits → PackWithTwins → seats in container;
- * leftovers stay outside with honest fitReason.
+ * Real-world: if nothing checked, auto-select all grouped sets.
+ * Packer seats are final in 3D (no yard-settle shove).
  */
 function runOptimizeKeepingLeftovers() {
   if (!rawScene) return null;
@@ -3539,12 +3622,43 @@ function runOptimizeKeepingLeftovers() {
 
   const groups = (typeof assemblyGroups !== 'undefined' && assemblyGroups)
     ? assemblyGroups : [];
-  const checked = groups.filter(g => g && g.checked && g.state !== 'oversized');
-  if (!checked.length) {
+  if (!groups.length) {
     if (typeof showToast === 'function')
-      showToast('Select sets first — click 1, 2, 3… then Optimise & Place', 3200);
+      showToast('No groups — Group by Shape first', 3200);
     return null;
   }
+
+  // Real-world UX: nothing picked → pack ALL non-oversized groups
+  let checked = groups.filter(g => g && g.checked && g.state !== 'oversized');
+  if (!checked.length) {
+    groups.forEach(g => {
+      if (g && g.state !== 'oversized') g.checked = true;
+    });
+    try {
+      if (typeof renumberCheckOrderByWeight === 'function')
+        renumberCheckOrderByWeight();
+    } catch (_) { /* */ }
+    checked = groups.filter(g => g && g.checked && g.state !== 'oversized');
+    if (typeof showToast === 'function')
+      showToast('No sets picked — packing all grouped sets', 2800);
+  }
+  if (!checked.length) {
+    if (typeof showToast === 'function')
+      showToast('Nothing to pack', 3000);
+    return null;
+  }
+
+  // Ensure Step7 pack units exist
+  try {
+    if (typeof csPackV2EnsureGroupPackUnits === 'function')
+      csPackV2EnsureGroupPackUnits(groups);
+    else if (typeof createPackUnits === 'function') {
+      groups.forEach(g => {
+        if (g && (!g.packUnits || !g.packUnits.length))
+          g.packUnits = createPackUnits(g);
+      });
+    }
+  } catch (_) { /* */ }
 
   // Freeze Group By orientations from the current yard view
   try {
@@ -3571,6 +3685,13 @@ function runOptimizeKeepingLeftovers() {
   if (!result || !result.layout) {
     if (typeof showToast === 'function')
       showToast((result && result.toast) || 'Optimise failed', 3500);
+    return result;
+  }
+
+  if (!(result.placedItems && result.placedItems.length)
+      && !(result.leftoverItems && result.leftoverItems.length)) {
+    if (typeof showToast === 'function')
+      showToast('Pack V2: no units built — check Group By / pack units', 4000);
     return result;
   }
 
@@ -3610,7 +3731,11 @@ function runOptimizeKeepingLeftovers() {
     }
   });
 
-  try { renderContainer(0); } catch (_) { /* */ }
+  try { renderContainer(0); } catch (err) {
+    try { console.error('[PackV2] renderContainer failed', err); } catch (_) { /* */ }
+    if (typeof showToast === 'function')
+      showToast('Pack done but 3D render error — see console', 4500);
+  }
   try { if (typeof renderStagingList === 'function') renderStagingList(); } catch (_) { /* */ }
   try { if (typeof updateStagingFooter === 'function') updateStagingFooter(); } catch (_) { /* */ }
   try {
@@ -3619,30 +3744,47 @@ function runOptimizeKeepingLeftovers() {
   } catch (_) { /* */ }
   try { if (typeof updateWorkflowUI === 'function') updateWorkflowUI(); } catch (_) { /* */ }
 
-  if (typeof showToast === 'function')
-    showToast(result.toast || 'Pack V2 done', 4500);
+  // Packer soak + live mesh soak after render
+  let soak = null;
+  let live = null;
+  try {
+    if (typeof csPackV2SoakInspect === 'function') {
+      soak = csPackV2SoakInspect(result, {
+        containerSpec: rawScene.containerSpec,
+      });
+      result.soak = soak;
+    }
+  } catch (_) { /* */ }
+  try {
+    if (typeof csPackV2LiveMeshSoak === 'function'
+        && typeof clickable !== 'undefined') {
+      const cont = currentLayout && currentLayout.containers
+        && currentLayout.containers[currentContainerIdx];
+      live = csPackV2LiveMeshSoak(clickable, cont || rawScene.containerSpec);
+      result.liveSoak = live;
+      if (soak) soak.live = live;
+    }
+  } catch (_) { /* */ }
 
   try {
     if (result.report && typeof csPackV2PublishPackReport === 'function')
       csPackV2PublishPackReport(result.report, { updateDom: true, replaceStats: false });
   } catch (_) { /* */ }
 
-  try {
-    if (typeof csPackV2SoakInspect === 'function') {
-      const soak = csPackV2SoakInspect(result, {
-        containerSpec: rawScene.containerSpec,
-      });
-      result.soak = soak;
-      if (typeof window !== 'undefined')
-        window.__lastPackV2Soak = soak;
-      if (!soak.ok && typeof showToast === 'function')
-        showToast('⚠ ' + (soak.summary || 'Soak gate fail'), 5000);
-    }
-  } catch (_) { /* */ }
+  let toast = result.toast || 'Pack V2 done';
+  if (live && !live.ok)
+    toast = '⚠ Live mesh: ' + (live.summary || 'float/dig');
+  else if (soak && !soak.ok)
+    toast = '⚠ ' + (soak.summary || 'Soak gate fail');
+  if (typeof showToast === 'function')
+    showToast(toast, 4500);
 
   try {
-    if (typeof window !== 'undefined')
+    if (typeof window !== 'undefined') {
       window.__lastPackV2Optimise = result;
+      window.__lastPackV2Soak = soak;
+      window.__lastPackV2LiveSoak = live;
+    }
   } catch (_) { /* */ }
   return result;
 }

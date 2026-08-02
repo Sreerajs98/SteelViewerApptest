@@ -26,6 +26,8 @@ static class Program
     public static bool RunZGroundTests { get; private set; }
     /// <summary>Optional IFC path from CLI (auto-load all phases after WebView ready).</summary>
     public static string? StartupIfcPath { get; private set; }
+    /// <summary>Optional --out path for CLI IFC group/optimise report JSON.</summary>
+    public static string? CliReportOutPath { get; private set; }
 
     [STAThread]
     static void Main(string[] args)
@@ -53,20 +55,26 @@ static class Program
         RunZGroundTests = args.Any(a =>
             string.Equals(a, "--z-ground-tests", StringComparison.OrdinalIgnoreCase));
 
-        // First .ifc path arg, or --ifc <path>
+        // First .ifc path arg, or --ifc <path>; optional --out <report.json>
         for (int i = 0; i < args.Length; i++)
         {
+            if (string.Equals(args[i], "--out", StringComparison.OrdinalIgnoreCase)
+                && i + 1 < args.Length)
+            {
+                CliReportOutPath = args[i + 1];
+                continue;
+            }
             if (string.Equals(args[i], "--ifc", StringComparison.OrdinalIgnoreCase)
                 && i + 1 < args.Length)
             {
                 StartupIfcPath = args[i + 1];
-                break;
+                continue;
             }
-            if (args[i].EndsWith(".ifc", StringComparison.OrdinalIgnoreCase)
+            if (StartupIfcPath == null
+                && args[i].EndsWith(".ifc", StringComparison.OrdinalIgnoreCase)
                 && File.Exists(args[i]))
             {
                 StartupIfcPath = args[i];
-                break;
             }
         }
 

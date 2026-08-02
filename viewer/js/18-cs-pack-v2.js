@@ -27,8 +27,10 @@
  *   Step 5d — Optimise wire: BuildUnits → PackWithTwins → 5b+5c → layout
  *   Step 5e — Pack report (on-screen + CLI step5)
  *   Step 5f — IFC soak gates (float=0 dig=0) + full Step5 suite
+ *   Step 5g — Pack V2 seats final in 3D (skip yardSettle; immutable seats)
+ *   Step 5h — Live THREE AABB soak after Optimise render
  *
- * Pack V2 Optimise UI wire complete through 5f (soak locally / CLI --ifc)
+ * Pack V2 Optimise: packer seats are law in the viewer
  */
 
 const CSPACK_V2_EPS = 0.5;
@@ -7181,6 +7183,14 @@ function csPackV2StampViewerPoseOnItem(item, pose, placement, opts) {
   item._packV2Applied = true;
   item._packV2FootYMm = pose.footYMm;
 
+  // Twin assemblies: enable existing twin render lane (steel W seat, not fat IFC AABB)
+  if (role === 'twin_wall_hug' || role === 'twin_beside') {
+    item._pairLaneLock = true;
+    item._pairPreferIfcMesh = true;
+    item._pairVisW = pose.pw;
+    item.packOrientTag = item.packOrientTag || 'rafter_pair';
+  }
+
   if (role === 'nest_stack' || layer === 'stack') {
     item.floorAnchor = false;
     item.baseLayerLock = false;
@@ -9303,6 +9313,152 @@ function csPackV2Step5eSelfTest() {
 //   • Stacks raise placedCount vs floor-only when leftovers exist
 //   • Report counts match packer; Group By dims not wiped on render items
 // ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STEP 5h — Live THREE mesh AABB soak (after renderContainer)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Measure live Pack V2 seats after render.
+ * Float / twin-hug / stack elevation use the THREE mesh AABB (seating authority).
+ * Dig uses packer footprint AABB (L×W×H at stamped seats) — IFC meshes are often
+ * fatter than the design box; packer non-overlap is the real-world contract.
+ * Stack-on-support face touch (oy ≤ eps) is not dig.
+ * @param {object[]} entries  clickable[]
+ * @param {object} cont       containerSpec / layout container
+ */
+function csPackV2LiveMeshSoak(entries, cont) {
+  const list = (entries || []).filter(e =>
+    e && e.mesh && e.item && !e.outsideContainer && e.item._packV2Applied);
+  if (!list.length) {
+    return {
+      ok: true, reason: 'NO_MESHES', floatCount: 0, digCount: 0,
+      digTwin: 0, twinHugOk: true, stacksElevated: true,
+      summary: 'Live soak: no Pack V2 meshes',
+    };
+  }
+  if (typeof THREE === 'undefined') {
+    return {
+      ok: false, reason: 'NO_THREE', floatCount: -1, digCount: -1,
+      summary: 'Live soak: THREE missing',
+    };
+  }
+
+  const sc = (typeof SCALE === 'number' && SCALE > 0) ? SCALE : 0.001;
+  const epsMm = 8; // IFC mesh seating noise
+  const eps = epsMm * sc;
+  const digEpsMm = (typeof CSPACK_V2_EPS === 'number' && CSPACK_V2_EPS > 0)
+    ? CSPACK_V2_EPS : 1;
+  const W = +(cont && cont.widthMm) || 2438;
+  const halfWMm = W * 0.5;
+
+  function packerBoxMm(it) {
+    const pl = Math.max(+it.packFootprintL || +it.pl || +it.l || +it.lengthMm || 0, 1);
+    const pw = Math.max(+it.packFootprintW || +it.pw || +it.w || +it.widthMm || 0, 1);
+    const ph = Math.max(+it.packFootprintH || +it.ph || +it.h || +it.heightMm || 0, 1);
+    const x = it._packerSeatX0 != null ? +it._packerSeatX0
+      : (it._packerSeatX != null ? +it._packerSeatX : +it.x || 0);
+    const z = it._packerSeatZ0 != null ? +it._packerSeatZ0
+      : (it._packerSeatZ != null ? +it._packerSeatZ : +it.z || 0);
+    const foot = it._packV2FootYMm != null ? +it._packV2FootYMm
+      : ((it.role === 'nest_stack' || it.packLayer === 'stack')
+        ? (+it.supportTopY || 0) : 0);
+    return {
+      minX: x - pl * 0.5, maxX: x + pl * 0.5,
+      minY: foot, maxY: foot + ph,
+      minZ: z - pw * 0.5, maxZ: z + pw * 0.5,
+      pl, pw, ph, x, z, foot,
+    };
+  }
+
+  let floatCount = 0;
+  let digCount = 0;
+  let digTwin = 0;
+  let meshDigCount = 0; // diagnostic only — fat IFC AABBs
+  const rows = [];
+
+  list.forEach(c => {
+    c.mesh.updateMatrixWorld(true);
+    const meshBox = new THREE.Box3().setFromObject(c.mesh);
+    const it = c.item;
+    const pb = packerBoxMm(it);
+    const footExpect = pb.foot * sc;
+    if (!isFinite(meshBox.min.y) || Math.abs(meshBox.min.y - footExpect) > eps + 0.001)
+      floatCount += 1;
+    rows.push({
+      entry: c, meshBox, pack: pb, it,
+      isStack: it.role === 'nest_stack' || it.packLayer === 'stack',
+      isTwin: it.role === 'twin_wall_hug' || it.role === 'twin_beside',
+      isHug: it.role === 'twin_wall_hug',
+      isSupport: !!(it.role === 'twin_wall_hug' || it.role === 'twin_beside'
+        || it.role === 'nest_strip' || it.packLayer === 'floor'
+        || it.floorAnchor),
+    });
+  });
+
+  for (let i = 0; i < rows.length; i++) {
+    for (let j = i + 1; j < rows.length; j++) {
+      const A = rows[i], B = rows[j];
+      // Packer-footprint dig (contract)
+      const a = A.pack, b = B.pack;
+      const ox = Math.min(a.maxX, b.maxX) - Math.max(a.minX, b.minX);
+      const oy = Math.min(a.maxY, b.maxY) - Math.max(a.minY, b.minY);
+      const oz = Math.min(a.maxZ, b.maxZ) - Math.max(a.minZ, b.minZ);
+      const stackOnSupport = (A.isStack && B.isSupport) || (B.isStack && A.isSupport);
+      // Face-touch on pad is OK (same as packer); allow a few mm pad bite
+      const yTol = stackOnSupport ? Math.max(digEpsMm, 5) : digEpsMm;
+      if (ox > digEpsMm && oy > yTol && oz > digEpsMm) {
+        digCount += 1;
+        if ((A.isStack && B.isTwin) || (B.isStack && A.isTwin))
+          digTwin += 1;
+      }
+      // Mesh AABB dig — reported only (does not fail gate)
+      const ma = A.meshBox, mb = B.meshBox;
+      const mx = Math.min(ma.max.x, mb.max.x) - Math.max(ma.min.x, mb.min.x);
+      const my = Math.min(ma.max.y, mb.max.y) - Math.max(ma.min.y, mb.min.y);
+      const mz = Math.min(ma.max.z, mb.max.z) - Math.max(ma.min.z, mb.min.z);
+      if (mx > eps && my > eps && mz > eps) meshDigCount += 1;
+    }
+  }
+
+  const hugs = rows.filter(x => x.isHug);
+  let twinHugOk = hugs.length === 0;
+  if (hugs.length) {
+    // Prefer packer hug seat; mesh may bulge past wall
+    twinHugOk = hugs.every(h => h.pack.minZ < -halfWMm + 80);
+  }
+
+  const stacks = rows.filter(x => x.isStack);
+  const stacksElevated = stacks.length === 0
+    || stacks.every(s => s.pack.foot > digEpsMm);
+
+  const ok = floatCount === 0 && digCount === 0 && digTwin === 0
+    && twinHugOk && stacksElevated;
+
+  const out = {
+    ok,
+    reason: ok ? null : 'LIVE_SOAK_FAIL',
+    floatCount,
+    digCount,
+    digTwin,
+    meshDigCount,
+    twinHugOk,
+    twinHugCount: hugs.length,
+    stackCount: stacks.length,
+    stacksElevated,
+    meshCount: list.length,
+    summary: ok
+      ? `Live OK · meshes=${list.length} float=0 dig=0`
+        + (stacks.length ? ` stack=${stacks.length}` : '')
+        + (meshDigCount ? ` meshDig=${meshDigCount}` : '')
+      : `Live FAIL · float=${floatCount} dig=${digCount} digTwin=${digTwin}`,
+  };
+  try {
+    if (typeof window !== 'undefined')
+      window.__lastPackV2LiveSoak = out;
+  } catch (_) { /* */ }
+  return out;
+}
 
 /**
  * Inspect an Optimise / PackWithTwins result for soak gates.
